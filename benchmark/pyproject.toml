@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentrix-bench"
+version = "0.1.0"
+description = "Shared-prefix Agent attention benchmark from benchmark.md"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "openai>=1.0",
+  "PyYAML>=6.0",
+  "tiktoken>=0.7",
+]
+
+[project.optional-dependencies]
+data = ["datasets>=2.19", "huggingface_hub>=0.23"]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+agentrix-bench = "cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = [
+  "api_runner",
+  "cli",
+  "data",
+  "metrics",
+  "models",
+  "reporting",
+  "synthetic",
+  "tokens",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]

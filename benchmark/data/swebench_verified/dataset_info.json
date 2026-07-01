@@ -1,0 +1,80 @@
+{
+  "builder_name": "parquet",
+  "citation": "",
+  "config_name": "default",
+  "dataset_name": "swe-bench_verified",
+  "dataset_size": 7779763,
+  "description": "",
+  "download_size": 2090470,
+  "features": {
+    "repo": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "instance_id": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "base_commit": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "patch": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "test_patch": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "problem_statement": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "hints_text": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "created_at": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "version": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "FAIL_TO_PASS": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "PASS_TO_PASS": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "environment_setup_commit": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "difficulty": {
+      "dtype": "string",
+      "_type": "Value"
+    }
+  },
+  "homepage": "",
+  "license": "",
+  "size_in_bytes": 9870233,
+  "splits": {
+    "test": {
+      "name": "test",
+      "num_bytes": 7779763,
+      "num_examples": 500,
+      "dataset_name": "swe-bench_verified"
+    }
+  },
+  "version": {
+    "version_str": "0.0.0",
+    "major": 0,
+    "minor": 0,
+    "patch": 0
+  }
+}

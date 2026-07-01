@@ -1,0 +1,78 @@
+{
+  "builder_name": "json",
+  "citation": "",
+  "config_name": "V2",
+  "dataset_name": "agency_bench",
+  "dataset_size": 247236,
+  "description": "",
+  "download_checksums": {
+    "hf://datasets/GAIR/AgencyBench@0faf55b7cf5846b7871e984ceb3327665c0b2f8d/data/v2/v2.jsonl": {
+      "num_bytes": 254643,
+      "checksum": null
+    }
+  },
+  "download_size": 254643,
+  "features": {
+    "version": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "category": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "scenario": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "scenario_id": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "source_path": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "subtask_count": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "subtask1": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "subtask2": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "subtask3": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "subtask4": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "subtask5": {
+      "dtype": "string",
+      "_type": "Value"
+    }
+  },
+  "homepage": "",
+  "license": "",
+  "size_in_bytes": 501879,
+  "splits": {
+    "train": {
+      "name": "train",
+      "num_bytes": 247236,
+      "num_examples": 32,
+      "dataset_name": "agency_bench"
+    }
+  },
+  "version": {
+    "version_str": "0.0.0",
+    "major": 0,
+    "minor": 0,
+    "patch": 0
+  }
+}

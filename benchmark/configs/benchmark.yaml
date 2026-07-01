@@ -1,0 +1,8 @@
+seed: 2026
+tile_k: 128
+suffix_mean: 768
+output_tokens: 256
+arrival_mode: simultaneous
+prefix_tokens: [8192, 16384, 32768]
+branch_counts: [4, 8, 16]
+suffix_distributions: [uniform, lognormal]
