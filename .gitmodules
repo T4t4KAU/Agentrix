@@ -1,4 +1,4 @@
 [submodule "vllm"]
 	path = vllm
 	url = https://github.com/T4t4KAU/vllm.git
-	branch = exp/pat-prefix-attn
+	branch = fork-attn
