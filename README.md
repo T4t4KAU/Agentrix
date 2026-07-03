@@ -40,8 +40,9 @@ git submodule sync --recursive
 git submodule update --init --recursive
 ```
 
-The `vllm/` submodule should be pinned to commit `134ec347`. Before publishing
-the Agentrix repository, verify that this commit is available from the vLLM
+The `vllm/` submodule should be pinned to commit `4ec1bfc98` on the
+`fork-attn` branch. Before publishing the Agentrix repository, verify that this
+commit is available from the vLLM
 remote specified in `.gitmodules`.
 
 ## Install uv
@@ -76,15 +77,15 @@ export NVCC_THREADS=1
 uv pip install -e . --torch-backend=auto
 ```
 
-Verify the PAT backend and scheduler:
+Verify the ForkAttention backend and CUDA Graph dispatch helpers:
 
 ```bash
 uv pip install -r requirements/test/cuda.txt
 .venv/bin/python -m pytest -q \
   tests/v1/worker/test_gpu_block_table.py \
-  tests/v1/attention/test_pat_scheduler.py \
-  tests/kernels/test_pat_attention.py \
-  tests/kernels/test_pat_attention_backend.py
+  tests/v1/worker/test_fork_cudagraph_dispatch.py \
+  tests/kernels/test_fork_attention.py \
+  tests/kernels/test_fork_attention_backend.py
 cd ..
 ```
 
@@ -130,18 +131,31 @@ OUTPUT_TOKENS=64 \
 OUTPUT_DIR=results/flash_p8192_b16_o64 \
 ./scripts/run_vllm_benchmark.sh
 
-ATTENTION_BACKEND=PAT_ATTN \
+ATTENTION_BACKEND=FORK_ATTN \
 MODEL_PATH=Qwen/Qwen3-0.6B \
 PREFIX_TOKENS=8192 \
 BRANCHES=16 \
 OUTPUT_TOKENS=64 \
-OUTPUT_DIR=results/pat_p8192_b16_o64 \
+OUTPUT_DIR=results/fork_p8192_b16_o64 \
 ./scripts/run_vllm_benchmark.sh
 ```
 
-PAT currently runs in eager mode, so the script sets `ENFORCE_EAGER=1` by
-default. Common overrides include `PORT`, `MAX_MODEL_LEN`, `MAX_NUM_SEQS`,
-`GPU_MEMORY_UTILIZATION`, `DTYPE`, `STARTUP_TIMEOUT`, and `KEEP_SERVER`.
+To run both backends and write a comparison summary in one command:
+
+```bash
+cd benchmark
+BACKENDS="FLASH_ATTN FORK_ATTN" \
+MODEL_PATH=Qwen/Qwen3-0.6B \
+PREFIX_TOKENS=8192 \
+BRANCHES=16 \
+OUTPUT_TOKENS=64 \
+./scripts/run_vllm_benchmark.sh
+```
+
+ForkAttention is intended to run with CUDA Graph capture, so the script leaves
+`ENFORCE_EAGER=0` by default. Common overrides include `PORT`,
+`MAX_MODEL_LEN`, `MAX_NUM_SEQS`, `GPU_MEMORY_UTILIZATION`, `DTYPE`,
+`STARTUP_TIMEOUT`, `KEEP_SERVER`, and `VLLM_SERVER_EXTRA_ARGS`.
 Results and server logs are written to the selected `OUTPUT_DIR`.
 
 Use a smaller workload for a quick smoke test:
@@ -154,7 +168,7 @@ PREFIX_TOKENS=2048 BRANCHES=2 OUTPUT_TOKENS=32 \
 
 ## Docker
 
-The provided image builds both the PAT-enabled vLLM submodule and the
+The provided image builds both the ForkAttention-enabled vLLM submodule and the
 benchmark environment on CUDA 13.1:
 
 ```bash

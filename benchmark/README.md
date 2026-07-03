@@ -12,7 +12,7 @@ reproduction workflow.
 .venv/bin/agentrix-bench simulate
 .venv/bin/python -m pytest
 
-ATTENTION_BACKEND=PAT_ATTN \
+BACKENDS="FLASH_ATTN FORK_ATTN" \
 PREFIX_TOKENS=8192 \
 BRANCHES=16 \
 OUTPUT_TOKENS=64 \
@@ -21,4 +21,6 @@ OUTPUT_TOKENS=64 \
 
 The default model is `Qwen/Qwen3-0.6B`. Set `MODEL_PATH` to use another
 Hugging Face model or a local model directory. All output is written under
-the Git-ignored `results/` directory.
+the Git-ignored `results/` directory. The vLLM script writes one subdirectory
+per backend plus `backend_comparison.csv` and `backend_comparison.md` with the
+end-to-end latency and throughput deltas.
