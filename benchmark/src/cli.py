@@ -11,6 +11,7 @@ import yaml
 from api_runner import run_api_case
 from data import inspect_datasets, load_records, record_to_prompt
 from metrics import compare_trace
+from models import BenchmarkTrace
 from reporting import write_results
 from synthetic import traces_from_config
 
@@ -33,6 +34,8 @@ def _parser() -> argparse.ArgumentParser:
     api.add_argument("--dataset", choices=["swebench", "agencybench"], required=True)
     api.add_argument("--data-path", type=Path)
     api.add_argument("--sample-index", type=int, default=0)
+    api.add_argument("--sample-count", type=int, default=1)
+    api.add_argument("--full-dataset", action="store_true")
     api.add_argument("--model", default=os.getenv("OPENAI_MODEL", "gpt-5.5"))
     api.add_argument(
         "--api-mode",
@@ -47,6 +50,13 @@ def _parser() -> argparse.ArgumentParser:
         default=os.getenv("OPENAI_REASONING_EFFORT"),
     )
     api.add_argument("--branches", type=int, default=8)
+    api.add_argument("--case-count", type=int, default=1)
+    api.add_argument("--branch-group-size", type=int, default=1)
+    api.add_argument(
+        "--branch-order",
+        choices=["case_major", "round_robin", "shuffle"],
+        default="case_major",
+    )
     api.add_argument("--prefix-tokens", type=int, default=8192)
     api.add_argument("--suffix-mean", type=int, default=768)
     api.add_argument(
@@ -97,28 +107,69 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(
             f"sample index {args.sample_index} is outside 0..{len(records) - 1}"
         )
-    prompt = record_to_prompt(args.dataset, records[args.sample_index])
-    trace, raw = asyncio.run(
-        run_api_case(
-            prompt,
-            model=args.model,
-            branch_count=args.branches,
-            output_tokens=args.output_tokens,
-            suffix_distribution=args.suffix_distribution,
-            suffix_mean=args.suffix_mean,
-            seed=args.seed,
-            target_prefix_tokens=args.prefix_tokens,
-            concurrency=args.concurrency,
-            arrival_interval_ms=args.arrival_interval_ms,
-            common_analysis_tokens=args.common_analysis_tokens,
-            api_mode=args.api_mode,
-            base_url=args.base_url,
-            api_key_env=api_key_env,
-            reasoning_effort=args.reasoning_effort,
+    if args.sample_count <= 0:
+        raise SystemExit("sample count must be positive")
+
+    remaining_records = len(records) - args.sample_index
+    sample_count = remaining_records if args.full_dataset else args.sample_count
+    sample_count = min(sample_count, remaining_records)
+
+    traces: list[BenchmarkTrace] = []
+    raw_results = []
+    end_index = args.sample_index + sample_count
+    for batch_index, sample_start in enumerate(
+        range(args.sample_index, end_index, args.case_count)
+    ):
+        current_case_count = min(args.case_count, end_index - sample_start)
+        prompts = [
+            record_to_prompt(args.dataset, records[sample_start + offset])
+            for offset in range(current_case_count)
+        ]
+        common_context: str | list[str]
+        common_context = prompts[0] if current_case_count == 1 else prompts
+        trace, raw = asyncio.run(
+            run_api_case(
+                common_context,
+                model=args.model,
+                branch_count=args.branches,
+                output_tokens=args.output_tokens,
+                suffix_distribution=args.suffix_distribution,
+                suffix_mean=args.suffix_mean,
+                seed=args.seed + sample_start,
+                target_prefix_tokens=args.prefix_tokens,
+                concurrency=args.concurrency,
+                arrival_interval_ms=args.arrival_interval_ms,
+                common_analysis_tokens=args.common_analysis_tokens,
+                api_mode=args.api_mode,
+                base_url=args.base_url,
+                api_key_env=api_key_env,
+                reasoning_effort=args.reasoning_effort,
+                case_count=current_case_count,
+                branch_group_size=args.branch_group_size,
+                branch_order=args.branch_order,
+            )
         )
-    )
-    result = compare_trace(trace)
-    write_results(args.output_dir, [trace], [result], raw)
+        trace = BenchmarkTrace(
+            case_id=f"{trace.case_id}_s{sample_start}",
+            prefix_tokens=trace.prefix_tokens,
+            branches=trace.branches,
+            suffix_distribution=trace.suffix_distribution,
+            output_tokens=trace.output_tokens,
+            arrival_mode=trace.arrival_mode,
+            metadata={
+                **trace.metadata,
+                "batch_index": batch_index,
+                "sample_start": sample_start,
+                "sample_count": current_case_count,
+            },
+        )
+        raw["batch_index"] = batch_index
+        raw["sample_start"] = sample_start
+        traces.append(trace)
+        raw_results.append(raw)
+
+    results = [compare_trace(trace) for trace in traces]
+    write_results(args.output_dir, traces, results, raw_results)
     print(f"Wrote API benchmark to {args.output_dir}")
     return 0
 

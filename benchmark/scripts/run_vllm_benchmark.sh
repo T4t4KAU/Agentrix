@@ -9,7 +9,7 @@ BENCHMARK_PYTHON="${BENCHMARK_PYTHON:-${BENCHMARK_DIR}/.venv/bin/python}"
 export PATH="$(dirname "${VLLM_BIN}"):${PATH}"
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-0.6B}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3-0.6b-local}"
-BACKENDS="${BACKENDS:-FLASH_ATTN FORK_ATTN}"
+BACKENDS="${BACKENDS:-FORK_ATTN}"
 DTYPE="${DTYPE:-float16}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
 HOST="${HOST:-127.0.0.1}"
@@ -17,8 +17,14 @@ PORT="${PORT:-9000}"
 DATASET="${DATASET:-swebench}"
 DATA_PATH="${DATA_PATH:-}"
 SAMPLE_INDEX="${SAMPLE_INDEX:-0}"
+SAMPLE_COUNT="${SAMPLE_COUNT:-1}"
+FULL_DATASET="${FULL_DATASET:-0}"
 PREFIX_TOKENS="${PREFIX_TOKENS:-2048}"
 BRANCHES="${BRANCHES:-2}"
+CASE_COUNT="${CASE_COUNT:-1}"
+BRANCH_GROUP_SIZE="${BRANCH_GROUP_SIZE:-1}"
+BRANCH_ORDER="${BRANCH_ORDER:-case_major}"
+CONCURRENCY="${CONCURRENCY:-$((BRANCHES * CASE_COUNT))}"
 SUFFIX_DISTRIBUTION="${SUFFIX_DISTRIBUTION:-lognormal}"
 SUFFIX_MEAN="${SUFFIX_MEAN:-128}"
 OUTPUT_TOKENS="${OUTPUT_TOKENS:-128}"
@@ -29,7 +35,7 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.70}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-300}"
-OUTPUT_DIR="${OUTPUT_DIR:-results/fork_vs_flash_${DATASET}_p${PREFIX_TOKENS}_b${BRANCHES}_o${OUTPUT_TOKENS}}"
+OUTPUT_DIR="${OUTPUT_DIR:-results/fork_attention_${DATASET}_c${CASE_COUNT}_p${PREFIX_TOKENS}_b${BRANCHES}_g${BRANCH_GROUP_SIZE}_o${OUTPUT_TOKENS}}"
 KEEP_SERVER="${KEEP_SERVER:-0}"
 VLLM_SERVER_EXTRA_ARGS="${VLLM_SERVER_EXTRA_ARGS:-}"
 BENCHMARK_EXTRA_ARGS="${BENCHMARK_EXTRA_ARGS:-}"
@@ -55,9 +61,9 @@ if [[ ! -x "${BENCHMARK_PYTHON}" ]]; then
   exit 1
 fi
 
-if ((${#BACKEND_LIST[@]} < 2)); then
-  echo "BACKENDS must contain at least two attention backends to compare." >&2
-  echo "Example: BACKENDS=\"FLASH_ATTN FORK_ATTN\" $0" >&2
+if ((${#BACKEND_LIST[@]} == 0)); then
+  echo "BACKENDS must contain at least one attention backend." >&2
+  echo "Example: BACKENDS=\"FORK_ATTN\" $0" >&2
   exit 1
 fi
 
@@ -143,22 +149,29 @@ run_backend() {
     -m cli run-api
     --dataset "${DATASET}"
     --sample-index "${SAMPLE_INDEX}"
+    --sample-count "${SAMPLE_COUNT}"
     --api-mode chat
     --base-url "${BASE_URL}/v1"
     --model "${SERVED_MODEL_NAME}"
     --prefix-tokens "${PREFIX_TOKENS}"
     --branches "${BRANCHES}"
+    --case-count "${CASE_COUNT}"
+    --branch-group-size "${BRANCH_GROUP_SIZE}"
+    --branch-order "${BRANCH_ORDER}"
     --suffix-distribution "${SUFFIX_DISTRIBUTION}"
     --suffix-mean "${SUFFIX_MEAN}"
     --output-tokens "${OUTPUT_TOKENS}"
     --common-analysis-tokens "${COMMON_ANALYSIS_TOKENS}"
-    --concurrency "${BRANCHES}"
+    --concurrency "${CONCURRENCY}"
     --arrival-interval-ms "${ARRIVAL_INTERVAL_MS}"
     --seed "${SEED}"
     --output-dir "${backend_output_dir}"
   )
   if [[ -n "${DATA_PATH}" ]]; then
     benchmark_args+=(--data-path "${DATA_PATH}")
+  fi
+  if [[ "${FULL_DATASET}" == "1" ]]; then
+    benchmark_args+=(--full-dataset)
   fi
   if [[ -n "${BENCHMARK_EXTRA_ARGS}" ]]; then
     read -r -a extra_benchmark_args <<<"${BENCHMARK_EXTRA_ARGS}"
@@ -187,6 +200,7 @@ write_comparison() {
 from __future__ import annotations
 
 import csv
+import statistics
 import sys
 from pathlib import Path
 
@@ -218,9 +232,60 @@ METRICS = [
 def read_result(path: Path) -> dict[str, str]:
     with path.open(encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle))
-    if len(rows) != 1:
-        raise SystemExit(f"expected one result row in {path}, found {len(rows)}")
-    return rows[0]
+    if not rows:
+        raise SystemExit(f"expected at least one result row in {path}")
+    if len(rows) == 1:
+        return rows[0]
+    return aggregate_results(rows)
+
+
+def aggregate_results(rows: list[dict[str, str]]) -> dict[str, str]:
+    total_output_tokens = sum(float(row["branch_total_output_tokens"]) for row in rows)
+    total_case_ms = sum(float(row["case_wall_time_ms"]) for row in rows)
+    total_branch_ms = sum(float(row["branch_phase_wall_ms"]) for row in rows)
+
+    def weighted_mean(metric: str) -> float:
+        total_weight = 0.0
+        weighted_sum = 0.0
+        for row in rows:
+            weight = float(row.get("branch_count") or 1)
+            weighted_sum += float(row[metric]) * weight
+            total_weight += weight
+        return weighted_sum / total_weight
+
+    aggregated = rows[0].copy()
+    aggregated["case_id"] = f"aggregate_{len(rows)}"
+    aggregated["case_wall_time_ms"] = f"{total_case_ms}"
+    aggregated["branch_phase_wall_ms"] = f"{total_branch_ms}"
+    aggregated["branch_total_output_tokens"] = f"{total_output_tokens}"
+    aggregated["end_to_end_output_tokens_per_s"] = (
+        f"{total_output_tokens / (total_case_ms / 1000)}"
+    )
+    aggregated["branch_output_tokens_per_s"] = (
+        f"{total_output_tokens / (total_branch_ms / 1000)}"
+    )
+    for metric in (
+        "branch_mean_latency_ms",
+        "branch_median_latency_ms",
+        "branch_min_latency_ms",
+        "branch_max_latency_ms",
+        "common_latency_ms",
+    ):
+        values = [float(row[metric]) for row in rows if row.get(metric)]
+        if not values:
+            continue
+        if metric == "branch_max_latency_ms":
+            value = max(values)
+        elif metric == "branch_min_latency_ms":
+            value = min(values)
+        elif metric in {"branch_mean_latency_ms", "branch_median_latency_ms"}:
+            value = weighted_mean(metric)
+        elif metric == "common_latency_ms":
+            value = sum(values)
+        else:
+            value = statistics.fmean(values)
+        aggregated[metric] = f"{value}"
+    return aggregated
 
 
 def to_float(row: dict[str, str], metric: str) -> float | None:
@@ -326,6 +391,10 @@ for attention_backend in "${BACKEND_LIST[@]}"; do
   run_backend "${attention_backend}"
 done
 
-write_comparison
+if ((${#BACKEND_LIST[@]} > 1)); then
+  write_comparison
 
-echo "Comparison complete: ${BENCHMARK_DIR}/${OUTPUT_DIR}"
+  echo "Comparison complete: ${BENCHMARK_DIR}/${OUTPUT_DIR}"
+else
+  echo "Benchmark complete: ${BENCHMARK_DIR}/${OUTPUT_DIR}"
+fi

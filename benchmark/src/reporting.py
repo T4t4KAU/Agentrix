@@ -27,16 +27,26 @@ def write_results(
     if raw_api_results is not None:
         write_json(output_dir / "raw_api_results.json", raw_api_results)
 
-    rows = [
-        {**result, **measured_metrics(trace, raw_api_results)}
-        for trace, result in zip(traces, results, strict=True)
-    ]
+    rows = []
+    for index, (trace, result) in enumerate(zip(traces, results, strict=True)):
+        rows.append({
+            **result,
+            **measured_metrics(trace, _select_raw_result(raw_api_results, index)),
+        })
     csv_path = output_dir / "benchmark_results.csv"
     with csv_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
     (output_dir / "summary.md").write_text(render_summary(rows), encoding="utf-8")
+
+
+def _select_raw_result(raw_api_results: Any | None, index: int) -> Any | None:
+    if isinstance(raw_api_results, list):
+        if index < len(raw_api_results):
+            return raw_api_results[index]
+        return None
+    return raw_api_results
 
 
 def measured_metrics(
