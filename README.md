@@ -40,7 +40,7 @@ git submodule sync --recursive
 git submodule update --init --recursive
 ```
 
-The `vllm/` submodule should be pinned to commit `e00e85d09` on the
+The `vllm/` submodule should be pinned to commit `d74abf592` on the
 `fork-attn` branch. Before publishing the Agentrix repository, verify that this
 commit is available from the vLLM
 remote specified in `.gitmodules`.
@@ -190,6 +190,33 @@ The comparison summary is written to
 `results/fork_vs_flash_p8192_b16_o64/backend_comparison.md`. Per-backend CSV
 files are written under the corresponding `flash_attn/` and `fork_attn/`
 subdirectories.
+
+On a two-GPU machine, run two single-GPU vLLM replicas and compare DP routing
+policies. `round_robin` is the load-balancing baseline. `prefix_forest` keeps
+each branch group on one replica while greedily balancing group weights across
+replicas:
+
+```bash
+cd benchmark
+
+BACKENDS="FORK_ATTN" \
+DP_REPLICAS=2 \
+DP_ROUTING=prefix_forest \
+GPU_IDS="0,1" \
+MODEL_PATH=Qwen/Qwen3-0.6B \
+PREFIX_TOKENS=8192 \
+SAMPLE_COUNT=4 \
+CASE_COUNT=4 \
+BRANCHES=32 \
+BRANCH_GROUP_SIZE=8 \
+CONCURRENCY=64 \
+OUTPUT_TOKENS=64 \
+MAX_MODEL_LEN=32768 \
+MAX_NUM_SEQS=32 \
+GPU_MEMORY_UTILIZATION=0.70 \
+OUTPUT_DIR=results/fork_dp2_prefix_forest \
+./scripts/run_vllm_benchmark.sh
+```
 
 Profile ForkAttention with Nsight Systems:
 

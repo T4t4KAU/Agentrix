@@ -30,3 +30,7 @@ end-to-end latency and throughput deltas.
 Use `run_vllm_fanout_matrix.sh` for stronger shared-prefix cases. It compares
 `FLASH_ATTN` and `FORK_ATTN` over five long-prefix, high-branch-count workloads
 and writes an aggregate `matrix_summary.md`.
+
+For DP routing experiments, set `DP_REPLICAS=2` and choose `DP_ROUTING`.
+`round_robin` is the load-balancing baseline; `prefix_forest` keeps branch
+groups together while balancing group weights across replicas.

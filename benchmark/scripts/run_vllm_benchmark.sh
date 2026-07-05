@@ -14,6 +14,9 @@ DTYPE="${DTYPE:-float16}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-9000}"
+DP_REPLICAS="${DP_REPLICAS:-1}"
+DP_ROUTING="${DP_ROUTING:-single}"
+GPU_IDS="${GPU_IDS:-}"
 DATASET="${DATASET:-swebench}"
 DATA_PATH="${DATA_PATH:-}"
 SAMPLE_INDEX="${SAMPLE_INDEX:-0}"
@@ -41,8 +44,8 @@ VLLM_SERVER_EXTRA_ARGS="${VLLM_SERVER_EXTRA_ARGS:-}"
 BENCHMARK_EXTRA_ARGS="${BENCHMARK_EXTRA_ARGS:-}"
 
 LOG_DIR="${BENCHMARK_DIR}/${OUTPUT_DIR}"
-BASE_URL="http://${HOST}:${PORT}"
-SERVER_PID=""
+SERVER_PIDS=()
+SERVER_BASE_URLS=()
 BACKENDS="${BACKENDS//,/ }"
 read -r -a BACKEND_LIST <<<"${BACKENDS}"
 
@@ -67,22 +70,30 @@ if ((${#BACKEND_LIST[@]} == 0)); then
   exit 1
 fi
 
+if ((DP_REPLICAS <= 0)); then
+  echo "DP_REPLICAS must be positive." >&2
+  exit 1
+fi
+
 if [[ "${KEEP_SERVER}" == "1" ]] && ((${#BACKEND_LIST[@]} > 1)); then
   echo "KEEP_SERVER=1 is only supported for single-backend debugging." >&2
   exit 1
 fi
 
 stop_server() {
-  if [[ -n "${SERVER_PID}" ]] && kill -0 "${SERVER_PID}" 2>/dev/null; then
-    if [[ "${KEEP_SERVER}" == "1" ]]; then
-      echo "vLLM server remains running (PID ${SERVER_PID})."
-    else
-      echo "Stopping vLLM server (PID ${SERVER_PID})..."
-      kill -TERM "${SERVER_PID}" 2>/dev/null || true
-      wait "${SERVER_PID}" 2>/dev/null || true
+  for server_pid in "${SERVER_PIDS[@]}"; do
+    if [[ -n "${server_pid}" ]] && kill -0 "${server_pid}" 2>/dev/null; then
+      if [[ "${KEEP_SERVER}" == "1" ]]; then
+        echo "vLLM server remains running (PID ${server_pid})."
+      else
+        echo "Stopping vLLM server (PID ${server_pid})..."
+        kill -TERM "${server_pid}" 2>/dev/null || true
+        wait "${server_pid}" 2>/dev/null || true
+      fi
     fi
-  fi
-  SERVER_PID=""
+  done
+  SERVER_PIDS=()
+  SERVER_BASE_URLS=()
 }
 
 trap stop_server EXIT INT TERM
@@ -92,58 +103,109 @@ run_backend() {
   local backend_name="${attention_backend,,}"
   local backend_output_dir="${OUTPUT_DIR}/${backend_name}"
   local backend_log_dir="${BENCHMARK_DIR}/${backend_output_dir}"
-  local server_log="${backend_log_dir}/vllm_server.log"
+  local effective_dp_routing="${DP_ROUTING}"
 
   mkdir -p "${backend_log_dir}"
+  if ((DP_REPLICAS == 1)); then
+    effective_dp_routing="single"
+  fi
 
-  if curl --silent --fail --max-time 2 "${BASE_URL}/health" >/dev/null 2>&1; then
-    echo "Port ${PORT} already has a healthy server; refusing to replace it." >&2
+  SERVER_PIDS=()
+  SERVER_BASE_URLS=()
+  local gpu_ids_normalized="${GPU_IDS//,/ }"
+  local gpu_id_list=()
+  if [[ -n "${gpu_ids_normalized}" ]]; then
+    read -r -a gpu_id_list <<<"${gpu_ids_normalized}"
+  else
+    for ((rank = 0; rank < DP_REPLICAS; rank++)); do
+      gpu_id_list+=("${rank}")
+    done
+  fi
+  if ((${#gpu_id_list[@]} < DP_REPLICAS)); then
+    echo "GPU_IDS must provide at least DP_REPLICAS entries." >&2
     exit 1
   fi
 
-  local vllm_args=(
-    serve "${MODEL_PATH}"
-    --host "${HOST}"
-    --port "${PORT}"
-    --served-model-name "${SERVED_MODEL_NAME}"
-    --attention-backend "${attention_backend}"
-    --dtype "${DTYPE}"
-    --generation-config vllm
-    --enable-prefix-caching
-    --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
-    --max-model-len "${MAX_MODEL_LEN}"
-    --max-num-seqs "${MAX_NUM_SEQS}"
-  )
-  if [[ "${ENFORCE_EAGER}" == "1" ]]; then
-    vllm_args+=(--enforce-eager)
-  fi
-  if [[ -n "${VLLM_SERVER_EXTRA_ARGS}" ]]; then
-    read -r -a extra_vllm_args <<<"${VLLM_SERVER_EXTRA_ARGS}"
-    vllm_args+=("${extra_vllm_args[@]}")
-  fi
-
-  echo "Starting ${MODEL_PATH} with ${attention_backend} on ${BASE_URL}..."
-  "${VLLM_BIN}" "${vllm_args[@]}" >"${server_log}" 2>&1 &
-  SERVER_PID=$!
-
-  local deadline=$((SECONDS + STARTUP_TIMEOUT))
-  until curl --silent --fail --max-time 2 "${BASE_URL}/health" >/dev/null 2>&1; do
-    if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
-      echo "vLLM exited during startup. Last log lines:" >&2
-      tail -n 80 "${server_log}" >&2
+  for ((rank = 0; rank < DP_REPLICAS; rank++)); do
+    local rank_port=$((PORT + rank))
+    local rank_base_url="http://${HOST}:${rank_port}"
+    if curl --silent --fail --max-time 2 \
+      "${rank_base_url}/health" >/dev/null 2>&1; then
+      echo "Port ${rank_port} already has a healthy server." >&2
       exit 1
     fi
-    if ((SECONDS >= deadline)); then
-      echo "Timed out waiting for vLLM after ${STARTUP_TIMEOUT}s." >&2
-      tail -n 80 "${server_log}" >&2
-      exit 1
-    fi
-    sleep 2
+    SERVER_BASE_URLS+=("${rank_base_url}")
   done
 
-  echo "vLLM is ready; available models:"
-  curl --silent --fail "${BASE_URL}/v1/models"
-  echo
+  for ((rank = 0; rank < DP_REPLICAS; rank++)); do
+    local rank_port=$((PORT + rank))
+    local rank_base_url="${SERVER_BASE_URLS[$rank]}"
+    local gpu_id="${gpu_id_list[$rank]}"
+    local server_log="${backend_log_dir}/vllm_server_rank${rank}.log"
+    if ((DP_REPLICAS == 1)); then
+      server_log="${backend_log_dir}/vllm_server.log"
+    fi
+    local vllm_args=(
+      serve "${MODEL_PATH}"
+      --host "${HOST}"
+      --port "${rank_port}"
+      --served-model-name "${SERVED_MODEL_NAME}"
+      --attention-backend "${attention_backend}"
+      --dtype "${DTYPE}"
+      --generation-config vllm
+      --enable-prefix-caching
+      --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
+      --max-model-len "${MAX_MODEL_LEN}"
+      --max-num-seqs "${MAX_NUM_SEQS}"
+    )
+    if [[ "${ENFORCE_EAGER}" == "1" ]]; then
+      vllm_args+=(--enforce-eager)
+    fi
+    if [[ -n "${VLLM_SERVER_EXTRA_ARGS}" ]]; then
+      read -r -a extra_vllm_args <<<"${VLLM_SERVER_EXTRA_ARGS}"
+      vllm_args+=("${extra_vllm_args[@]}")
+    fi
+
+    echo "Starting ${MODEL_PATH} with ${attention_backend} rank ${rank}"
+    echo "  GPU ${gpu_id}, endpoint ${rank_base_url}"
+    CUDA_VISIBLE_DEVICES="${gpu_id}" \
+      "${VLLM_BIN}" "${vllm_args[@]}" >"${server_log}" 2>&1 &
+    SERVER_PIDS+=("$!")
+  done
+
+  for ((rank = 0; rank < DP_REPLICAS; rank++)); do
+    local rank_base_url="${SERVER_BASE_URLS[$rank]}"
+    local server_log="${backend_log_dir}/vllm_server_rank${rank}.log"
+    if ((DP_REPLICAS == 1)); then
+      server_log="${backend_log_dir}/vllm_server.log"
+    fi
+    local deadline=$((SECONDS + STARTUP_TIMEOUT))
+    until curl --silent --fail --max-time 2 \
+      "${rank_base_url}/health" >/dev/null 2>&1; do
+      if ! kill -0 "${SERVER_PIDS[$rank]}" 2>/dev/null; then
+        echo "vLLM rank ${rank} exited during startup. Last log lines:" >&2
+        tail -n 80 "${server_log}" >&2
+        exit 1
+      fi
+      if ((SECONDS >= deadline)); then
+        echo "Timed out waiting for vLLM rank ${rank}." >&2
+        tail -n 80 "${server_log}" >&2
+        exit 1
+      fi
+      sleep 2
+    done
+    echo "vLLM rank ${rank} is ready:"
+    curl --silent --fail "${rank_base_url}/v1/models"
+    echo
+  done
+
+  local base_urls_arg=""
+  for rank_base_url in "${SERVER_BASE_URLS[@]}"; do
+    if [[ -n "${base_urls_arg}" ]]; then
+      base_urls_arg+=","
+    fi
+    base_urls_arg+="${rank_base_url}/v1"
+  done
 
   local benchmark_args=(
     -m cli run-api
@@ -151,7 +213,9 @@ run_backend() {
     --sample-index "${SAMPLE_INDEX}"
     --sample-count "${SAMPLE_COUNT}"
     --api-mode chat
-    --base-url "${BASE_URL}/v1"
+    --base-url "${SERVER_BASE_URLS[0]}/v1"
+    --base-urls "${base_urls_arg}"
+    --dp-routing "${effective_dp_routing}"
     --model "${SERVED_MODEL_NAME}"
     --prefix-tokens "${PREFIX_TOKENS}"
     --branches "${BRANCHES}"

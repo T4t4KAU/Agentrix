@@ -31,11 +31,108 @@ class APIBranchResult:
     branch_id: int
     case_index: int
     group_id: int
+    route_rank: int
     input_tokens: int
     output_tokens: int
     latency_ms: float
     text: str
     strategy: str
+
+
+DP_ROUTINGS = {
+    "single",
+    "round_robin",
+    "prefix_sticky",
+    "prefix_forest",
+}
+
+
+def _branch_rank_map(
+    case_count: int,
+    branch_count: int,
+    branch_group_size: int,
+    desired_suffixes: list[int],
+    dp_size: int,
+    dp_routing: str,
+) -> dict[tuple[int, int], int]:
+    if dp_routing not in DP_ROUTINGS:
+        raise ValueError(f"unsupported DP routing: {dp_routing}")
+    if dp_size <= 0:
+        raise ValueError("dp_size must be positive")
+    if len(desired_suffixes) != case_count * branch_count:
+        raise ValueError("desired suffix count must match the branch matrix")
+    if dp_routing != "single" and dp_size == 1:
+        raise ValueError(f"{dp_routing} requires at least two base URLs")
+
+    route_map: dict[tuple[int, int], int] = {}
+    if dp_routing == "single":
+        for case_index in range(case_count):
+            for branch_index in range(branch_count):
+                route_map[(case_index, branch_index)] = 0
+        return route_map
+
+    if dp_routing == "round_robin":
+        for case_index in range(case_count):
+            for branch_index in range(branch_count):
+                global_index = case_index * branch_count + branch_index
+                route_map[(case_index, branch_index)] = global_index % dp_size
+        return route_map
+
+    if dp_routing == "prefix_sticky":
+        for case_index in range(case_count):
+            rank = case_index % dp_size
+            for branch_index in range(branch_count):
+                route_map[(case_index, branch_index)] = rank
+        return route_map
+
+    group_count = (branch_count + branch_group_size - 1) // branch_group_size
+    group_weights: list[tuple[int, int, int]] = []
+    for case_index in range(case_count):
+        for group_id in range(group_count):
+            start = group_id * branch_group_size
+            end = min(branch_count, start + branch_group_size)
+            weight = sum(
+                desired_suffixes[case_index * branch_count + branch_index]
+                for branch_index in range(start, end)
+            )
+            group_weights.append((case_index, group_id, weight + end - start))
+
+    rank_loads = [0] * dp_size
+    group_rank: dict[tuple[int, int], int] = {}
+    for case_index, group_id, weight in sorted(
+        group_weights,
+        key=lambda item: (-item[2], item[0], item[1]),
+    ):
+        rank = min(range(dp_size), key=lambda item: (rank_loads[item], item))
+        group_rank[(case_index, group_id)] = rank
+        rank_loads[rank] += weight
+
+    for case_index in range(case_count):
+        for branch_index in range(branch_count):
+            group_id = branch_index // branch_group_size
+            route_map[(case_index, branch_index)] = group_rank[
+                (case_index, group_id)
+            ]
+    return route_map
+
+
+def _rank_counts(route_map: dict[tuple[int, int], int], dp_size: int) -> list[int]:
+    counts = [0] * dp_size
+    for rank in route_map.values():
+        counts[rank] += 1
+    return counts
+
+
+def _common_rank(
+    case_index: int,
+    route_map: dict[tuple[int, int], int],
+    branch_count: int,
+    dp_size: int,
+) -> int:
+    counts = [0] * dp_size
+    for branch_index in range(branch_count):
+        counts[route_map[(case_index, branch_index)]] += 1
+    return min(range(dp_size), key=lambda rank: (-counts[rank], rank))
 
 
 async def run_api_case(
@@ -52,11 +149,13 @@ async def run_api_case(
     common_analysis_tokens: int = 256,
     api_mode: str = "responses",
     base_url: str | None = None,
+    base_urls: list[str] | None = None,
     api_key_env: str = "OPENAI_API_KEY",
     reasoning_effort: str | None = None,
     case_count: int = 1,
     branch_group_size: int = 1,
     branch_order: str = "case_major",
+    dp_routing: str = "single",
 ) -> tuple[BenchmarkTrace, dict[str, Any]]:
     import random
 
@@ -72,9 +171,16 @@ async def run_api_case(
         raise ValueError(f"unsupported API mode: {api_mode}")
     if branch_order not in {"case_major", "round_robin", "shuffle"}:
         raise ValueError(f"unsupported branch order: {branch_order}")
+    if dp_routing not in DP_ROUTINGS:
+        raise ValueError(f"unsupported DP routing: {dp_routing}")
 
     case_started = time.perf_counter()
-    client = AsyncOpenAI(api_key=os.getenv(api_key_env), base_url=base_url)
+    client_base_urls = list(base_urls or [base_url])
+    clients = [
+        AsyncOpenAI(api_key=os.getenv(api_key_env), base_url=url)
+        for url in client_base_urls
+    ]
+    dp_size = len(clients)
     contexts = (
         [common_context]
         if isinstance(common_context, str)
@@ -88,11 +194,32 @@ async def run_api_case(
             for context in contexts
         ]
 
+    total_branches = case_count * branch_count
+    desired_suffixes = sample_suffixes(
+        total_branches,
+        suffix_distribution,
+        suffix_mean,
+        random.Random(seed),
+    )
+    route_map = _branch_rank_map(
+        case_count,
+        branch_count,
+        branch_group_size,
+        desired_suffixes,
+        dp_size,
+        dp_routing,
+    )
+    common_ranks = [
+        _common_rank(case_index, route_map, branch_count, dp_size)
+        for case_index in range(case_count)
+    ]
+
     common_started = time.perf_counter()
 
     async def request(
-        messages: list[dict[str, str]], max_tokens: int
+        messages: list[dict[str, str]], max_tokens: int, route_rank: int
     ) -> tuple[str, int, int]:
+        client = clients[route_rank]
         if api_mode == "responses":
             kwargs: dict[str, Any] = {
                 "model": model,
@@ -133,8 +260,12 @@ async def run_api_case(
 
     common_results = await asyncio.gather(
         *(
-            request([{"role": "user", "content": context}], common_analysis_tokens)
-            for context in contexts
+            request(
+                [{"role": "user", "content": context}],
+                common_analysis_tokens,
+                common_ranks[case_index],
+            )
+            for case_index, context in enumerate(contexts)
         )
     )
     common_latency_ms = (time.perf_counter() - common_started) * 1000
@@ -152,6 +283,7 @@ async def run_api_case(
         common_cases.append(
             {
                 "case_index": case_index,
+                "route_rank": common_ranks[case_index],
                 "input_tokens": common_input_tokens,
                 "output_tokens": common_output_tokens,
                 "prefix_tokens": count_tokens(shared_context, model),
@@ -162,13 +294,6 @@ async def run_api_case(
         int(case["prefix_tokens"]) for case in common_cases
     ]
     local_prefix_tokens = int(statistics.fmean(local_prefix_tokens_by_case))
-    total_branches = case_count * branch_count
-    desired_suffixes = sample_suffixes(
-        total_branches,
-        suffix_distribution,
-        suffix_mean,
-        random.Random(seed),
-    )
     semaphore = asyncio.Semaphore(concurrency)
     branch_specs = [
         (case_index, branch_index)
@@ -219,17 +344,20 @@ async def run_api_case(
         if group_context:
             messages.append({"role": "user", "content": group_context})
         messages.append({"role": "user", "content": private_context})
+        route_rank = route_map[(case_index, branch_index)]
         started = time.perf_counter()
         async with semaphore:
             text, input_tokens, actual_output_tokens = await request(
                 messages,
                 output_tokens,
+                route_rank,
             )
         latency_ms = (time.perf_counter() - started) * 1000
         return APIBranchResult(
             branch_id=index,
             case_index=case_index,
             group_id=group_id,
+            route_rank=route_rank,
             input_tokens=input_tokens,
             output_tokens=actual_output_tokens,
             latency_ms=latency_ms,
@@ -276,12 +404,20 @@ async def run_api_case(
             "seed": seed,
             "api_mode": api_mode,
             "base_url": base_url,
+            "base_urls": client_base_urls,
             "api_key_env": api_key_env,
             "reasoning_effort": reasoning_effort,
             "case_count": case_count,
             "branches_per_case": branch_count,
             "branch_group_size": branch_group_size,
             "branch_order": branch_order,
+            "dp_routing": dp_routing,
+            "dp_size": dp_size,
+            "branch_route_counts": _rank_counts(route_map, dp_size),
+            "common_route_counts": [
+                sum(1 for rank in common_ranks if rank == index)
+                for index in range(dp_size)
+            ],
             "prefix_tokens_by_case": local_prefix_tokens_by_case,
         },
     )
@@ -289,12 +425,20 @@ async def run_api_case(
         "model": model,
         "api_mode": api_mode,
         "base_url": base_url,
+        "base_urls": client_base_urls,
         "api_key_env": api_key_env,
         "reasoning_effort": reasoning_effort,
         "case_count": case_count,
         "branches_per_case": branch_count,
         "branch_group_size": branch_group_size,
         "branch_order": branch_order,
+        "dp_routing": dp_routing,
+        "dp_size": dp_size,
+        "branch_route_counts": _rank_counts(route_map, dp_size),
+        "common_route_counts": [
+            sum(1 for rank in common_ranks if rank == index)
+            for index in range(dp_size)
+        ],
         "total_latency_ms": (time.perf_counter() - case_started) * 1000,
         "branch_phase_latency_ms": branch_phase_latency_ms,
         "common": {
@@ -305,5 +449,5 @@ async def run_api_case(
         },
         "branches": [asdict(result) for result in branches],
     }
-    await client.close()
+    await asyncio.gather(*(client.close() for client in clients))
     return trace, raw

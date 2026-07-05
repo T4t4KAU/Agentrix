@@ -43,6 +43,7 @@ def _parser() -> argparse.ArgumentParser:
         default=os.getenv("OPENAI_API_MODE", "responses"),
     )
     api.add_argument("--base-url", default=os.getenv("OPENAI_BASE_URL"))
+    api.add_argument("--base-urls", default=os.getenv("OPENAI_BASE_URLS"))
     api.add_argument("--api-key-env", default=os.getenv("OPENAI_API_KEY_ENV"))
     api.add_argument(
         "--reasoning-effort",
@@ -56,6 +57,11 @@ def _parser() -> argparse.ArgumentParser:
         "--branch-order",
         choices=["case_major", "round_robin", "shuffle"],
         default="case_major",
+    )
+    api.add_argument(
+        "--dp-routing",
+        choices=["single", "round_robin", "prefix_sticky", "prefix_forest"],
+        default="single",
     )
     api.add_argument("--prefix-tokens", type=int, default=8192)
     api.add_argument("--suffix-mean", type=int, default=768)
@@ -116,6 +122,13 @@ def main(argv: list[str] | None = None) -> int:
 
     traces: list[BenchmarkTrace] = []
     raw_results = []
+    base_urls = None
+    if args.base_urls:
+        base_urls = [
+            item.strip()
+            for item in args.base_urls.split(",")
+            if item.strip()
+        ]
     end_index = args.sample_index + sample_count
     for batch_index, sample_start in enumerate(
         range(args.sample_index, end_index, args.case_count)
@@ -142,11 +155,13 @@ def main(argv: list[str] | None = None) -> int:
                 common_analysis_tokens=args.common_analysis_tokens,
                 api_mode=args.api_mode,
                 base_url=args.base_url,
+                base_urls=base_urls,
                 api_key_env=api_key_env,
                 reasoning_effort=args.reasoning_effort,
                 case_count=current_case_count,
                 branch_group_size=args.branch_group_size,
                 branch_order=args.branch_order,
+                dp_routing=args.dp_routing,
             )
         )
         trace = BenchmarkTrace(
