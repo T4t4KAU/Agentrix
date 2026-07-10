@@ -63,6 +63,16 @@ RUN uv pip install --python .venv/bin/python \
 
 WORKDIR /workspace/agentrix
 
+COPY LMCache/ LMCache/
+
+WORKDIR /workspace/agentrix/LMCache
+
+RUN uv pip install --python ../vllm/.venv/bin/python \
+    --no-build-isolation \
+    -e .
+
+WORKDIR /workspace/agentrix
+
 COPY benchmark/ benchmark/
 
 WORKDIR /workspace/agentrix/benchmark

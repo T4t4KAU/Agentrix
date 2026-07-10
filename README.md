@@ -1,9 +1,10 @@
 # Agentrix
 
-Agentrix keeps the shared-prefix attention implementation for vLLM and its
-end-to-end benchmark suite in one repository:
+Agentrix keeps the shared-prefix attention implementation for vLLM, its
+LMCache integration, and the end-to-end benchmark suite in one repository:
 
 - `vllm/` is a Git submodule pinned to the experimental implementation.
+- `LMCache/` is a Git submodule pinned to the tiered KV storage implementation.
 - `benchmark/` contains simulation, API, and local vLLM benchmarks.
 
 ## System Requirements
@@ -24,7 +25,7 @@ nvidia-smi
 
 ## Clone the Repository
 
-Initialize the vLLM submodule when cloning:
+Initialize both submodules when cloning:
 
 ```bash
 git clone --recurse-submodules <agentrix-repository-url> agentrix
@@ -40,10 +41,9 @@ git submodule sync --recursive
 git submodule update --init --recursive
 ```
 
-The `vllm/` submodule should be pinned to commit `d74abf592` on the
-`fork-attn` branch. Before publishing the Agentrix repository, verify that this
-commit is available from the vLLM
-remote specified in `.gitmodules`.
+Both submodules track their `fork-attn` branches. Agentrix records exact commit
+IDs, so verify that the pinned commits are available from the remotes in
+`.gitmodules` before publishing the parent repository.
 
 ## Install uv
 
@@ -115,6 +115,65 @@ export TORCH_CUDA_ARCH_LIST=12.0
 .venv/bin/cmake --build --preset release --target install --parallel 2 --verbose
 cd ..
 ```
+
+## Build and Enable LMCache
+
+Install LMCache into the same environment as vLLM so the connector and CUDA
+extension use the same Python, PyTorch, and CUDA ABI:
+
+```bash
+git submodule update --init --recursive
+cd LMCache
+source ../vllm/.venv/bin/activate
+export MAX_JOBS=2
+export NVCC_THREADS=1
+uv pip install --no-build-isolation -e .
+cd ..
+```
+
+Create an LMCache configuration. With `disk_cache_mode: eviction`, new KV
+chunks enter CPU memory first and are asynchronously demoted to disk only when
+the CPU cache evicts them. Omitting this setting preserves LMCache's original
+write-through behavior.
+
+```yaml
+# /tmp/agentrix-lmcache.yaml
+chunk_size: 256
+local_cpu: true
+max_local_cpu_size: 8
+local_disk: /mnt/nvme/lmcache
+max_local_disk_size: 128
+cache_policy: LRU
+extra_config:
+  disk_cache_mode: eviction
+  disk_io_threads: 4
+```
+
+Enable the vLLM connector with the configuration file:
+
+```bash
+export LMCACHE_CONFIG_FILE=/tmp/agentrix-lmcache.yaml
+vllm serve /path/to/model \
+  --enable-prefix-caching \
+  --kv-transfer-config \
+  '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}'
+```
+
+Run the reproducible three-tier smoke test. It intentionally limits the CPU
+cache to a few Qwen3-1.7B KV chunks and lowers vLLM's GPU allocation so
+CPU-to-disk demotion is exercised quickly:
+
+```bash
+cd benchmark
+MODEL_PATH=/path/to/Qwen3-1.7B \
+VLLM_BIN=../vllm/.venv/bin/vllm \
+./scripts/run_lmcache_tiered_smoke.sh
+cd ..
+```
+
+The command succeeds only if LMCache writes KV chunk files to the disk tier.
+Its configuration, server log, benchmark output, and `smoke_summary.txt` are
+written under `benchmark/results/lmcache_tiered_smoke/` by default.
 
 ## Install the Benchmark Suite
 

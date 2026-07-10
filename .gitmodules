@@ -2,3 +2,7 @@
 	path = vllm
 	url = https://github.com/T4t4KAU/vllm.git
 	branch = fork-attn
+[submodule "LMCache"]
+	path = LMCache
+	url = https://github.com/T4t4KAU/LMCache.git
+	branch = fork-attn
