@@ -15,6 +15,7 @@ ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-9000}"
 DP_REPLICAS="${DP_REPLICAS:-1}"
+DP_DEPLOYMENT="${DP_DEPLOYMENT:-external}"
 DP_ROUTING="${DP_ROUTING:-single}"
 GPU_IDS="${GPU_IDS:-}"
 DATASET="${DATASET:-swebench}"
@@ -76,6 +77,16 @@ if ((DP_REPLICAS <= 0)); then
   exit 1
 fi
 
+if [[ "${DP_DEPLOYMENT}" != "external" && "${DP_DEPLOYMENT}" != "internal" ]]; then
+  echo "DP_DEPLOYMENT must be external or internal." >&2
+  exit 1
+fi
+
+SERVER_COUNT="${DP_REPLICAS}"
+if [[ "${DP_DEPLOYMENT}" == "internal" ]]; then
+  SERVER_COUNT=1
+fi
+
 if [[ "${KEEP_SERVER}" == "1" ]] && ((${#BACKEND_LIST[@]} > 1)); then
   echo "KEEP_SERVER=1 is only supported for single-backend debugging." >&2
   exit 1
@@ -99,9 +110,9 @@ stop_server() {
 
 write_prometheus_metrics() {
   local backend_log_dir="$1"
-  for ((rank = 0; rank < DP_REPLICAS; rank++)); do
+  for ((rank = 0; rank < SERVER_COUNT; rank++)); do
     local metrics_path="${backend_log_dir}/prometheus_metrics_rank${rank}.prom"
-    if ((DP_REPLICAS == 1)); then
+    if ((SERVER_COUNT == 1)); then
       metrics_path="${backend_log_dir}/prometheus_metrics.prom"
     fi
     curl --silent --fail --max-time 10 \
@@ -113,10 +124,10 @@ write_server_profile() {
   local backend_log_dir="$1"
   local profile_path="${backend_log_dir}/server_profile.json"
   local log_paths=()
-  if ((DP_REPLICAS == 1)); then
+  if ((SERVER_COUNT == 1)); then
     log_paths+=("${backend_log_dir}/vllm_server.log")
   else
-    for ((rank = 0; rank < DP_REPLICAS; rank++)); do
+    for ((rank = 0; rank < SERVER_COUNT; rank++)); do
       log_paths+=("${backend_log_dir}/vllm_server_rank${rank}.log")
     done
   fi
@@ -134,6 +145,7 @@ write_server_profile() {
 from __future__ import annotations
 
 import ast
+import csv
 import json
 import re
 import sys
@@ -217,6 +229,38 @@ def parse_log(path: Path) -> dict[str, object]:
         text,
     ):
         metadata_averages[match.group(1)] = float(match.group(2))
+    routing_matches = re.findall(
+        r"ForkAttention DP prefix routing stats: requests=(\d+), "
+        r"affinity_routes=(\d+), graph_bound_routes=(\d+), "
+        r"arrival_waves=(\d+), "
+        r"rank_routes=(\[[^\n]+?\]), "
+        r"avg_route_us=([0-9.]+)",
+        text,
+    )
+    routing_stats: dict[str, object] = {}
+    if routing_matches:
+        (
+            requests,
+            affinity_routes,
+            graph_bound_routes,
+            arrival_waves,
+            rank_routes,
+            avg_route_us,
+        ) = routing_matches[-1]
+        routing_stats = {
+            "requests": int(requests),
+            "affinity_routes": int(affinity_routes),
+            "graph_bound_routes": int(graph_bound_routes),
+            "arrival_waves": int(arrival_waves),
+            "rank_routes": ast.literal_eval(rank_routes),
+            "avg_route_us": float(avg_route_us),
+        }
+        telemetry_matches = re.findall(
+            r"ForkAttention DP prefix routing stats:.*?telemetry=(\[[^\n]+\])",
+            text,
+        )
+        if telemetry_matches:
+            routing_stats["telemetry"] = ast.literal_eval(telemetry_matches[-1])
     return {
         "log": str(path),
         "gpu_kv_cache_tokens": int_or_none(kv_match.group(1) if kv_match else None),
@@ -246,15 +290,28 @@ def parse_log(path: Path) -> dict[str, object]:
         ),
         "fork_cudagraph_dispatch": graph_dispatch,
         "fork_metadata_avg_ms": metadata_averages,
+        "fork_dp_prefix_routing": routing_stats,
         **profile,
     }
 
 
 def main() -> int:
     profile_path = Path(sys.argv[1])
+    result_path = profile_path.parent / "benchmark_results.csv"
+    actual_sample_count = int(sys.argv[3])
+    batch_count = None
+    if result_path.exists():
+        with result_path.open(encoding="utf-8", newline="") as handle:
+            result_rows = list(csv.DictReader(handle))
+        batch_count = len(result_rows)
+        branches = int(sys.argv[4])
+        actual_sample_count = sum(
+            int(row["branch_count"]) // branches for row in result_rows
+        )
     workload = {
         "case_count": int(sys.argv[2]),
-        "sample_count": int(sys.argv[3]),
+        "sample_count": actual_sample_count,
+        "batch_count": batch_count,
         "branches": int(sys.argv[4]),
         "concurrency": int(sys.argv[5]),
         "prefix_tokens": int(sys.argv[6]),
@@ -317,7 +374,7 @@ run_backend() {
   local effective_dp_routing="${DP_ROUTING}"
 
   mkdir -p "${backend_log_dir}"
-  if ((DP_REPLICAS == 1)); then
+  if ((DP_REPLICAS == 1)) || [[ "${DP_DEPLOYMENT}" == "internal" ]]; then
     effective_dp_routing="single"
   fi
 
@@ -336,8 +393,10 @@ run_backend() {
     echo "GPU_IDS must provide at least DP_REPLICAS entries." >&2
     exit 1
   fi
+  local internal_gpu_ids
+  internal_gpu_ids="$(IFS=,; echo "${gpu_id_list[*]:0:${DP_REPLICAS}}")"
 
-  for ((rank = 0; rank < DP_REPLICAS; rank++)); do
+  for ((rank = 0; rank < SERVER_COUNT; rank++)); do
     local rank_port=$((PORT + rank))
     local rank_base_url="http://${HOST}:${rank_port}"
     if curl --silent --fail --max-time 2 \
@@ -348,12 +407,15 @@ run_backend() {
     SERVER_BASE_URLS+=("${rank_base_url}")
   done
 
-  for ((rank = 0; rank < DP_REPLICAS; rank++)); do
+  for ((rank = 0; rank < SERVER_COUNT; rank++)); do
     local rank_port=$((PORT + rank))
     local rank_base_url="${SERVER_BASE_URLS[$rank]}"
     local gpu_id="${gpu_id_list[$rank]}"
+    if [[ "${DP_DEPLOYMENT}" == "internal" ]]; then
+      gpu_id="${internal_gpu_ids}"
+    fi
     local server_log="${backend_log_dir}/vllm_server_rank${rank}.log"
-    if ((DP_REPLICAS == 1)); then
+    if ((SERVER_COUNT == 1)); then
       server_log="${backend_log_dir}/vllm_server.log"
     fi
     local vllm_args=(
@@ -372,6 +434,12 @@ run_backend() {
     if [[ "${ENFORCE_EAGER}" == "1" ]]; then
       vllm_args+=(--enforce-eager)
     fi
+    if [[ "${DP_DEPLOYMENT}" == "internal" ]]; then
+      vllm_args+=(
+        --data-parallel-size "${DP_REPLICAS}"
+        --api-server-count 1
+      )
+    fi
     if [[ -n "${KV_TRANSFER_CONFIG}" ]]; then
       vllm_args+=(--kv-transfer-config "${KV_TRANSFER_CONFIG}")
     fi
@@ -380,17 +448,17 @@ run_backend() {
       vllm_args+=("${extra_vllm_args[@]}")
     fi
 
-    echo "Starting ${MODEL_PATH} with ${attention_backend} rank ${rank}"
-    echo "  GPU ${gpu_id}, endpoint ${rank_base_url}"
+    echo "Starting ${MODEL_PATH} with ${attention_backend} server ${rank}"
+    echo "  GPUs ${gpu_id}, endpoint ${rank_base_url}, DP ${DP_DEPLOYMENT}"
     CUDA_VISIBLE_DEVICES="${gpu_id}" \
       "${VLLM_BIN}" "${vllm_args[@]}" >"${server_log}" 2>&1 &
     SERVER_PIDS+=("$!")
   done
 
-  for ((rank = 0; rank < DP_REPLICAS; rank++)); do
+  for ((rank = 0; rank < SERVER_COUNT; rank++)); do
     local rank_base_url="${SERVER_BASE_URLS[$rank]}"
     local server_log="${backend_log_dir}/vllm_server_rank${rank}.log"
-    if ((DP_REPLICAS == 1)); then
+    if ((SERVER_COUNT == 1)); then
       server_log="${backend_log_dir}/vllm_server.log"
     fi
     local deadline=$((SECONDS + STARTUP_TIMEOUT))
