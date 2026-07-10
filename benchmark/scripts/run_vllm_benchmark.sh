@@ -20,13 +20,13 @@ GPU_IDS="${GPU_IDS:-}"
 DATASET="${DATASET:-swebench}"
 DATA_PATH="${DATA_PATH:-}"
 SAMPLE_INDEX="${SAMPLE_INDEX:-0}"
-SAMPLE_COUNT="${SAMPLE_COUNT:-1}"
+CASE_COUNT="${CASE_COUNT:-1}"
+SAMPLE_COUNT="${SAMPLE_COUNT:-${CASE_COUNT}}"
 FULL_DATASET="${FULL_DATASET:-0}"
 PREFIX_TOKENS="${PREFIX_TOKENS:-2048}"
 BRANCHES="${BRANCHES:-2}"
-CASE_COUNT="${CASE_COUNT:-1}"
 BRANCH_GROUP_SIZE="${BRANCH_GROUP_SIZE:-1}"
-BRANCH_ORDER="${BRANCH_ORDER:-case_major}"
+BRANCH_ORDER="${BRANCH_ORDER:-round_robin}"
 CONCURRENCY="${CONCURRENCY:-$((BRANCHES * CASE_COUNT))}"
 SUFFIX_DISTRIBUTION="${SUFFIX_DISTRIBUTION:-lognormal}"
 SUFFIX_MEAN="${SUFFIX_MEAN:-128}"
@@ -42,6 +42,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-results/fork_attention_${DATASET}_c${CASE_COUNT}_p${PR
 KEEP_SERVER="${KEEP_SERVER:-0}"
 VLLM_SERVER_EXTRA_ARGS="${VLLM_SERVER_EXTRA_ARGS:-}"
 BENCHMARK_EXTRA_ARGS="${BENCHMARK_EXTRA_ARGS:-}"
+KV_TRANSFER_CONFIG="${KV_TRANSFER_CONFIG:-}"
 
 LOG_DIR="${BENCHMARK_DIR}/${OUTPUT_DIR}"
 SERVER_PIDS=()
@@ -94,6 +95,200 @@ stop_server() {
   done
   SERVER_PIDS=()
   SERVER_BASE_URLS=()
+}
+
+write_prometheus_metrics() {
+  local backend_log_dir="$1"
+  for ((rank = 0; rank < DP_REPLICAS; rank++)); do
+    local metrics_path="${backend_log_dir}/prometheus_metrics_rank${rank}.prom"
+    if ((DP_REPLICAS == 1)); then
+      metrics_path="${backend_log_dir}/prometheus_metrics.prom"
+    fi
+    curl --silent --fail --max-time 10 \
+      "${SERVER_BASE_URLS[$rank]}/metrics" >"${metrics_path}" || true
+  done
+}
+
+write_server_profile() {
+  local backend_log_dir="$1"
+  local profile_path="${backend_log_dir}/server_profile.json"
+  local log_paths=()
+  if ((DP_REPLICAS == 1)); then
+    log_paths+=("${backend_log_dir}/vllm_server.log")
+  else
+    for ((rank = 0; rank < DP_REPLICAS; rank++)); do
+      log_paths+=("${backend_log_dir}/vllm_server_rank${rank}.log")
+    done
+  fi
+
+  "${BENCHMARK_PYTHON}" - \
+    "${profile_path}" \
+    "${CASE_COUNT}" \
+    "${SAMPLE_COUNT}" \
+    "${BRANCHES}" \
+    "${CONCURRENCY}" \
+    "${PREFIX_TOKENS}" \
+    "${BRANCH_ORDER}" \
+    "${SUFFIX_DISTRIBUTION}" \
+    "${log_paths[@]}" <<'PY'
+from __future__ import annotations
+
+import json
+import re
+import sys
+from pathlib import Path
+
+
+PROFILE_KEYS = [
+    "candidates",
+    "hot_shared_candidates",
+    "selected_chunks",
+    "selected_blocks",
+    "protected_hot_shared_chunks",
+    "protected_hot_shared_blocks",
+    "selected_hot_shared_chunks",
+    "selected_hot_shared_blocks",
+    "lifecycle_hot_candidates",
+    "lifecycle_cooling_candidates",
+    "lifecycle_cold_candidates",
+    "gpu_hotset_reserved_blocks",
+]
+
+
+def int_or_none(value: str | None) -> int | None:
+    if value is None:
+        return None
+    return int(value.replace(",", ""))
+
+
+def max_field(lines: list[str], key: str) -> int:
+    pattern = re.compile(rf"{re.escape(key)}=(\d+)")
+    values = [int(match.group(1)) for line in lines for match in pattern.finditer(line)]
+    return max(values, default=0)
+
+
+def prometheus_counter(path: Path, metric: str) -> float:
+    if not path.exists():
+        return 0.0
+    pattern = re.compile(
+        rf"^{re.escape(metric)}(?:_total)?(?:\{{[^}}]*\}})?\s+([0-9.eE+-]+)$",
+        re.MULTILINE,
+    )
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    return sum(float(value) for value in pattern.findall(text))
+
+
+def parse_log(path: Path) -> dict[str, object]:
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    lines = text.splitlines()
+    kv_match = re.search(r"GPU KV cache size:\s*([0-9,]+)\s*tokens", text)
+    concurrency_match = re.search(
+        r"Maximum concurrency for\s*([0-9,]+)\s*tokens per request:\s*([0-9.]+)x",
+        text,
+    )
+    profile = {f"max_{key}": max_field(lines, key) for key in PROFILE_KEYS}
+    usages = [
+        float(value)
+        for value in re.findall(r"kv_cache_usage=([0-9.]+)", text)
+    ]
+    pressure_steps = {
+        level: text.count(f"pressure={level}")
+        for level in ("normal", "high", "critical")
+    }
+    metrics_name = (
+        "prometheus_metrics.prom"
+        if path.name == "vllm_server.log"
+        else path.name.replace("vllm_server_rank", "prometheus_metrics_rank").replace(
+            ".log", ".prom"
+        )
+    )
+    metrics_path = path.with_name(metrics_name)
+    return {
+        "log": str(path),
+        "gpu_kv_cache_tokens": int_or_none(kv_match.group(1) if kv_match else None),
+        "max_model_len_for_concurrency": int_or_none(
+            concurrency_match.group(1) if concurrency_match else None
+        ),
+        "max_concurrency": (
+            float(concurrency_match.group(2)) if concurrency_match else None
+        ),
+        "fanout_preemption_selected_victims": text.count(
+            "Fanout preemption selected victim"
+        ),
+        "fanout_admission_promoted_cohorts": text.count(
+            "Fanout admission promoted cohort"
+        ),
+        "fanout_gpu_hotset_reservations": text.count(
+            "Fanout GPU hotset reserved"
+        ),
+        "preempt_log_lines": len(re.findall("preempt", text, re.IGNORECASE)),
+        "max_observed_kv_cache_usage": max(usages, default=0.0),
+        "pressure_steps": pressure_steps,
+        "kv_offload_load_bytes": prometheus_counter(
+            metrics_path, "vllm:kv_offload_load_bytes"
+        ),
+        "kv_offload_store_bytes": prometheus_counter(
+            metrics_path, "vllm:kv_offload_store_bytes"
+        ),
+        **profile,
+    }
+
+
+def main() -> int:
+    profile_path = Path(sys.argv[1])
+    workload = {
+        "case_count": int(sys.argv[2]),
+        "sample_count": int(sys.argv[3]),
+        "branches": int(sys.argv[4]),
+        "concurrency": int(sys.argv[5]),
+        "prefix_tokens": int(sys.argv[6]),
+        "branch_order": sys.argv[7],
+        "suffix_distribution": sys.argv[8],
+    }
+    logs = [Path(arg) for arg in sys.argv[9:]]
+    ranks = [parse_log(path) for path in logs if path.exists()]
+    aggregate: dict[str, object] = {"workload": workload, "ranks": ranks}
+    for key in (
+        "gpu_kv_cache_tokens",
+        "fanout_preemption_selected_victims",
+        "fanout_admission_promoted_cohorts",
+        "fanout_gpu_hotset_reservations",
+        "preempt_log_lines",
+        *(f"max_{name}" for name in PROFILE_KEYS),
+    ):
+        values = [rank.get(key) for rank in ranks if isinstance(rank.get(key), int)]
+        aggregate[key] = (
+            sum(values)
+            if key.endswith(("victims", "cohorts", "reservations", "lines"))
+            else max(values, default=0)
+        )
+    aggregate["max_observed_kv_cache_usage"] = max(
+        (
+            float(rank.get("max_observed_kv_cache_usage", 0.0))
+            for rank in ranks
+        ),
+        default=0.0,
+    )
+    aggregate["pressure_steps"] = {
+        level: sum(
+            int(rank.get("pressure_steps", {}).get(level, 0))
+            for rank in ranks
+            if isinstance(rank.get("pressure_steps"), dict)
+        )
+        for level in ("normal", "high", "critical")
+    }
+    for key in ("kv_offload_load_bytes", "kv_offload_store_bytes"):
+        aggregate[key] = sum(float(rank.get(key, 0.0)) for rank in ranks)
+    profile_path.write_text(
+        json.dumps(aggregate, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PY
 }
 
 trap stop_server EXIT INT TERM
@@ -160,6 +355,9 @@ run_backend() {
     )
     if [[ "${ENFORCE_EAGER}" == "1" ]]; then
       vllm_args+=(--enforce-eager)
+    fi
+    if [[ -n "${KV_TRANSFER_CONFIG}" ]]; then
+      vllm_args+=(--kv-transfer-config "${KV_TRANSFER_CONFIG}")
     fi
     if [[ -n "${VLLM_SERVER_EXTRA_ARGS}" ]]; then
       read -r -a extra_vllm_args <<<"${VLLM_SERVER_EXTRA_ARGS}"
@@ -245,6 +443,8 @@ run_backend() {
   echo "Running Agentrix benchmark for ${attention_backend}..."
   OPENAI_API_KEY="vllm-local" "${BENCHMARK_PYTHON}" "${benchmark_args[@]}"
 
+  write_prometheus_metrics "${backend_log_dir}"
+  write_server_profile "${backend_log_dir}"
   stop_server
   echo "Benchmark complete for ${attention_backend}: ${backend_log_dir}"
 }
