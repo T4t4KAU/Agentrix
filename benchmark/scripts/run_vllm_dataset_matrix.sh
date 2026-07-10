@@ -6,6 +6,7 @@ RUN_SCRIPT="${BENCHMARK_DIR}/scripts/run_vllm_benchmark.sh"
 
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-1.7B}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3-1.7b-local}"
+BACKENDS="${BACKENDS:-FORK_ATTN}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-results/fork_dataset_matrix_$(date +%Y%m%d_%H%M%S)}"
 AGENTBOARD_PATH="${AGENTBOARD_PATH:-${BENCHMARK_DIR}/data/agentboard.jsonl}"
 APPWORLD_PATH="${APPWORLD_PATH:-${BENCHMARK_DIR}/data/appworld.jsonl}"
@@ -31,7 +32,7 @@ for spec in "${DATASETS[@]}"; do
     DATA_PATH="${data_path}" \
     MODEL_PATH="${MODEL_PATH}" \
     SERVED_MODEL_NAME="${SERVED_MODEL_NAME}" \
-    BACKENDS=FORK_ATTN \
+    BACKENDS="${BACKENDS}" \
     SAMPLE_COUNT=4 \
     CASE_COUNT=4 \
     PREFIX_TOKENS=8192 \
