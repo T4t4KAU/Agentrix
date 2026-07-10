@@ -133,6 +133,7 @@ write_server_profile() {
     "${log_paths[@]}" <<'PY'
 from __future__ import annotations
 
+import ast
 import json
 import re
 import sys
@@ -203,6 +204,19 @@ def parse_log(path: Path) -> dict[str, object]:
         )
     )
     metrics_path = path.with_name(metrics_name)
+    dispatch_matches = re.findall(
+        r"ForkAttention CUDA graph dispatch: total=\d+ counters=(\{[^\n]+\})",
+        text,
+    )
+    graph_dispatch = (
+        ast.literal_eval(dispatch_matches[-1]) if dispatch_matches else {}
+    )
+    metadata_averages: dict[str, float] = {}
+    for match in re.finditer(
+        r"ForkAttention profile:.*?path=([^ ]+).*?avg_metadata_ms=([0-9.]+)",
+        text,
+    ):
+        metadata_averages[match.group(1)] = float(match.group(2))
     return {
         "log": str(path),
         "gpu_kv_cache_tokens": int_or_none(kv_match.group(1) if kv_match else None),
@@ -230,6 +244,8 @@ def parse_log(path: Path) -> dict[str, object]:
         "kv_offload_store_bytes": prometheus_counter(
             metrics_path, "vllm:kv_offload_store_bytes"
         ),
+        "fork_cudagraph_dispatch": graph_dispatch,
+        "fork_metadata_avg_ms": metadata_averages,
         **profile,
     }
 

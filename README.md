@@ -191,6 +191,26 @@ The comparison summary is written to
 files are written under the corresponding `flash_attn/` and `fork_attn/`
 subdirectories.
 
+ForkAttention can capture a sparse set of CUDA Graph plan capacities instead
+of the full batch-size and plan-bucket product. Profile a representative run,
+then pass the hot capacities to the matrix runner:
+
+```bash
+VLLM_FORK_ATTN_CUDAGRAPH_CAPTURE_BUCKETS="common:4,8;forest:256,512,1024" \
+./scripts/run_vllm_fanout_matrix.sh
+```
+
+`server_profile.json` records CUDA Graph hit/miss counters and average
+ForkAttention metadata construction time for selecting these capacities.
+
+AgentBoard and AppWorld directory adapters are also available. Point
+`DATA_PATH` at a checkout containing their prompt assets:
+
+```bash
+DATASET=agentboard DATA_PATH=/path/to/AgentBoard ./scripts/run_vllm_benchmark.sh
+DATASET=appworld DATA_PATH=/path/to/appworld ./scripts/run_vllm_benchmark.sh
+```
+
 On a two-GPU machine, run two single-GPU vLLM replicas and compare DP routing
 policies. `round_robin` is the load-balancing baseline. `prefix_forest` keeps
 each branch group on one replica while greedily balancing group weights across

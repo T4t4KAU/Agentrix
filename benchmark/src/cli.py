@@ -31,7 +31,11 @@ def _parser() -> argparse.ArgumentParser:
     simulate.add_argument("--output-dir", type=Path, default=Path("results/simulated"))
 
     api = subparsers.add_parser("run-api")
-    api.add_argument("--dataset", choices=["swebench", "agencybench"], required=True)
+    api.add_argument(
+        "--dataset",
+        choices=["swebench", "agencybench", "agentboard", "appworld"],
+        required=True,
+    )
     api.add_argument("--data-path", type=Path)
     api.add_argument("--sample-index", type=int, default=0)
     api.add_argument("--sample-count", type=int, default=1)
