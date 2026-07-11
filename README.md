@@ -347,6 +347,20 @@ docker build \
   -t agentrix:cu131 .
 ```
 
+CUDA 12.8 can compile the same SM120 kernels. Pin `TORCH_BACKEND=cu128` so a
+newer host driver does not make uv select a CUDA 13 PyTorch wheel. A single
+build job keeps the peak memory of large CUTLASS translation units bounded:
+
+```bash
+docker build \
+  --build-arg CUDA_IMAGE=nvidia/cuda:12.8.1-devel-ubuntu22.04 \
+  --build-arg TORCH_BACKEND=cu128 \
+  --build-arg MAX_JOBS=1 \
+  --build-arg NVCC_THREADS=1 \
+  --build-arg TORCH_CUDA_ARCH_LIST=12.0 \
+  -t agentrix:cu128 .
+```
+
 Run a smoke benchmark with access to the NVIDIA GPU and the host Hugging Face
 cache:
 
@@ -362,4 +376,5 @@ docker run --rm \
 ```
 
 For another GPU architecture, override `TORCH_CUDA_ARCH_LIST` at build time.
-The default value `12.0` targets NVIDIA Blackwell consumer GPUs.
+The default value `12.0` targets NVIDIA Blackwell consumer GPUs. Keep
+`CUDA_IMAGE` and `TORCH_BACKEND` on the same CUDA release family.

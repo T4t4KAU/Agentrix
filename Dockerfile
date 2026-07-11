@@ -1,11 +1,13 @@
 # syntax=docker/dockerfile:1
 
-FROM nvidia/cuda:13.1.0-devel-ubuntu22.04
+ARG CUDA_IMAGE=nvidia/cuda:13.1.0-devel-ubuntu22.04
+FROM ${CUDA_IMAGE}
 
 ARG PYTHON_VERSION=3.12
 ARG MAX_JOBS=2
 ARG NVCC_THREADS=1
 ARG TORCH_CUDA_ARCH_LIST=12.0
+ARG TORCH_BACKEND=auto
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
@@ -52,7 +54,7 @@ WORKDIR /workspace/agentrix/vllm
 RUN uv venv --python "${PYTHON_VERSION}" --seed .venv \
     && uv pip install --python .venv/bin/python \
         -r requirements/build/cuda.txt \
-        --torch-backend=auto
+        --torch-backend="${TORCH_BACKEND}"
 
 RUN tools/install_protoc.sh \
     && PATH="${PWD}/.venv/bin:${PATH}" ./build_rust.sh
