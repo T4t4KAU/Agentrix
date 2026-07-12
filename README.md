@@ -116,6 +116,18 @@ export TORCH_CUDA_ARCH_LIST=12.0
 cd ..
 ```
 
+When validating more than one CUDA toolkit, keep every Python environment,
+CMake build directory, and install prefix separate. In particular, reserve
+`vllm/cmake-build-cu130` for the host CUDA 13.0 build and use
+`vllm/cmake-build-cu128` only from the CUDA 12.8 container. Never reconfigure
+one directory with the other toolkit or PyTorch wheel. A container-private
+CUDA 12.8 setup can use `/opt/agentrix-cu128-venv` and
+`/opt/agentrix-cu128-install`; the source checkout may be bind-mounted, but its
+environment and compiled output must not be shared with the host build.
+On SM120 with CUDA 12.8, set `VLLM_USE_FLASHINFER_SAMPLER=0` so vLLM uses its
+native sampler; the current FlashInfer JIT requires CUDA 12.9 or newer for
+SM120. This does not disable the ForkAttention backend.
+
 ## Build and Enable LMCache
 
 Install LMCache into the same environment as vLLM so the connector and CUDA
@@ -182,6 +194,26 @@ smoke workload. The command succeeds only if LMCache writes KV chunk files to
 the disk tier.
 Its configuration, server log, benchmark output, and `smoke_summary.txt` are
 written under `benchmark/results/lmcache_tiered_smoke/` by default.
+
+For a fair policy comparison, run the paired benchmark. It always runs
+LMCache's default `LRU` policy first, followed by `FORK_AWARE`, with identical
+model, tier capacities, dataset, and concurrency:
+
+```bash
+cd benchmark
+MODEL_PATH=/path/to/Qwen3-1.7B \
+VLLM_BIN=../vllm/.venv/bin/vllm \
+./scripts/run_lmcache_policy_comparison.sh
+cd ..
+```
+
+The paired report is written to
+`benchmark/results/lmcache_policy_comparison/policy_comparison.md`. Its primary
+policy metric is total KV reload demand reduced relative to default LMCache,
+reported in tokens, GiB, and percent. Actual retrieval, storage, and disk-load
+allocation failures are shown alongside it. The separate logical footprint
+table reports how much branch-local KV ForkAttention avoids independent of the
+LMCache eviction policy.
 
 ## Install the Benchmark Suite
 

@@ -28,7 +28,7 @@ extra_config:
 EOF
 
 export LMCACHE_CONFIG_FILE
-export PYTHONPATH="${REPO_ROOT}/vllm:${REPO_ROOT}/LMCache${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${RUNTIME_PYTHONPATH:+${RUNTIME_PYTHONPATH}:}${REPO_ROOT}/vllm:${REPO_ROOT}/LMCache${PYTHONPATH:+:${PYTHONPATH}}"
 if [[ -z "${KV_TRANSFER_CONFIG:-}" ]]; then
   KV_TRANSFER_CONFIG='{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}'
 fi
@@ -76,6 +76,7 @@ fi
 
 cat >"${OUTPUT_ROOT}/smoke_summary.txt" <<EOF
 status=passed
+cache_policy=${LMCACHE_CACHE_POLICY:-LRU}
 disk_path=${LMCACHE_DISK_PATH}
 disk_files=${disk_files}
 disk_bytes=${disk_bytes}
