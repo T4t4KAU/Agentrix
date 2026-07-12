@@ -215,6 +215,39 @@ allocation failures are shown alongside it. The separate logical footprint
 table reports how much branch-local KV ForkAttention avoids independent of the
 LMCache eviction policy.
 
+To compare CPU-only offload, tiered LMCache, and vLLM's native connector with
+both attention backends, run:
+
+```bash
+cd benchmark
+MODEL_PATH=/path/to/Qwen3-1.7B \
+VLLM_BIN=../vllm/.venv/bin/vllm \
+CPU_SIZE_GB=0.5 \
+DISK_SIZE_GB=2 \
+PREFIX_TOKENS=4096 \
+BRANCHES=8 \
+CASE_COUNT=4 \
+CONCURRENCY=32 \
+./scripts/run_offload_backend_comparison.sh
+cd ..
+```
+
+The script runs seven configurations with the same workload and capacity:
+ForkAttention without offload, ForkAttention native CPU offload, default
+LMCache LRU CPU offload, fork-aware LMCache CPU offload, fork-aware LMCache
+CPU plus disk, FlashAttention without offload, and FlashAttention native LRU
+CPU offload. The native ForkAttention configuration enables fanout-aware
+admission and hot-prefix protection; the native FlashAttention configuration
+explicitly disables these extensions to preserve the ordinary LRU baseline.
+
+The report is written to
+`benchmark/results/offload_backend_comparison/offload_comparison.md`. It shows
+end-to-end and branch throughput, pairwise offload impact within each backend,
+KV load/store traffic, disk footprint, load failures, and the total logical KV
+footprint reduction from branch-local FlashAttention KV to ForkAttention's
+shared representation. Repeat the command into distinct `OUTPUT_DIR` values
+and use paired medians when collecting performance results.
+
 ## Install the Benchmark Suite
 
 The benchmark suite uses a separate environment so that it does not alter the

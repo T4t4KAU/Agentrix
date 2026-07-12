@@ -31,6 +31,21 @@ Use `run_vllm_fanout_matrix.sh` for stronger shared-prefix cases. It compares
 `FLASH_ATTN` and `FORK_ATTN` over five long-prefix, high-branch-count workloads
 and writes an aggregate `matrix_summary.md`.
 
+Use `run_offload_backend_comparison.sh` for the seven-way offload comparison:
+
+```bash
+MODEL_PATH=/path/to/Qwen3-1.7B \
+CPU_SIZE_GB=0.5 \
+DISK_SIZE_GB=2 \
+./scripts/run_offload_backend_comparison.sh
+```
+
+It covers ForkAttention with no offload, native CPU offload, default and
+fork-aware LMCache CPU offload, and fork-aware LMCache CPU plus disk. It also
+covers FlashAttention with no offload and ordinary native LRU CPU offload. The
+generated `offload_comparison.md` includes pairwise throughput deltas, logical
+KV footprint reduction, KV movement, disk footprint, and load failures.
+
 For DP routing experiments, set `DP_REPLICAS=2` and choose `DP_ROUTING`.
 `round_robin` is the load-balancing baseline; `prefix_forest` keeps branch
 groups together while balancing group weights across replicas.
