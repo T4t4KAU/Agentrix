@@ -44,6 +44,7 @@ KEEP_SERVER="${KEEP_SERVER:-0}"
 VLLM_SERVER_EXTRA_ARGS="${VLLM_SERVER_EXTRA_ARGS:-}"
 BENCHMARK_EXTRA_ARGS="${BENCHMARK_EXTRA_ARGS:-}"
 KV_TRANSFER_CONFIG="${KV_TRANSFER_CONFIG:-}"
+KV_BYTES_PER_TOKEN="${KV_BYTES_PER_TOKEN:-}"
 
 LOG_DIR="${BENCHMARK_DIR}/${OUTPUT_DIR}"
 SERVER_PIDS=()
@@ -53,6 +54,24 @@ read -r -a BACKEND_LIST <<<"${BACKENDS}"
 
 cd "${BENCHMARK_DIR}"
 mkdir -p "${LOG_DIR}"
+
+if [[ -z "${KV_BYTES_PER_TOKEN}" && -f "${MODEL_PATH}/config.json" ]]; then
+  KV_BYTES_PER_TOKEN="$(${BENCHMARK_PYTHON} - "${MODEL_PATH}/config.json" "${DTYPE}" <<'PY'
+import json
+import sys
+
+config = json.load(open(sys.argv[1], encoding="utf-8"))
+dtype_bytes = 4 if sys.argv[2] == "float32" else 2
+layers = int(config["num_hidden_layers"])
+kv_heads = int(config.get("num_key_value_heads", config["num_attention_heads"]))
+head_dim = int(
+    config.get("head_dim", config["hidden_size"] // config["num_attention_heads"])
+)
+print(2 * layers * kv_heads * head_dim * dtype_bytes)
+PY
+)"
+fi
+KV_BYTES_PER_TOKEN="${KV_BYTES_PER_TOKEN:-0}"
 
 if [[ ! -x "${VLLM_BIN}" ]]; then
   echo "vLLM executable does not exist: ${VLLM_BIN}" >&2
@@ -499,6 +518,7 @@ run_backend() {
     --base-urls "${base_urls_arg}"
     --dp-routing "${effective_dp_routing}"
     --model "${SERVED_MODEL_NAME}"
+    --kv-bytes-per-token "${KV_BYTES_PER_TOKEN}"
     --prefix-tokens "${PREFIX_TOKENS}"
     --branches "${BRANCHES}"
     --case-count "${CASE_COUNT}"

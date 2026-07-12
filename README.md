@@ -143,7 +143,7 @@ local_cpu: true
 max_local_cpu_size: 8
 local_disk: /mnt/nvme/lmcache
 max_local_disk_size: 128
-cache_policy: LRU
+cache_policy: FORK_AWARE
 extra_config:
   disk_cache_mode: eviction
   disk_io_threads: 4
@@ -159,6 +159,12 @@ vllm serve /path/to/model \
   '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}'
 ```
 
+`FORK_AWARE` keeps high-fanout shared-prefix chunks in CPU ahead of low-value
+suffix chunks, uses HOT/COOLING/COLD lifecycle hysteresis, and only promotes a
+disk chunk ahead of a lower-value CPU victim when capacity permits. Foreground
+loads can still use emergency eviction to preserve vLLM's lookup/load contract.
+Use `LRU` to reproduce the unmodified LMCache three-tier baseline.
+
 Run the reproducible three-tier smoke test. It intentionally limits the CPU
 cache to a few Qwen3-1.7B KV chunks and lowers vLLM's GPU allocation so
 CPU-to-disk demotion is exercised quickly:
@@ -171,7 +177,9 @@ VLLM_BIN=../vllm/.venv/bin/vllm \
 cd ..
 ```
 
-The command succeeds only if LMCache writes KV chunk files to the disk tier.
+Set `LMCACHE_CACHE_POLICY=LRU` or `FORK_AWARE` to compare policies with the same
+smoke workload. The command succeeds only if LMCache writes KV chunk files to
+the disk tier.
 Its configuration, server log, benchmark output, and `smoke_summary.txt` are
 written under `benchmark/results/lmcache_tiered_smoke/` by default.
 

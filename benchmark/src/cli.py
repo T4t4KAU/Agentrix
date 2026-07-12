@@ -78,6 +78,7 @@ def _parser() -> argparse.ArgumentParser:
     api.add_argument("--common-analysis-tokens", type=int, default=256)
     api.add_argument("--concurrency", type=int, default=8)
     api.add_argument("--arrival-interval-ms", type=int, default=0)
+    api.add_argument("--kv-bytes-per-token", type=int, default=0)
     api.add_argument("--seed", type=int, default=2026)
     api.add_argument("--output-dir", type=Path, default=Path("results/api"))
     return parser
@@ -187,7 +188,10 @@ def main(argv: list[str] | None = None) -> int:
         traces.append(trace)
         raw_results.append(raw)
 
-    results = [compare_trace(trace) for trace in traces]
+    results = [
+        compare_trace(trace, kv_bytes_per_token=args.kv_bytes_per_token)
+        for trace in traces
+    ]
     write_results(args.output_dir, traces, results, raw_results)
     print(f"Wrote API benchmark to {args.output_dir}")
     return 0

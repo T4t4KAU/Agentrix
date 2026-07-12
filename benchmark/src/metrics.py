@@ -43,7 +43,11 @@ def monowire_metrics(
     }
 
 
-def compare_trace(trace: BenchmarkTrace, tile_k: int = 128) -> dict[str, int | float | str]:
+def compare_trace(
+    trace: BenchmarkTrace,
+    tile_k: int = 128,
+    kv_bytes_per_token: int = 0,
+) -> dict[str, int | float | str]:
     suffixes = [branch.suffix_tokens for branch in trace.branches]
     baseline = baseline_metrics(trace.prefix_tokens, suffixes, tile_k)
     monowire = monowire_metrics(trace.prefix_tokens, suffixes, tile_k)
@@ -53,7 +57,10 @@ def compare_trace(trace: BenchmarkTrace, tile_k: int = 128) -> dict[str, int | f
     def ratio(left: int, right: int) -> float:
         return left / right if right else 1.0
 
-    return {
+    baseline_kv = baseline["unique_kv_tokens"]
+    optimized_kv = monowire["unique_kv_tokens"]
+    kv_tokens_saved = baseline_kv - optimized_kv
+    result: dict[str, int | float | str] = {
         "case_id": trace.case_id,
         "prefix_tokens": trace.prefix_tokens,
         "branch_count": len(suffixes),
@@ -64,6 +71,8 @@ def compare_trace(trace: BenchmarkTrace, tile_k: int = 128) -> dict[str, int | f
         "monowire_valid_qk": monowire["valid_qk"],
         "baseline_unique_kv": baseline["unique_kv_tokens"],
         "monowire_unique_kv": monowire["unique_kv_tokens"],
+        "kv_tokens_saved": kv_tokens_saved,
+        "kv_reduction_percent": 100 * kv_tokens_saved / baseline_kv,
         "kv_reduction": ratio(
             baseline["unique_kv_tokens"], monowire["unique_kv_tokens"]
         ),
@@ -78,3 +87,9 @@ def compare_trace(trace: BenchmarkTrace, tile_k: int = 128) -> dict[str, int | f
             baseline["logical_launches"], monowire["logical_launches"]
         ),
     }
+    if kv_bytes_per_token > 0:
+        kv_bytes_saved = kv_tokens_saved * kv_bytes_per_token
+        result["kv_bytes_per_token"] = kv_bytes_per_token
+        result["kv_bytes_saved"] = kv_bytes_saved
+        result["kv_gib_saved"] = kv_bytes_saved / 1024**3
+    return result

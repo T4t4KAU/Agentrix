@@ -29,6 +29,16 @@ def test_valid_work_is_preserved() -> None:
     result = compare_trace(trace)
     assert result["baseline_valid_qk"] == result["monowire_valid_qk"]
     assert result["launch_reduction"] == 2
+    assert result["kv_tokens_saved"] == 16384
+    assert result["kv_reduction_percent"] == pytest.approx(49.61, rel=1e-3)
+
+
+def test_total_kv_bytes_saved() -> None:
+    trace = BenchmarkTrace("case", 8192, [BranchTrace(i, 512, 1) for i in range(4)])
+    result = compare_trace(trace, kv_bytes_per_token=114688)
+    assert result["kv_tokens_saved"] == 24576
+    assert result["kv_bytes_saved"] == 2818572288
+    assert result["kv_gib_saved"] == pytest.approx(2.625)
 
 
 @pytest.mark.parametrize("function", [baseline_metrics, monowire_metrics])

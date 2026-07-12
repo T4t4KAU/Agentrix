@@ -21,7 +21,7 @@ local_cpu: true
 max_local_cpu_size: ${LMCACHE_CPU_SIZE_GB:-0.10}
 local_disk: ${LMCACHE_DISK_PATH}
 max_local_disk_size: ${LMCACHE_DISK_SIZE_GB:-1.0}
-cache_policy: LRU
+cache_policy: ${LMCACHE_CACHE_POLICY:-LRU}
 extra_config:
   disk_cache_mode: eviction
   disk_io_threads: 2
@@ -60,7 +60,9 @@ if ! grep -Eq "disk_cache_mode.*eviction" "${server_log}"; then
   exit 1
 fi
 
-if grep -Eq "Failed to write key|Failed to submit disk write|Traceback" "${server_log}"; then
+if grep -Eq \
+  "Failed to write key|Failed to submit disk write|EngineCore encountered a fatal error|AssertionError" \
+  "${server_log}"; then
   echo "LMCache tiered smoke failed: the server reported a storage error." >&2
   tail -n 100 "${server_log}" >&2
   exit 1

@@ -167,18 +167,34 @@ def render_summary(results: Iterable[dict[str, Any]]) -> str:
         [
             "## Logical Savings",
             "",
-            "| Case | Prefix | Branches | Suffix mean | KV reduction "
+            "| Case | Prefix | Branches | Suffix mean | KV saved tokens "
+            "| KV saved GiB | KV saved | KV reduction "
             "| Tile reduction | Launch reduction |",
-            "|---|---:|---:|---:|---:|---:|---:|",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for row in rows:
         lines.append(
             f"| {row['case_id']} | {row['prefix_tokens']} | {row['branch_count']} "
             f"| {_float(row, 'suffix_mean'):.1f} "
+            f"| {int(_kv_tokens_saved(row))} "
+            f"| {_format_number(row, 'kv_gib_saved', 3)} "
+            f"| {_kv_reduction_percent(row):.1f}% "
             f"| {_float(row, 'kv_reduction'):.2f}x "
             f"| {_float(row, 'tile_reduction'):.2f}x "
             f"| {_float(row, 'launch_reduction'):.2f}x |"
+        )
+    if len(rows) > 1:
+        total_baseline = sum(_float(row, "baseline_unique_kv") for row in rows)
+        total_saved = sum(_kv_tokens_saved(row) for row in rows)
+        total_bytes = sum(float(row.get("kv_bytes_saved", 0)) for row in rows)
+        lines.extend(
+            [
+                "",
+                f"**Total KV Cache saved:** {int(total_saved)} tokens, "
+                f"{total_bytes / 1024**3:.3f} GiB, "
+                f"{100 * total_saved / total_baseline:.1f}%.",
+            ]
         )
     lines.extend(
         [
@@ -204,14 +220,27 @@ def _float(row: dict[str, Any], key: str) -> float:
     return float(value)
 
 
+def _kv_tokens_saved(row: dict[str, Any]) -> float:
+    if "kv_tokens_saved" in row:
+        return _float(row, "kv_tokens_saved")
+    return _float(row, "baseline_unique_kv") - _float(row, "monowire_unique_kv")
+
+
+def _kv_reduction_percent(row: dict[str, Any]) -> float:
+    if "kv_reduction_percent" in row:
+        return _float(row, "kv_reduction_percent")
+    baseline = _float(row, "baseline_unique_kv")
+    return 100 * _kv_tokens_saved(row) / baseline if baseline else 0.0
+
+
 def _float_or_none(value: Any) -> float | None:
     if value is None:
         return None
     return float(value)
 
 
-def _format_number(row: dict[str, Any], key: str) -> str:
+def _format_number(row: dict[str, Any], key: str, digits: int = 1) -> str:
     value = row.get(key)
     if value in (None, ""):
         return "-"
-    return f"{float(value):.1f}"
+    return f"{float(value):.{digits}f}"
