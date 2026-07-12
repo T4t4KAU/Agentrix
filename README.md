@@ -7,6 +7,11 @@ LMCache integration, and the end-to-end benchmark suite in one repository:
 - `LMCache/` is a Git submodule pinned to the tiered KV storage implementation.
 - `benchmark/` contains simulation, API, and local vLLM benchmarks.
 
+## Documentation
+
+- [AutoDL CUDA 12.8 build and benchmark guide](docs/autodl_build_and_benchmark.md)
+- [Prefix-aware data parallel experiment results](docs/dp_experiment_results.md)
+
 ## System Requirements
 
 - Linux x86_64 with an NVIDIA GPU.
