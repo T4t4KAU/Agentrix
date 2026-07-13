@@ -33,7 +33,7 @@ preemption, GPU hotset protection, and connector planning. The optimized
 variant enables that complete prefix-aware policy. LMCache and disk storage
 are excluded from this matrix.
 
-The default host matrix uses 4K and 8K prefixes with 8 and 16 branches. Longer
+The default host matrix uses 8K and 16K prefixes with 8 and 16 branches. Other
 settings can be selected through `PREFIX_LENGTHS` and `BRANCH_COUNTS`.
 
 ### Data Parallel

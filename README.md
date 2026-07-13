@@ -381,8 +381,9 @@ MODE=tp_accuracy MODEL_SPECS='qwen3-14b|/path/to/Qwen3-14B' \
 ```
 
 Override `PREFIX_LENGTHS`, `BRANCH_COUNTS`, `DATASETS`, `CASE_COUNT`,
-`GPU_IDS`, `DP_REPLICAS`, and `TP_SIZE` without editing the scripts. Completed
-run directories are skipped, so an interrupted matrix can resume in place.
+`GPU_IDS`, `DP_REPLICAS`, `TP_SIZE`, and `VARIANT_SPECS` without editing the
+scripts. Completed run directories are skipped, so an interrupted matrix can
+resume in place.
 Each mode writes `main_experiment_report.md` and a machine-readable CSV under
 `benchmark/results/main_experiment/<mode>/`. Accuracy means deterministic
 output agreement against FlashAttention; the bundled prompt snapshots do not
