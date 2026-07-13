@@ -31,6 +31,24 @@ def test_prefix_sticky_keeps_whole_case_on_one_rank() -> None:
     assert {route_map[(2, branch)] for branch in range(4)} == {0}
 
 
+def test_prefix_skewed_creates_complementary_minority_branches() -> None:
+    route_map = _branch_rank_map(
+        case_count=2,
+        branch_count=9,
+        branch_group_size=1,
+        desired_suffixes=[1] * 18,
+        dp_size=2,
+        dp_routing="prefix_skewed",
+    )
+
+    assert [route_map[(0, branch)] for branch in range(9)].count(0) == 8
+    assert [route_map[(1, branch)] for branch in range(9)].count(1) == 8
+    assert route_map[(0, 0)] == 1
+    assert route_map[(1, 0)] == 0
+    assert _common_rank(0, route_map, branch_count=9, dp_size=2) == 0
+    assert _common_rank(1, route_map, branch_count=9, dp_size=2) == 1
+
+
 def test_prefix_forest_balances_without_splitting_groups() -> None:
     route_map = _branch_rank_map(
         case_count=1,
@@ -43,8 +61,7 @@ def test_prefix_forest_balances_without_splitting_groups() -> None:
 
     for group_id in range(4):
         ranks = {
-            route_map[(0, branch)]
-            for branch in range(group_id * 2, group_id * 2 + 2)
+            route_map[(0, branch)] for branch in range(group_id * 2, group_id * 2 + 2)
         }
         assert len(ranks) == 1
     assert _rank_counts(route_map, 2) == [4, 4]

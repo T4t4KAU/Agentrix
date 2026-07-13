@@ -375,6 +375,33 @@ OUTPUT_DIR=results/fork_dp2_prefix_forest \
 ./scripts/run_vllm_benchmark.sh
 ```
 
+### Experimental DP KV Reload Rebalance
+
+The KV-reload Prefix Forest rebalance path is high risk and disabled by
+default. It can move a preempted greedy request to another internal DP rank
+only when LMCache reports a real external reload, the target proves that it
+already has a longer physical GPU prefix, and the router predicts sufficient
+prefix or fanout benefit. Unsupported requests and configurations stay on the
+ordinary prefix-aware DP path.
+
+Run the paired default-LMCache comparison with:
+
+```bash
+cd benchmark
+MODEL_PATH=/path/to/Qwen3-8B \
+GPU_IDS=0,1 \
+OUTPUT_ROOT=results/dp_reload_comparison \
+./scripts/run_vllm_dp_reload_comparison.sh
+```
+
+Both variants start with an empty LMCache server using its default `LRU`
+policy. The baseline leaves `VLLM_FORK_ATTN_DP_RELOAD_REBALANCE=0`; the
+optimized variant sets it to `1`. The experiment additionally requires
+ForkAttention, prefix-aware internal DP, synchronous scheduling, PP=1, the v2
+model runner, `LMCacheMPConnector`, and greedy sampling. The generated report
+includes throughput, preemptions, logical shared-KV reduction, committed
+handoffs, and the GPU-local KV reload avoided by successful handoffs.
+
 Profile ForkAttention with Nsight Systems:
 
 ```bash

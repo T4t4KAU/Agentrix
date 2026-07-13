@@ -34,6 +34,7 @@ SUFFIX_MEAN="${SUFFIX_MEAN:-128}"
 OUTPUT_TOKENS="${OUTPUT_TOKENS:-128}"
 COMMON_ANALYSIS_TOKENS="${COMMON_ANALYSIS_TOKENS:-128}"
 ARRIVAL_INTERVAL_MS="${ARRIVAL_INTERVAL_MS:-0}"
+MINORITY_HEADSTART_MS="${MINORITY_HEADSTART_MS:-0}"
 SEED="${SEED:-2026}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.70}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
@@ -160,6 +161,7 @@ write_server_profile() {
     "${PREFIX_TOKENS}" \
     "${BRANCH_ORDER}" \
     "${SUFFIX_DISTRIBUTION}" \
+    "${KV_BYTES_PER_TOKEN}" \
     "${log_paths[@]}" <<'PY'
 from __future__ import annotations
 
@@ -280,6 +282,37 @@ def parse_log(path: Path) -> dict[str, object]:
         )
         if telemetry_matches:
             routing_stats["telemetry"] = ast.literal_eval(telemetry_matches[-1])
+    reload_matches = re.findall(
+        r"ForkAttention DP reload stats: intents=(\d+) local=(\d+) "
+        r"planned=(\d+) committed=(\d+) failed=(\d+) "
+        r"predicted_saved_blocks=(\d+) source_reload_tokens=(\d+) "
+        r"target_local_tokens=(\d+) saved_reload_tokens=(\d+) "
+        r"source_external_tokens=(\d+) "
+        r"target_external_tokens=(\d+) saved_external_tokens=(\d+)",
+        text,
+    )
+    reload_stats: dict[str, int] = {}
+    if reload_matches:
+        values = (int(value) for value in reload_matches[-1])
+        reload_stats = dict(
+            zip(
+                (
+                    "intents",
+                    "local",
+                    "planned",
+                    "committed",
+                    "failed",
+                    "predicted_saved_blocks",
+                    "source_reload_tokens",
+                    "target_local_tokens",
+                    "saved_reload_tokens",
+                    "source_external_tokens",
+                    "target_external_tokens",
+                    "saved_external_tokens",
+                ),
+                values,
+            )
+        )
     return {
         "log": str(path),
         "gpu_kv_cache_tokens": int_or_none(kv_match.group(1) if kv_match else None),
@@ -307,9 +340,13 @@ def parse_log(path: Path) -> dict[str, object]:
         "kv_offload_store_bytes": prometheus_counter(
             metrics_path, "vllm:kv_offload_store_bytes"
         ),
+        "num_preemptions": prometheus_counter(
+            metrics_path, "vllm:num_preemptions"
+        ),
         "fork_cudagraph_dispatch": graph_dispatch,
         "fork_metadata_avg_ms": metadata_averages,
         "fork_dp_prefix_routing": routing_stats,
+        "fork_dp_reload": reload_stats,
         **profile,
     }
 
@@ -337,7 +374,8 @@ def main() -> int:
         "branch_order": sys.argv[7],
         "suffix_distribution": sys.argv[8],
     }
-    logs = [Path(arg) for arg in sys.argv[9:]]
+    kv_bytes_per_token = int(sys.argv[9])
+    logs = [Path(arg) for arg in sys.argv[10:]]
     ranks = [parse_log(path) for path in logs if path.exists()]
     aggregate: dict[str, object] = {"workload": workload, "ranks": ranks}
     for key in (
@@ -369,8 +407,44 @@ def main() -> int:
         )
         for level in ("normal", "high", "critical")
     }
-    for key in ("kv_offload_load_bytes", "kv_offload_store_bytes"):
+    for key in (
+        "kv_offload_load_bytes",
+        "kv_offload_store_bytes",
+        "num_preemptions",
+    ):
         aggregate[key] = sum(float(rank.get(key, 0.0)) for rank in ranks)
+    reload_totals = {
+        key: sum(
+            int(rank.get("fork_dp_reload", {}).get(key, 0))
+            for rank in ranks
+            if isinstance(rank.get("fork_dp_reload"), dict)
+        )
+        for key in (
+            "intents",
+            "local",
+            "planned",
+            "committed",
+            "failed",
+            "predicted_saved_blocks",
+            "source_reload_tokens",
+            "target_local_tokens",
+            "saved_reload_tokens",
+            "source_external_tokens",
+            "target_external_tokens",
+            "saved_external_tokens",
+        )
+    }
+    reload_totals["saved_external_bytes"] = (
+        reload_totals["saved_external_tokens"] * kv_bytes_per_token
+    )
+    reload_totals["saved_external_gib"] = (
+        reload_totals["saved_external_bytes"] / 1024**3
+    )
+    reload_totals["saved_reload_bytes"] = (
+        reload_totals["saved_reload_tokens"] * kv_bytes_per_token
+    )
+    reload_totals["saved_reload_gib"] = reload_totals["saved_reload_bytes"] / 1024**3
+    aggregate["fork_dp_reload"] = reload_totals
     profile_path.write_text(
         json.dumps(aggregate, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
@@ -393,7 +467,10 @@ run_backend() {
   local effective_dp_routing="${DP_ROUTING}"
 
   mkdir -p "${backend_log_dir}"
-  if ((DP_REPLICAS == 1)) || [[ "${DP_DEPLOYMENT}" == "internal" ]]; then
+  if ((DP_REPLICAS == 1)); then
+    effective_dp_routing="single"
+  elif [[ "${DP_DEPLOYMENT}" == "internal" ]] \
+    && [[ "${DP_ROUTING}" != "prefix_skewed" ]]; then
     effective_dp_routing="single"
   fi
 
@@ -530,9 +607,13 @@ run_backend() {
     --common-analysis-tokens "${COMMON_ANALYSIS_TOKENS}"
     --concurrency "${CONCURRENCY}"
     --arrival-interval-ms "${ARRIVAL_INTERVAL_MS}"
+    --minority-headstart-ms "${MINORITY_HEADSTART_MS}"
     --seed "${SEED}"
     --output-dir "${backend_output_dir}"
   )
+  if [[ "${DP_DEPLOYMENT}" == "internal" ]]; then
+    benchmark_args+=(--internal-dp-size "${DP_REPLICAS}")
+  fi
   if [[ -n "${DATA_PATH}" ]]; then
     benchmark_args+=(--data-path "${DATA_PATH}")
   fi

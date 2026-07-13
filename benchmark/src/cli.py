@@ -64,9 +64,16 @@ def _parser() -> argparse.ArgumentParser:
     )
     api.add_argument(
         "--dp-routing",
-        choices=["single", "round_robin", "prefix_sticky", "prefix_forest"],
+        choices=[
+            "single",
+            "round_robin",
+            "prefix_sticky",
+            "prefix_forest",
+            "prefix_skewed",
+        ],
         default="single",
     )
+    api.add_argument("--internal-dp-size", type=int)
     api.add_argument("--prefix-tokens", type=int, default=8192)
     api.add_argument("--suffix-mean", type=int, default=768)
     api.add_argument(
@@ -78,6 +85,7 @@ def _parser() -> argparse.ArgumentParser:
     api.add_argument("--common-analysis-tokens", type=int, default=256)
     api.add_argument("--concurrency", type=int, default=8)
     api.add_argument("--arrival-interval-ms", type=int, default=0)
+    api.add_argument("--minority-headstart-ms", type=int, default=0)
     api.add_argument("--kv-bytes-per-token", type=int, default=0)
     api.add_argument("--seed", type=int, default=2026)
     api.add_argument("--output-dir", type=Path, default=Path("results/api"))
@@ -92,16 +100,15 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(report, ensure_ascii=False, indent=2))
         else:
             for item in report:
-                print(
-                    f"{item['dataset']}: {item['records']} records "
-                    f"({item['path']})"
-                )
+                print(f"{item['dataset']}: {item['records']} records ({item['path']})")
         return 0
 
     if args.command == "simulate":
         config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
         traces = traces_from_config(config)
-        results = [compare_trace(trace, int(config.get("tile_k", 128))) for trace in traces]
+        results = [
+            compare_trace(trace, int(config.get("tile_k", 128))) for trace in traces
+        ]
         write_results(args.output_dir, traces, results)
         print(f"Wrote {len(results)} cases to {args.output_dir}")
         return 0
@@ -129,11 +136,7 @@ def main(argv: list[str] | None = None) -> int:
     raw_results = []
     base_urls = None
     if args.base_urls:
-        base_urls = [
-            item.strip()
-            for item in args.base_urls.split(",")
-            if item.strip()
-        ]
+        base_urls = [item.strip() for item in args.base_urls.split(",") if item.strip()]
     end_index = args.sample_index + sample_count
     for batch_index, sample_start in enumerate(
         range(args.sample_index, end_index, args.case_count)
@@ -157,6 +160,7 @@ def main(argv: list[str] | None = None) -> int:
                 target_prefix_tokens=args.prefix_tokens,
                 concurrency=args.concurrency,
                 arrival_interval_ms=args.arrival_interval_ms,
+                minority_headstart_ms=args.minority_headstart_ms,
                 common_analysis_tokens=args.common_analysis_tokens,
                 api_mode=args.api_mode,
                 base_url=args.base_url,
@@ -167,6 +171,7 @@ def main(argv: list[str] | None = None) -> int:
                 branch_group_size=args.branch_group_size,
                 branch_order=args.branch_order,
                 dp_routing=args.dp_routing,
+                internal_dp_size=args.internal_dp_size,
             )
         )
         trace = BenchmarkTrace(

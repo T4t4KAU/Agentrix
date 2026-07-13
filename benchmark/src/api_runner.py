@@ -44,6 +44,7 @@ DP_ROUTINGS = {
     "round_robin",
     "prefix_sticky",
     "prefix_forest",
+    "prefix_skewed",
 }
 
 
@@ -62,7 +63,7 @@ def _branch_rank_map(
     if len(desired_suffixes) != case_count * branch_count:
         raise ValueError("desired suffix count must match the branch matrix")
     if dp_routing != "single" and dp_size == 1:
-        raise ValueError(f"{dp_routing} requires at least two base URLs")
+        raise ValueError(f"{dp_routing} requires at least two DP ranks")
 
     route_map: dict[tuple[int, int], int] = {}
     if dp_routing == "single":
@@ -83,6 +84,16 @@ def _branch_rank_map(
             rank = case_index % dp_size
             for branch_index in range(branch_count):
                 route_map[(case_index, branch_index)] = rank
+        return route_map
+
+    if dp_routing == "prefix_skewed":
+        for case_index in range(case_count):
+            majority_rank = case_index % dp_size
+            minority_rank = (majority_rank + 1) % dp_size
+            for branch_index in range(branch_count):
+                route_map[(case_index, branch_index)] = (
+                    minority_rank if branch_index == 0 else majority_rank
+                )
         return route_map
 
     group_count = (branch_count + branch_group_size - 1) // branch_group_size
@@ -110,9 +121,7 @@ def _branch_rank_map(
     for case_index in range(case_count):
         for branch_index in range(branch_count):
             group_id = branch_index // branch_group_size
-            route_map[(case_index, branch_index)] = group_rank[
-                (case_index, group_id)
-            ]
+            route_map[(case_index, branch_index)] = group_rank[(case_index, group_id)]
     return route_map
 
 
@@ -146,6 +155,7 @@ async def run_api_case(
     target_prefix_tokens: int | None = None,
     concurrency: int = 8,
     arrival_interval_ms: int = 0,
+    minority_headstart_ms: int = 0,
     common_analysis_tokens: int = 256,
     api_mode: str = "responses",
     base_url: str | None = None,
@@ -156,6 +166,7 @@ async def run_api_case(
     branch_group_size: int = 1,
     branch_order: str = "case_major",
     dp_routing: str = "single",
+    internal_dp_size: int | None = None,
 ) -> tuple[BenchmarkTrace, dict[str, Any]]:
     import random
 
@@ -163,10 +174,8 @@ async def run_api_case(
         raise ValueError("branch count and output token limits must be positive")
     if case_count <= 0 or branch_group_size <= 0:
         raise ValueError("case count and branch group size must be positive")
-    if concurrency <= 0 or arrival_interval_ms < 0:
-        raise ValueError(
-            "concurrency must be positive and arrival interval non-negative"
-        )
+    if concurrency <= 0 or arrival_interval_ms < 0 or minority_headstart_ms < 0:
+        raise ValueError("concurrency must be positive and arrival delays non-negative")
     if api_mode not in {"responses", "chat"}:
         raise ValueError(f"unsupported API mode: {api_mode}")
     if branch_order not in {"case_major", "round_robin", "shuffle"}:
@@ -180,7 +189,9 @@ async def run_api_case(
         AsyncOpenAI(api_key=os.getenv(api_key_env), base_url=url)
         for url in client_base_urls
     ]
-    dp_size = len(clients)
+    dp_size = internal_dp_size or len(clients)
+    if internal_dp_size is not None and len(clients) != 1:
+        raise ValueError("internal_dp_size requires exactly one API endpoint")
     contexts = (
         [common_context]
         if isinstance(common_context, str)
@@ -217,15 +228,25 @@ async def run_api_case(
     common_started = time.perf_counter()
 
     async def request(
-        messages: list[dict[str, str]], max_tokens: int, route_rank: int
+        messages: list[dict[str, str]],
+        max_tokens: int,
+        route_rank: int,
+        priority: int = 0,
     ) -> tuple[str, int, int]:
-        client = clients[route_rank]
+        client = clients[0] if internal_dp_size is not None else clients[route_rank]
+        extra_headers = (
+            {"X-data-parallel-rank": str(route_rank)}
+            if internal_dp_size is not None
+            else None
+        )
         if api_mode == "responses":
             kwargs: dict[str, Any] = {
                 "model": model,
                 "input": messages,
                 "max_output_tokens": max_tokens,
                 "temperature": 0,
+                "extra_headers": extra_headers,
+                "extra_body": {"priority": priority},
             }
             if reasoning_effort:
                 kwargs["reasoning"] = {"effort": reasoning_effort}
@@ -243,6 +264,8 @@ async def run_api_case(
                 "messages": messages,
                 "max_tokens": max_tokens,
                 "temperature": 0,
+                "extra_headers": extra_headers,
+                "extra_body": {"priority": priority},
             }
             if reasoning_effort:
                 kwargs["reasoning_effort"] = reasoning_effort
@@ -290,9 +313,7 @@ async def run_api_case(
                 "text": common_analysis,
             }
         )
-    local_prefix_tokens_by_case = [
-        int(case["prefix_tokens"]) for case in common_cases
-    ]
+    local_prefix_tokens_by_case = [int(case["prefix_tokens"]) for case in common_cases]
     local_prefix_tokens = int(statistics.fmean(local_prefix_tokens_by_case))
     semaphore = asyncio.Semaphore(concurrency)
     branch_specs = [
@@ -315,14 +336,18 @@ async def run_api_case(
         arrival_rank: int,
     ) -> APIBranchResult:
         index = case_index * branch_count + branch_index
-        if arrival_interval_ms:
-            await asyncio.sleep(arrival_rank * arrival_interval_ms / 1000)
+        delay_ms = arrival_rank * arrival_interval_ms
+        if dp_routing == "prefix_skewed":
+            if branch_index == 0:
+                delay_ms += minority_headstart_ms
+            elif branch_index > 1:
+                delay_ms += minority_headstart_ms * 2
+        if delay_ms:
+            await asyncio.sleep(delay_ms / 1000)
         strategy = STRATEGIES[index % len(STRATEGIES)]
         group_id = branch_index // branch_group_size
         suffix_budget = max(desired_suffixes[index], 2)
-        group_budget = (
-            0 if branch_group_size == 1 else max(1, suffix_budget // 2)
-        )
+        group_budget = 0 if branch_group_size == 1 else max(1, suffix_budget // 2)
         leaf_budget = max(1, suffix_budget - group_budget)
         group_context = ""
         if group_budget:
@@ -345,12 +370,20 @@ async def run_api_case(
             messages.append({"role": "user", "content": group_context})
         messages.append({"role": "user", "content": private_context})
         route_rank = route_map[(case_index, branch_index)]
+        request_output_tokens = (
+            min(output_tokens, 64)
+            if dp_routing == "prefix_skewed" and branch_index == 1
+            else output_tokens
+        )
         started = time.perf_counter()
         async with semaphore:
             text, input_tokens, actual_output_tokens = await request(
                 messages,
-                output_tokens,
+                request_output_tokens,
                 route_rank,
+                priority=10
+                if dp_routing == "prefix_skewed" and branch_index == 0
+                else 0,
             )
         latency_ms = (time.perf_counter() - started) * 1000
         return APIBranchResult(
@@ -413,6 +446,7 @@ async def run_api_case(
             "branch_order": branch_order,
             "dp_routing": dp_routing,
             "dp_size": dp_size,
+            "minority_headstart_ms": minority_headstart_ms,
             "branch_route_counts": _rank_counts(route_map, dp_size),
             "common_route_counts": [
                 sum(1 for rank in common_ranks if rank == index)
@@ -434,10 +468,10 @@ async def run_api_case(
         "branch_order": branch_order,
         "dp_routing": dp_routing,
         "dp_size": dp_size,
+        "minority_headstart_ms": minority_headstart_ms,
         "branch_route_counts": _rank_counts(route_map, dp_size),
         "common_route_counts": [
-            sum(1 for rank in common_ranks if rank == index)
-            for index in range(dp_size)
+            sum(1 for rank in common_ranks if rank == index) for index in range(dp_size)
         ],
         "total_latency_ms": (time.perf_counter() - case_started) * 1000,
         "branch_phase_latency_ms": branch_phase_latency_ms,

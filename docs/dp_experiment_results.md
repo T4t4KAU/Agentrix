@@ -148,3 +148,46 @@ Raw results are stored on the AutoDL host under:
 /root/autodl-tmp/Agentrix/benchmark/results/dp_agencybench_qwen3_8b_cu128_r2
 /root/autodl-tmp/Agentrix/benchmark/results/dp_agencybench_qwen3_8b_cu128_r3
 ```
+
+## Experimental KV Reload Rebalance
+
+An additional experiment evaluated the default-off KV-reload Prefix Forest
+rebalance path. Both variants used ForkAttention prefix-aware internal DP,
+the same two GPUs and Qwen3-8B model, a fresh LMCache MP server, and LMCache's
+default `LRU` policy. The only policy difference was
+`VLLM_FORK_ATTN_DP_RELOAD_REBALANCE`.
+
+The stress workload used two 8,192-token cases, nine branches per case, 768
+maximum output tokens, concurrency 18, and 608 GPU KV blocks per replica. It
+deliberately skewed each prefix forest across the two ranks and created 28 to
+31 scheduler preemptions.
+
+| Variant | Branch tok/s | E2E tok/s | Preemptions | Logical KV saved | GPU-local reload saved |
+|---|---:|---:|---:|---:|---:|
+| Default LMCache LRU | 233.64 | 221.21 | 28 | 19.464 GiB | 0 GiB |
+| Reload rebalance enabled | 231.84 | 219.58 | 31 | 19.464 GiB | 0 GiB |
+
+The measured differences were -0.77% branch throughput and -0.74% end-to-end
+throughput. No reload intents, plans, or committed handoffs occurred. The
+workload preempted running requests, but vLLM's local prefix cache retained
+their blocks, so those requests never entered LMCache's external reload path.
+The small throughput difference is therefore run-to-run noise rather than
+evidence of either a gain or a regression caused by a handoff.
+
+This result is important for interpreting the feature: running preemption
+alone is not a valid trigger. The implementation now waits for an actual
+external LMCache hit, validates target-side physical GPU residency in a
+prepare phase, and rejects a target that has no local-prefix gain over the
+source. A workload that forces local APC eviction while preserving the same
+prefix on another DP rank is still required to quantify end-to-end benefit.
+
+Reproduce the paired run with:
+
+```bash
+cd /root/autodl-tmp/Agentrix/benchmark
+OUTPUT_ROOT=results/dp_reload_comparison_external_final \
+  ./scripts/run_vllm_dp_reload_comparison.sh
+```
+
+As in the earlier experiments, the shutdown-time `EngineDeadError` was emitted
+after all HTTP responses, metrics, and result files had been collected.
