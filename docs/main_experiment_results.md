@@ -2,14 +2,23 @@
 
 ## Scope
 
-This document is the canonical record for the Agentrix main experiment. The
-matrix uses all four bundled datasets: SWE-bench Verified, AgencyBench,
-AgentBoard, and AppWorld. Every workload expands each selected dataset prompt
-into a long common prefix followed by multiple branch suffixes. The final
-matrix uses a deterministic cap of 32 records per dataset: all 9 AgentBoard,
-13 AppWorld, and 32 AgencyBench records, plus the first 32 SWE-bench Verified
-records. This yields 256 to 1,024 branch requests per matrix point. Set
-`MAX_DATASET_RECORDS=0` for an uncapped run.
+This document is the canonical record for the completed high-value experiment.
+The complete 304-run factorial launch procedure is documented separately in
+[`main_experiment_matrix.md`](main_experiment_matrix.md).
+
+The high-value run uses all four bundled datasets: SWE-bench Verified,
+AgencyBench, AgentBoard, and AppWorld. It retains the complete Qwen3-1.7B
+8K/16K by 8/16-branch grid on AgentBoard and AppWorld, adds cross-dataset
+16K/16 stress replications, and validates Llama-3.2-1B on the same stress
+shape. The complete two-rank Qwen3-8B DP grid covers 8K/16K prefixes and
+8/16/32 branches. Qwen3-14B TP accuracy uses the maximum 16K/32 shape.
+
+The Qwen single-GPU core grid consumes all 9 AgentBoard and 13 AppWorld
+records. Its AgencyBench 8K/8 cell uses 32 records; all 16K/16 stress
+replications use eight records. DP consumes all AgentBoard, AppWorld, and
+AgencyBench records plus the first 32 SWE-bench records. TP accuracy uses the
+first eight records per dataset. Every comparison within a cell uses identical
+prompts, and reported cross-cell means are unweighted.
 
 The experimental KV reload rebalance feature is disabled throughout. The DP
 comparison isolates the stable prefix-aware routing path.
@@ -124,24 +133,111 @@ with `NUM_GPU_BLOCKS_OVERRIDE`. The host run recorded here uses 1700 blocks
 (27,200 tokens at the default 16-token block size) after calibration against
 the lowest observed backend capacity.
 
-## Validation Status
+## Executed Coverage
 
-The measurement path has passed a CUDA 13.0 host smoke test with Qwen3-1.7B.
-Streaming TTFT/TPOT, latency percentiles, GPU telemetry, Prometheus KV gauges,
-CPU offload occupancy, offload traffic, policy provenance, and server-profile
-merging were populated for all five single-GPU variants. The smoke used a 1K
-prefix, eight branches, a 160-block GPU KV capacity, and a 0.125 GiB CPU cache;
-the offload variants reached 100% sampled CPU-cache occupancy. These values
-validate instrumentation and pressure generation only. They are not main
-experiment performance claims.
+| Group | Hardware | CUDA | Executed coverage |
+|---|---|---|---|
+| Single GPU | RTX 5070 12 GiB | 13.0 build | 75 runs: Qwen complete grid on AgentBoard/AppWorld; Qwen and Llama 16K/16 stress replications on four datasets |
+| Data parallel | 2x RTX 5090 32 GiB | 12.8 | Complete 72-run Qwen3-8B grid |
+| TP accuracy | 2x RTX 5090 32 GiB | 12.8 | 12 standard Qwen3-14B 16K/32 runs plus two Flash repeatability controls |
 
-Full matrix results will be inserted below from the generated reports after
-the host and server runs complete.
+Single-GPU comparisons pin 1,700 GPU blocks and an 8 GiB CPU offload cache.
+DP comparisons pin 3,852 blocks per rank. The reload-rebalance experiment is
+disabled. Earlier diagnostic checkpoints with inherited hotset policy or
+backend-dependent capacities are excluded.
 
-## Results
+The clean result manifests span Agentrix commits `a6db65e`, `26f63d9`, and
+`c95508e`, which changed experiment orchestration, provenance, documentation,
+or submodule registration. Every reported cell uses the same clean vLLM commit
+`287304ad68ce`.
 
-The fair full matrix is running. Earlier diagnostic checkpoints are excluded:
-their ordinary Fork variants still inherited the default GPU hotset policy, and
-one host checkpoint used backend-dependent GPU KV capacities. Both sets remain
-archived under `benchmark/results/main_experiment_archive/` for debugging, but
-they are not main experiment evidence.
+## Single-GPU Offload
+
+The table compares optimized ForkAttention offload against ordinary
+ForkAttention LRU offload. Positive throughput is an improvement; negative
+TTFT and KV load values are reductions.
+
+| Model | Dataset | Prefix | Branches | Throughput | TTFT P50 | KV load |
+|---|---|---:|---:|---:|---:|---:|
+| Qwen3-1.7B | AgentBoard | 8K | 8 | +57.2% | -54.8% | -75.5% |
+| Qwen3-1.7B | AgentBoard | 8K | 16 | +84.6% | -67.1% | -87.3% |
+| Qwen3-1.7B | AgentBoard | 16K | 8 | +88.9% | -62.7% | -82.1% |
+| Qwen3-1.7B | AgentBoard | 16K | 16 | +129.4% | -70.8% | -85.1% |
+| Qwen3-1.7B | AppWorld | 8K | 8 | +78.9% | -67.8% | -80.2% |
+| Qwen3-1.7B | AppWorld | 8K | 16 | +102.3% | -71.3% | -86.6% |
+| Qwen3-1.7B | AppWorld | 16K | 8 | +80.3% | -58.0% | -80.6% |
+| Qwen3-1.7B | AppWorld | 16K | 16 | +128.6% | -73.5% | -84.9% |
+| Qwen3-1.7B | AgencyBench | 8K | 8 | +78.0% | -60.8% | -82.1% |
+| Qwen3-1.7B | AgencyBench | 16K | 16 | +150.6% | -70.6% | -86.1% |
+| Qwen3-1.7B | SWE-bench | 16K | 16 | +141.7% | -70.5% | -85.5% |
+| Llama-3.2-1B | AgentBoard | 16K | 16 | +77.9% | -55.5% | -86.0% |
+| Llama-3.2-1B | AppWorld | 16K | 16 | +58.5% | -50.3% | -86.7% |
+| Llama-3.2-1B | AgencyBench | 16K | 16 | +73.6% | -56.8% | -85.0% |
+| Llama-3.2-1B | SWE-bench | 16K | 16 | +73.4% | -58.5% | -85.2% |
+
+Across the 11 complete Qwen cells, the unweighted mean improvement is 101.9%
+for output throughput and 66.2% for TTFT P50, while CPU-to-GPU KV load falls
+83.3%. The sampled total physical GPU+CPU KV peak changes by only -0.5% on
+average. This is expected: the policy changes residency and reload frequency,
+not the amount of useful KV retained. ForkAttention's logical KV read reduction
+is reported separately and does not imply duplicate physical vLLM blocks.
+Across the four Llama stress cells, throughput rises 70.9%, TTFT P50 falls
+55.3%, and KV load falls 85.7%, confirming that the offload result is not
+specific to Qwen3.
+
+## Data-Parallel Results
+
+Prefix-aware DP is compared directly with ordinary ForkAttention DP across 24
+dataset/shape cells.
+
+| Scope | Throughput | Wins | TTFT P50 | Wins | Peak GPU KV | Wins |
+|---|---:|---:|---:|---:|---:|---:|
+| All cells | +26.5% | 22/24 | -56.2% | 24/24 | -17.7% | 20/24 |
+| 8K prefix | +6.9% | 10/12 | -46.0% | 12/12 | -21.0% | 11/12 |
+| 16K prefix | +46.1% | 12/12 | -66.4% | 12/12 | -14.4% | 9/12 |
+
+The average logical KV read reduction is 93.8%. The 16K result is the primary
+claim: every throughput cell improves, while 8K retains two small negative
+throughput outliers. Lower sampled GPU compute and memory-controller activity
+for prefix-aware DP reflect less redundant work; they should not be interpreted
+as lower hardware capability.
+
+At the maximum 16K/32 shape, throughput improves over ordinary Fork DP by
+32.3% on AgencyBench, 31.0% on AgentBoard, 101.1% on AppWorld, and 20.9% on
+SWE-bench. TTFT P50 falls by 64.9%, 63.9%, 74.7%, and 33.7%, respectively.
+
+## TP Accuracy Guardrail
+
+Each dataset cell compares 264 outputs: 256 branches and eight common-analysis
+outputs. Values below are unweighted means over the four 16K/32 cells.
+
+| Comparison | Exact match | Token F1 | Text similarity |
+|---|---:|---:|---:|
+| Fork run 1 vs Flash | 91.10% | 98.25% | 97.16% |
+| Fork run 2 vs Flash | 91.76% | 98.60% | 97.60% |
+| Fork run 2 vs Fork run 1 | 94.03% | 98.59% | 97.65% |
+
+AgentBoard Flash repeatability is 92.80% exact match and 98.40% token F1,
+which is comparable to Fork repeatability on that cell (91.29% and 98.10%).
+SWE-bench is the strict-exact outlier: both Flash and Fork are internally
+repeatable (98.48% and 98.86%), but Flash-to-Fork exact match is 85.61% while
+token F1 remains 98.45%. The implementation therefore passes a strong
+token-level agreement guardrail but is not bitwise or text-exact equivalent.
+Because the bundled snapshots do not provide a common executable evaluator,
+this experiment does not establish environment-level task accuracy.
+
+## Artifacts
+
+Detailed P50/P95/P99 latency, TPOT, throughput, compute utilization,
+memory-controller utilization, physical/logical KV metrics, offload traffic,
+and provenance are preserved in the committed report snapshots:
+
+- [Single-GPU report](experiment_results/single_gpu.md) ([CSV](experiment_results/single_gpu.csv))
+- [Data-parallel report](experiment_results/dp.md) ([CSV](experiment_results/dp.csv))
+- [TP accuracy report](experiment_results/tp_accuracy.md) ([CSV](experiment_results/tp_accuracy.csv))
+
+Request-level JSON, telemetry samples, and server logs remain in the ignored
+`benchmark/results/main_experiment/` tree on the machines that ran each group.
+
+The complete factorial commands and expected run counts are in
+[`main_experiment_matrix.md`](main_experiment_matrix.md).

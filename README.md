@@ -14,6 +14,8 @@ LMCache integration, and the end-to-end benchmark suite in one repository:
 - [llama.cpp CUDA/MUSA ForkAttention build and runtime guide](docs/llama_cpp_forkattention_usage.md)
 - [llama.cpp EulerOS and CentOS adaptation notes](docs/llama_cpp_forkattention_hce_centos_adaptation.md)
 - [Prefix-aware data parallel experiment results](docs/dp_experiment_results.md)
+- [Main shared-prefix experiment results](docs/main_experiment_results.md)
+- [Complete main experiment matrix](docs/main_experiment_matrix.md)
 - [ForkAttention TP model compatibility](docs/tp_model_compatibility.md)
 
 ## System Requirements
