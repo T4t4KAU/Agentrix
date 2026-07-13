@@ -30,6 +30,7 @@ MAX_MODEL_LEN=4096 \
 | Architecture | Model | Status | GPU KV capacity | Branch tok/s | E2E tok/s | Logical KV reduction |
 |---|---|---|---:|---:|---:|---:|
 | `Qwen3ForCausalLM` | Qwen3-8B | Passed | 220,592 tokens | 118.22 | 44.20 | 48.91% |
+| `LlamaForCausalLM` | Meta-Llama-3.1-8B-Instruct | Passed | 251,344 tokens | 152.92 | 49.41 | 48.45% |
 
 ## Qwen3ForCausalLM
 
@@ -42,4 +43,17 @@ Raw results are stored on the AutoDL host at:
 
 ```text
 /root/autodl-tmp/Agentrix/benchmark/results/tp_model_compat/qwen3_8b
+```
+
+## LlamaForCausalLM
+
+Meta-Llama-3.1-8B-Instruct loaded natively with eight KV heads split across
+the two TP ranks. ForkAttention CUDA Graph capture and all API requests
+completed successfully. The workload saved 2,092 logical KV token entries,
+equivalent to 0.255 GiB. No vLLM source adaptation was required.
+
+Raw results are stored at:
+
+```text
+/root/autodl-tmp/Agentrix/benchmark/results/tp_model_compat/llama31_8b
 ```
