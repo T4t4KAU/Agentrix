@@ -24,6 +24,7 @@ agentrix-bench = "cli:main"
 [tool.setuptools]
 package-dir = {"" = "src"}
 py-modules = [
+  "accuracy",
   "api_runner",
   "cli",
   "data",
@@ -31,6 +32,7 @@ py-modules = [
   "models",
   "reporting",
   "synthetic",
+  "telemetry",
   "tokens",
 ]
 

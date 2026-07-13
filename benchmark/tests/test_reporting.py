@@ -1,5 +1,7 @@
 import csv
 
+import pytest
+
 from models import BenchmarkTrace, BranchTrace
 from reporting import write_results
 
@@ -9,8 +11,24 @@ def test_write_results_includes_measured_latency(tmp_path) -> None:
         case_id="case",
         prefix_tokens=1024,
         branches=[
-            BranchTrace(0, 16, 10, input_tokens=1040, latency_ms=100.0),
-            BranchTrace(1, 32, 20, input_tokens=1056, latency_ms=200.0),
+            BranchTrace(
+                0,
+                16,
+                10,
+                input_tokens=1040,
+                latency_ms=100.0,
+                ttft_ms=40.0,
+                tpot_ms=6.0,
+            ),
+            BranchTrace(
+                1,
+                32,
+                20,
+                input_tokens=1056,
+                latency_ms=200.0,
+                ttft_ms=80.0,
+                tpot_ms=6.315,
+            ),
         ],
     )
     result = {
@@ -45,6 +63,9 @@ def test_write_results_includes_measured_latency(tmp_path) -> None:
 
     assert rows[0]["common_latency_ms"] == "50.0"
     assert rows[0]["branch_mean_latency_ms"] == "150.0"
+    assert rows[0]["branch_p50_latency_ms"] == "150.0"
+    assert rows[0]["branch_p95_latency_ms"] == "195.0"
+    assert rows[0]["branch_p99_latency_ms"] == "199.0"
     assert rows[0]["branch_phase_wall_ms"] == "225.0"
     assert rows[0]["branch_phase_wall_source"] == "measured_branch_phase"
     assert rows[0]["case_wall_time_ms"] == "300.0"
@@ -52,7 +73,11 @@ def test_write_results_includes_measured_latency(tmp_path) -> None:
     assert rows[0]["approx_wall_time_ms"] == "300.0"
     assert rows[0]["branch_total_output_tokens"] == "30"
     assert float(rows[0]["branch_output_tokens_per_s"]) == 30 / 0.225
+    assert float(rows[0]["branch_requests_per_s"]) == 2 / 0.225
+    assert rows[0]["ttft_ms_p50"] == "60.0"
+    assert float(rows[0]["tpot_ms_p95"]) == pytest.approx(6.29925)
 
     summary = (tmp_path / "summary.md").read_text(encoding="utf-8")
     assert "Measured End-to-End Latency" in summary
+    assert "Streaming Latency" in summary
     assert "Logical Savings" in summary

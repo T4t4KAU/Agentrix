@@ -11,6 +11,8 @@ class BranchTrace:
     decode_tokens: int
     input_tokens: int | None = None
     latency_ms: float | None = None
+    ttft_ms: float | None = None
+    tpot_ms: float | None = None
     strategy: str | None = None
 
     def __post_init__(self) -> None:

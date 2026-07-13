@@ -40,17 +40,24 @@ SEED="${SEED:-2026}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.70}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
+NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE:-}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-300}"
+SHUTDOWN_TIMEOUT="${SHUTDOWN_TIMEOUT:-30}"
+VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
+VLLM_FORK_ATTN_FANOUT_SCHEDULING_ENABLED="${VLLM_FORK_ATTN_FANOUT_SCHEDULING_ENABLED:-1}"
 OUTPUT_DIR="${OUTPUT_DIR:-results/fork_attention_${DATASET}_c${CASE_COUNT}_p${PREFIX_TOKENS}_b${BRANCHES}_g${BRANCH_GROUP_SIZE}_o${OUTPUT_TOKENS}}"
 KEEP_SERVER="${KEEP_SERVER:-0}"
 VLLM_SERVER_EXTRA_ARGS="${VLLM_SERVER_EXTRA_ARGS:-}"
 BENCHMARK_EXTRA_ARGS="${BENCHMARK_EXTRA_ARGS:-}"
 KV_TRANSFER_CONFIG="${KV_TRANSFER_CONFIG:-}"
 KV_BYTES_PER_TOKEN="${KV_BYTES_PER_TOKEN:-}"
+ENABLE_TELEMETRY="${ENABLE_TELEMETRY:-1}"
+TELEMETRY_INTERVAL_SECONDS="${TELEMETRY_INTERVAL_SECONDS:-0.5}"
 
 LOG_DIR="${BENCHMARK_DIR}/${OUTPUT_DIR}"
 SERVER_PIDS=()
 SERVER_BASE_URLS=()
+TELEMETRY_PID=""
 BACKENDS="${BACKENDS//,/ }"
 read -r -a BACKEND_LIST <<<"${BACKENDS}"
 
@@ -101,6 +108,22 @@ if ((TP_SIZE <= 0)); then
   echo "TP_SIZE must be positive." >&2
   exit 1
 fi
+if [[ -n "${NUM_GPU_BLOCKS_OVERRIDE}" ]] \
+  && { ! [[ "${NUM_GPU_BLOCKS_OVERRIDE}" =~ ^[0-9]+$ ]] \
+    || ((NUM_GPU_BLOCKS_OVERRIDE <= 0)); }; then
+  echo "NUM_GPU_BLOCKS_OVERRIDE must be a positive integer." >&2
+  exit 1
+fi
+if [[ "${VLLM_USE_FLASHINFER_SAMPLER}" != "0" \
+  && "${VLLM_USE_FLASHINFER_SAMPLER}" != "1" ]]; then
+  echo "VLLM_USE_FLASHINFER_SAMPLER must be 0 or 1." >&2
+  exit 1
+fi
+if [[ "${VLLM_FORK_ATTN_FANOUT_SCHEDULING_ENABLED}" != "0" \
+  && "${VLLM_FORK_ATTN_FANOUT_SCHEDULING_ENABLED}" != "1" ]]; then
+  echo "VLLM_FORK_ATTN_FANOUT_SCHEDULING_ENABLED must be 0 or 1." >&2
+  exit 1
+fi
 
 if [[ "${DP_DEPLOYMENT}" != "external" && "${DP_DEPLOYMENT}" != "internal" ]]; then
   echo "DP_DEPLOYMENT must be external or internal." >&2
@@ -117,7 +140,16 @@ if [[ "${KEEP_SERVER}" == "1" ]] && ((${#BACKEND_LIST[@]} > 1)); then
   exit 1
 fi
 
+stop_telemetry() {
+  if [[ -n "${TELEMETRY_PID}" ]] && kill -0 "${TELEMETRY_PID}" 2>/dev/null; then
+    kill -TERM "${TELEMETRY_PID}" 2>/dev/null || true
+    wait "${TELEMETRY_PID}" 2>/dev/null || true
+  fi
+  TELEMETRY_PID=""
+}
+
 stop_server() {
+  stop_telemetry
   for server_pid in "${SERVER_PIDS[@]}"; do
     if [[ -n "${server_pid}" ]] && kill -0 "${server_pid}" 2>/dev/null; then
       if [[ "${KEEP_SERVER}" == "1" ]]; then
@@ -220,7 +252,7 @@ def prometheus_counter(path: Path, metric: str) -> float:
 def parse_log(path: Path) -> dict[str, object]:
     text = path.read_text(encoding="utf-8", errors="ignore")
     lines = text.splitlines()
-    kv_match = re.search(r"GPU KV cache size:\s*([0-9,]+)\s*tokens", text)
+    kv_matches = re.findall(r"GPU KV cache size:\s*([0-9,]+)\s*tokens", text)
     concurrency_match = re.search(
         r"Maximum concurrency for\s*([0-9,]+)\s*tokens per request:\s*([0-9.]+)x",
         text,
@@ -320,7 +352,9 @@ def parse_log(path: Path) -> dict[str, object]:
         )
     return {
         "log": str(path),
-        "gpu_kv_cache_tokens": int_or_none(kv_match.group(1) if kv_match else None),
+        "gpu_kv_cache_tokens": sum(
+            int(value.replace(",", "")) for value in kv_matches
+        ),
         "max_model_len_for_concurrency": int_or_none(
             concurrency_match.group(1) if concurrency_match else None
         ),
@@ -342,8 +376,14 @@ def parse_log(path: Path) -> dict[str, object]:
         "kv_offload_load_bytes": prometheus_counter(
             metrics_path, "vllm:kv_offload_load_bytes"
         ),
+        "kv_offload_load_operations": prometheus_counter(
+            metrics_path, "vllm:kv_offload_load_size_count"
+        ),
         "kv_offload_store_bytes": prometheus_counter(
             metrics_path, "vllm:kv_offload_store_bytes"
+        ),
+        "kv_offload_store_operations": prometheus_counter(
+            metrics_path, "vllm:kv_offload_store_size_count"
         ),
         "num_preemptions": prometheus_counter(
             metrics_path, "vllm:num_preemptions"
@@ -397,6 +437,15 @@ def main() -> int:
             if key.endswith(("victims", "cohorts", "reservations", "lines"))
             else max(values, default=0)
         )
+    gpu_kv_capacities = [
+        int(rank["gpu_kv_cache_tokens"])
+        for rank in ranks
+        if isinstance(rank.get("gpu_kv_cache_tokens"), int)
+    ]
+    aggregate["gpu_kv_cache_capacity_tokens"] = sum(gpu_kv_capacities)
+    aggregate["gpu_kv_cache_capacity_gib"] = (
+        sum(gpu_kv_capacities) * kv_bytes_per_token / 1024**3
+    )
     aggregate["max_observed_kv_cache_usage"] = max(
         (
             float(rank.get("max_observed_kv_cache_usage", 0.0))
@@ -414,10 +463,18 @@ def main() -> int:
     }
     for key in (
         "kv_offload_load_bytes",
+        "kv_offload_load_operations",
         "kv_offload_store_bytes",
+        "kv_offload_store_operations",
         "num_preemptions",
     ):
         aggregate[key] = sum(float(rank.get(key, 0.0)) for rank in ranks)
+    for direction in ("load", "store"):
+        total_bytes = float(aggregate[f"kv_offload_{direction}_bytes"])
+        operations = float(aggregate[f"kv_offload_{direction}_operations"])
+        aggregate[f"kv_offload_{direction}_average_mib"] = (
+            total_bytes / operations / 1024**2 if operations else 0.0
+        )
     reload_totals = {
         key: sum(
             int(rank.get("fork_dp_reload", {}).get(key, 0))
@@ -450,6 +507,10 @@ def main() -> int:
     )
     reload_totals["saved_reload_gib"] = reload_totals["saved_reload_bytes"] / 1024**3
     aggregate["fork_dp_reload"] = reload_totals
+    telemetry_path = profile_path.parent / "telemetry.json"
+    if telemetry_path.exists():
+        telemetry = json.loads(telemetry_path.read_text(encoding="utf-8"))
+        aggregate["telemetry"] = telemetry.get("summary", {})
     profile_path.write_text(
         json.dumps(aggregate, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
@@ -535,9 +596,13 @@ run_backend() {
       --max-model-len "${MAX_MODEL_LEN}"
       --max-num-seqs "${MAX_NUM_SEQS}"
       --tensor-parallel-size "${TP_SIZE}"
+      --shutdown-timeout "${SHUTDOWN_TIMEOUT}"
     )
     if [[ "${ENFORCE_EAGER}" == "1" ]]; then
       vllm_args+=(--enforce-eager)
+    fi
+    if [[ -n "${NUM_GPU_BLOCKS_OVERRIDE}" ]]; then
+      vllm_args+=(--num-gpu-blocks-override "${NUM_GPU_BLOCKS_OVERRIDE}")
     fi
     if [[ "${DP_DEPLOYMENT}" == "internal" ]]; then
       vllm_args+=(
@@ -555,7 +620,10 @@ run_backend() {
 
     echo "Starting ${MODEL_PATH} with ${attention_backend} server ${rank}"
     echo "  GPUs ${gpu_id}, endpoint ${rank_base_url}, DP ${DP_DEPLOYMENT}"
-    CUDA_VISIBLE_DEVICES="${gpu_id}" \
+    env -u VLLM_BIN -u VLLM_SERVER_EXTRA_ARGS \
+      CUDA_VISIBLE_DEVICES="${gpu_id}" \
+      VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER}" \
+      VLLM_FORK_ATTN_FANOUT_SCHEDULING_ENABLED="${VLLM_FORK_ATTN_FANOUT_SCHEDULING_ENABLED}" \
       "${VLLM_BIN}" "${vllm_args[@]}" >"${server_log}" 2>&1 &
     SERVER_PIDS+=("$!")
   done
@@ -634,9 +702,29 @@ run_backend() {
     benchmark_args+=("${extra_benchmark_args[@]}")
   fi
 
+  if [[ "${ENABLE_TELEMETRY}" == "1" ]]; then
+    local telemetry_args=(
+      "${BENCHMARK_DIR}/src/telemetry.py"
+      --output "${backend_log_dir}/telemetry.json"
+      --gpu-ids "${internal_gpu_ids}"
+      --interval-seconds "${TELEMETRY_INTERVAL_SECONDS}"
+    )
+    for rank_base_url in "${SERVER_BASE_URLS[@]}"; do
+      telemetry_args+=(--metrics-url "${rank_base_url}/metrics")
+    done
+    "${BENCHMARK_PYTHON}" "${telemetry_args[@]}" &
+    TELEMETRY_PID="$!"
+    sleep 0.05
+    if ! kill -0 "${TELEMETRY_PID}" 2>/dev/null; then
+      echo "Telemetry process exited before the benchmark started." >&2
+      exit 1
+    fi
+  fi
+
   echo "Running Agentrix benchmark for ${attention_backend}..."
   OPENAI_API_KEY="vllm-local" "${BENCHMARK_PYTHON}" "${benchmark_args[@]}"
 
+  stop_telemetry
   write_prometheus_metrics "${backend_log_dir}"
   write_server_profile "${backend_log_dir}"
   stop_server

@@ -1,4 +1,12 @@
-from api_runner import _branch_rank_map, _common_rank, _rank_counts
+from api_runner import (
+    _branch_rank_map,
+    _client_route_counts,
+    _common_rank,
+    _internal_dp_headers,
+    _rank_counts,
+    _reported_route_rank,
+    _time_per_output_token,
+)
 
 
 def test_round_robin_routes_individual_branches_evenly() -> None:
@@ -66,3 +74,29 @@ def test_prefix_forest_balances_without_splitting_groups() -> None:
         assert len(ranks) == 1
     assert _rank_counts(route_map, 2) == [4, 4]
     assert _common_rank(0, route_map, branch_count=8, dp_size=2) == 0
+
+
+def test_time_per_output_token_excludes_first_token_latency() -> None:
+    assert _time_per_output_token(100.0, 40.0, 4) == 20.0
+    assert _time_per_output_token(40.0, 40.0, 1) == 0.0
+    assert _time_per_output_token(100.0, None, 4) is None
+
+
+def test_internal_dp_only_forces_rank_for_skewed_reload_workload() -> None:
+    assert _internal_dp_headers(2, "single", 1) is None
+    assert _internal_dp_headers(2, "prefix_forest", 1) is None
+    assert _internal_dp_headers(None, "prefix_skewed", 1) is None
+    assert _internal_dp_headers(2, "prefix_skewed", 1) == {"X-data-parallel-rank": "1"}
+
+
+def test_internal_dp_reports_server_owned_routing_as_unknown() -> None:
+    route_map = {(0, 0): 0, (0, 1): 1}
+
+    assert _reported_route_rank(2, "single", 0) is None
+    assert _reported_route_rank(2, "prefix_skewed", 1) == 1
+    assert _reported_route_rank(None, "round_robin", 1) == 1
+    assert _client_route_counts(2, "single", route_map, [0], 2) == (None, None)
+    assert _client_route_counts(None, "round_robin", route_map, [0], 2) == (
+        [1, 1],
+        [1, 0],
+    )

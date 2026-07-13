@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import statistics
 from pathlib import Path
 from typing import Any, Iterable
@@ -23,16 +24,20 @@ def write_results(
     raw_api_results: Any | None = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    write_json(output_dir / "benchmark_trace.json", [trace.to_dict() for trace in traces])
+    write_json(
+        output_dir / "benchmark_trace.json", [trace.to_dict() for trace in traces]
+    )
     if raw_api_results is not None:
         write_json(output_dir / "raw_api_results.json", raw_api_results)
 
     rows = []
     for index, (trace, result) in enumerate(zip(traces, results, strict=True)):
-        rows.append({
-            **result,
-            **measured_metrics(trace, _select_raw_result(raw_api_results, index)),
-        })
+        rows.append(
+            {
+                **result,
+                **measured_metrics(trace, _select_raw_result(raw_api_results, index)),
+            }
+        )
     csv_path = output_dir / "benchmark_results.csv"
     with csv_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
@@ -54,9 +59,7 @@ def measured_metrics(
     raw_api_results: Any | None = None,
 ) -> dict[str, int | float | str]:
     branch_latencies = [
-        branch.latency_ms
-        for branch in trace.branches
-        if branch.latency_ms is not None
+        branch.latency_ms for branch in trace.branches if branch.latency_ms is not None
     ]
     if not branch_latencies:
         return {}
@@ -73,6 +76,7 @@ def measured_metrics(
 
     branch_max_latency_ms = max(branch_latencies)
     branch_output_tokens = sum(branch.decode_tokens for branch in trace.branches)
+    branch_input_tokens = sum(branch.input_tokens or 0 for branch in trace.branches)
     measured_branch_phase_ms = _float_or_none(branch_phase_latency_ms)
     branch_phase_ms = measured_branch_phase_ms or branch_max_latency_ms
     branch_phase_source = (
@@ -100,6 +104,9 @@ def measured_metrics(
     metrics: dict[str, int | float | str] = {
         "branch_mean_latency_ms": statistics.fmean(branch_latencies),
         "branch_median_latency_ms": statistics.median(branch_latencies),
+        "branch_p50_latency_ms": _percentile(branch_latencies, 50),
+        "branch_p95_latency_ms": _percentile(branch_latencies, 95),
+        "branch_p99_latency_ms": _percentile(branch_latencies, 99),
         "branch_min_latency_ms": min(branch_latencies),
         "branch_max_latency_ms": branch_max_latency_ms,
         "branch_phase_wall_ms": branch_phase_ms,
@@ -108,8 +115,18 @@ def measured_metrics(
         "case_wall_time_source": case_wall_time_source,
         "approx_wall_time_ms": case_wall_time_ms,
         "branch_total_output_tokens": branch_output_tokens,
+        "branch_total_input_tokens": branch_input_tokens,
+        "branch_requests_per_s": _tokens_per_second(
+            len(branch_latencies), branch_phase_ms
+        ),
+        "branch_input_tokens_per_s": _tokens_per_second(
+            branch_input_tokens, branch_phase_ms
+        ),
         "branch_output_tokens_per_s": _tokens_per_second(
             branch_output_tokens, branch_phase_ms
+        ),
+        "branch_total_tokens_per_s": _tokens_per_second(
+            branch_input_tokens + branch_output_tokens, branch_phase_ms
         ),
         "end_to_end_output_tokens_per_s": _tokens_per_second(
             branch_output_tokens, case_wall_time_ms
@@ -121,6 +138,12 @@ def measured_metrics(
         metrics["branch_mean_input_tokens"] = statistics.fmean(input_tokens)
         metrics["branch_min_input_tokens"] = min(input_tokens)
         metrics["branch_max_input_tokens"] = max(input_tokens)
+    ttfts = [branch.ttft_ms for branch in trace.branches if branch.ttft_ms is not None]
+    if ttfts:
+        metrics.update(_distribution_metrics("ttft_ms", ttfts))
+    tpots = [branch.tpot_ms for branch in trace.branches if branch.tpot_ms is not None]
+    if tpots:
+        metrics.update(_distribution_metrics("tpot_ms", tpots))
     return metrics
 
 
@@ -133,7 +156,7 @@ def render_summary(results: Iterable[dict[str, Any]]) -> str:
                 "## Measured End-to-End Latency",
                 "",
                 "| Case | Prefix | Branches | Common ms | Branch mean ms "
-                "| Branch p50 ms | Branch max ms | Branch wall ms "
+                "| Branch p50 ms | Branch p95 ms | Branch p99 ms "
                 "| E2E wall ms | Branch tok/s | E2E tok/s |",
                 "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
             ]
@@ -145,9 +168,9 @@ def render_summary(results: Iterable[dict[str, Any]]) -> str:
                 f"| {row['case_id']} | {row['prefix_tokens']} "
                 f"| {row['branch_count']} | {_format_number(row, 'common_latency_ms')} "
                 f"| {_format_number(row, 'branch_mean_latency_ms')} "
-                f"| {_format_number(row, 'branch_median_latency_ms')} "
-                f"| {_format_number(row, 'branch_max_latency_ms')} "
-                f"| {_format_number(row, 'branch_phase_wall_ms')} "
+                f"| {_format_number(row, 'branch_p50_latency_ms')} "
+                f"| {_format_number(row, 'branch_p95_latency_ms')} "
+                f"| {_format_number(row, 'branch_p99_latency_ms')} "
                 f"| {_format_number(row, 'case_wall_time_ms')} "
                 f"| {_format_number(row, 'branch_output_tokens_per_s')} "
                 f"| {_format_number(row, 'end_to_end_output_tokens_per_s')} |"
@@ -162,6 +185,32 @@ def render_summary(results: Iterable[dict[str, Any]]) -> str:
                 "",
             ]
         )
+
+    if any("ttft_ms_mean" in row for row in rows):
+        lines.extend(
+            [
+                "## Streaming Latency",
+                "",
+                "| Case | TTFT mean ms | TTFT P50 | TTFT P95 | TTFT P99 "
+                "| TPOT mean ms | TPOT P50 | TPOT P95 | TPOT P99 |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for row in rows:
+            if "ttft_ms_mean" not in row:
+                continue
+            lines.append(
+                f"| {row['case_id']} "
+                f"| {_format_number(row, 'ttft_ms_mean')} "
+                f"| {_format_number(row, 'ttft_ms_p50')} "
+                f"| {_format_number(row, 'ttft_ms_p95')} "
+                f"| {_format_number(row, 'ttft_ms_p99')} "
+                f"| {_format_number(row, 'tpot_ms_mean')} "
+                f"| {_format_number(row, 'tpot_ms_p50')} "
+                f"| {_format_number(row, 'tpot_ms_p95')} "
+                f"| {_format_number(row, 'tpot_ms_p99')} |"
+            )
+        lines.append("")
 
     lines.extend(
         [
@@ -211,6 +260,30 @@ def _tokens_per_second(tokens: int, latency_ms: float) -> float:
     if latency_ms <= 0:
         return 0.0
     return tokens / (latency_ms / 1000)
+
+
+def _percentile(values: Iterable[float], percentile: float) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        raise ValueError("cannot calculate a percentile of an empty sample")
+    if not 0 <= percentile <= 100:
+        raise ValueError("percentile must be between 0 and 100")
+    position = (len(ordered) - 1) * percentile / 100
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1 - weight) + ordered[upper] * weight
+
+
+def _distribution_metrics(prefix: str, values: list[float]) -> dict[str, float]:
+    return {
+        f"{prefix}_mean": statistics.fmean(values),
+        f"{prefix}_p50": _percentile(values, 50),
+        f"{prefix}_p95": _percentile(values, 95),
+        f"{prefix}_p99": _percentile(values, 99),
+    }
 
 
 def _float(row: dict[str, Any], key: str) -> float:

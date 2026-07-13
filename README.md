@@ -356,6 +356,50 @@ benchmark/scripts/import_agent_datasets.py \
   --appworld-source /path/to/appworld
 ```
 
+### Main experiment matrix
+
+`run_main_experiment.sh` runs all four bundled datasets and records streaming
+TTFT/TPOT, P50/P95/P99 request latency, throughput, logical and observed KV
+usage, GPU compute utilization, and NVIDIA memory-controller utilization.
+Select one of the three experiment groups with `MODE`:
+
+```bash
+cd benchmark
+
+# One GPU: Flash/Fork with no offload, ordinary CPU offload, and optimized offload.
+MODE=single_gpu \
+MODEL_SPECS='qwen3-1.7b|/path/to/Qwen3-1.7B;llama3.2-1b|/path/to/Llama-3.2-1B' \
+./scripts/run_main_experiment.sh
+
+# Internal DP: Flash, Fork, and prefix-aware Fork. Experimental reload is disabled.
+MODE=dp MODEL_SPECS='qwen3-8b|/path/to/Qwen3-8B' \
+./scripts/run_main_experiment.sh
+
+# TP accuracy guardrail: one Flash run and two Fork repeats.
+MODE=tp_accuracy MODEL_SPECS='qwen3-14b|/path/to/Qwen3-14B' \
+./scripts/run_main_experiment.sh
+```
+
+Override `PREFIX_LENGTHS`, `BRANCH_COUNTS`, `DATASETS`, `CASE_COUNT`,
+`GPU_IDS`, `DP_REPLICAS`, and `TP_SIZE` without editing the scripts. Completed
+run directories are skipped, so an interrupted matrix can resume in place.
+Each mode writes `main_experiment_report.md` and a machine-readable CSV under
+`benchmark/results/main_experiment/<mode>/`. Accuracy means deterministic
+output agreement against FlashAttention; the bundled prompt snapshots do not
+provide a common executable environment-level evaluator.
+
+The runner sets `VLLM_USE_FLASHINFER_SAMPLER=0` by default so sampler JIT does
+not confound attention backend measurements. Set it to `1` explicitly to
+benchmark the FlashInfer sampler; the selected value is recorded in every run
+manifest.
+
+The ordinary offload baseline is vLLM's native `OffloadingConnector` with LRU
+eviction and all fanout admission, preemption, hotset, and connector planning
+disabled. The optimized variant uses the same CPU capacity and LRU base policy,
+enabling those prefix-aware controls. Ordinary Fork DP likewise disables the
+fanout scheduler; only the prefix-aware DP variant enables it. LMCache and disk
+storage are intentionally outside this matrix.
+
 On a two-GPU machine, run two single-GPU vLLM replicas and compare DP routing
 policies. `round_robin` is the load-balancing baseline. `prefix_forest` keeps
 each branch group on one replica while greedily balancing group weights across

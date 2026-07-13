@@ -83,6 +83,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     api.add_argument("--output-tokens", type=int, default=256)
     api.add_argument("--common-analysis-tokens", type=int, default=256)
+    api.add_argument(
+        "--stream",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use streaming chat responses to measure TTFT and TPOT.",
+    )
     api.add_argument("--concurrency", type=int, default=8)
     api.add_argument("--arrival-interval-ms", type=int, default=0)
     api.add_argument("--minority-headstart-ms", type=int, default=0)
@@ -172,6 +178,7 @@ def main(argv: list[str] | None = None) -> int:
                 branch_order=args.branch_order,
                 dp_routing=args.dp_routing,
                 internal_dp_size=args.internal_dp_size,
+                stream=args.stream,
             )
         )
         trace = BenchmarkTrace(

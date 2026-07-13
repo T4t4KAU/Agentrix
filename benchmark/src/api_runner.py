@@ -31,12 +31,24 @@ class APIBranchResult:
     branch_id: int
     case_index: int
     group_id: int
-    route_rank: int
+    route_rank: int | None
     input_tokens: int
     output_tokens: int
     latency_ms: float
+    ttft_ms: float | None
+    tpot_ms: float | None
     text: str
     strategy: str
+
+
+@dataclass
+class APIRequestResult:
+    text: str
+    input_tokens: int
+    output_tokens: int
+    latency_ms: float
+    ttft_ms: float | None = None
+    tpot_ms: float | None = None
 
 
 DP_ROUTINGS = {
@@ -144,6 +156,43 @@ def _common_rank(
     return min(range(dp_size), key=lambda rank: (-counts[rank], rank))
 
 
+def _internal_dp_headers(
+    internal_dp_size: int | None,
+    dp_routing: str,
+    route_rank: int,
+) -> dict[str, str] | None:
+    if internal_dp_size is None or dp_routing != "prefix_skewed":
+        return None
+    return {"X-data-parallel-rank": str(route_rank)}
+
+
+def _reported_route_rank(
+    internal_dp_size: int | None,
+    dp_routing: str,
+    route_rank: int,
+) -> int | None:
+    if internal_dp_size is None or internal_dp_size == 1:
+        return route_rank
+    if dp_routing == "prefix_skewed":
+        return route_rank
+    return None
+
+
+def _client_route_counts(
+    internal_dp_size: int | None,
+    dp_routing: str,
+    route_map: dict[tuple[int, int], int],
+    common_ranks: list[int],
+    dp_size: int,
+) -> tuple[list[int] | None, list[int] | None]:
+    if internal_dp_size not in (None, 1) and dp_routing != "prefix_skewed":
+        return None, None
+    return (
+        _rank_counts(route_map, dp_size),
+        [sum(1 for rank in common_ranks if rank == index) for index in range(dp_size)],
+    )
+
+
 async def run_api_case(
     common_context: str | list[str],
     model: str,
@@ -167,6 +216,7 @@ async def run_api_case(
     branch_order: str = "case_major",
     dp_routing: str = "single",
     internal_dp_size: int | None = None,
+    stream: bool = True,
 ) -> tuple[BenchmarkTrace, dict[str, Any]]:
     import random
 
@@ -232,12 +282,12 @@ async def run_api_case(
         max_tokens: int,
         route_rank: int,
         priority: int = 0,
-    ) -> tuple[str, int, int]:
+    ) -> APIRequestResult:
         client = clients[0] if internal_dp_size is not None else clients[route_rank]
-        extra_headers = (
-            {"X-data-parallel-rank": str(route_rank)}
-            if internal_dp_size is not None
-            else None
+        extra_headers = _internal_dp_headers(
+            internal_dp_size,
+            dp_routing,
+            route_rank,
         )
         if api_mode == "responses":
             kwargs: dict[str, Any] = {
@@ -250,13 +300,16 @@ async def run_api_case(
             }
             if reasoning_effort:
                 kwargs["reasoning"] = {"effort": reasoning_effort}
+            started = time.perf_counter()
             response = await client.responses.create(**kwargs)
+            latency_ms = (time.perf_counter() - started) * 1000
             if response.usage is None:
                 raise RuntimeError("API response did not include token usage")
-            return (
-                response.output_text,
-                response.usage.input_tokens,
-                response.usage.output_tokens,
+            return APIRequestResult(
+                text=response.output_text,
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+                latency_ms=latency_ms,
             )
         if api_mode == "chat":
             kwargs = {
@@ -269,7 +322,56 @@ async def run_api_case(
             }
             if reasoning_effort:
                 kwargs["reasoning_effort"] = reasoning_effort
+            if stream:
+                started = time.perf_counter()
+                response_stream = await client.chat.completions.create(
+                    **kwargs,
+                    stream=True,
+                    stream_options={"include_usage": True},
+                )
+                text_parts: list[str] = []
+                first_token_at: float | None = None
+                usage = None
+                async for chunk in response_stream:
+                    if chunk.usage is not None:
+                        usage = chunk.usage
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
+                    text = delta.content or ""
+                    if not text:
+                        text = str(
+                            (delta.model_extra or {}).get("reasoning_content") or ""
+                        )
+                    if text:
+                        if first_token_at is None:
+                            first_token_at = time.perf_counter()
+                        text_parts.append(text)
+                completed_at = time.perf_counter()
+                if usage is None:
+                    raise RuntimeError("streaming API response omitted token usage")
+                latency_ms = (completed_at - started) * 1000
+                ttft_ms = (
+                    (first_token_at - started) * 1000
+                    if first_token_at is not None
+                    else None
+                )
+                tpot_ms = _time_per_output_token(
+                    latency_ms,
+                    ttft_ms,
+                    usage.completion_tokens,
+                )
+                return APIRequestResult(
+                    text="".join(text_parts),
+                    input_tokens=usage.prompt_tokens,
+                    output_tokens=usage.completion_tokens,
+                    latency_ms=latency_ms,
+                    ttft_ms=ttft_ms,
+                    tpot_ms=tpot_ms,
+                )
+            started = time.perf_counter()
             response = await client.chat.completions.create(**kwargs)
+            latency_ms = (time.perf_counter() - started) * 1000
             if response.usage is None:
                 raise RuntimeError("API response did not include token usage")
             message = response.choices[0].message
@@ -278,7 +380,12 @@ async def run_api_case(
                 # DeepSeek reasoning models expose the generated reasoning through
                 # an OpenAI-compatible extension when the visible answer is empty.
                 text = str((message.model_extra or {}).get("reasoning_content") or "")
-            return text, response.usage.prompt_tokens, response.usage.completion_tokens
+            return APIRequestResult(
+                text=text,
+                input_tokens=response.usage.prompt_tokens,
+                output_tokens=response.usage.completion_tokens,
+                latency_ms=latency_ms,
+            )
         raise AssertionError("unreachable")
 
     common_results = await asyncio.gather(
@@ -295,7 +402,7 @@ async def run_api_case(
     shared_contexts = []
     common_cases = []
     for case_index, (context, result) in enumerate(zip(contexts, common_results)):
-        common_analysis, common_input_tokens, common_output_tokens = result
+        common_analysis = result.text
         shared_context = (
             context
             + "\n\n--- Shared Analysis ---\n\n"
@@ -306,9 +413,16 @@ async def run_api_case(
         common_cases.append(
             {
                 "case_index": case_index,
-                "route_rank": common_ranks[case_index],
-                "input_tokens": common_input_tokens,
-                "output_tokens": common_output_tokens,
+                "route_rank": _reported_route_rank(
+                    internal_dp_size,
+                    dp_routing,
+                    common_ranks[case_index],
+                ),
+                "input_tokens": result.input_tokens,
+                "output_tokens": result.output_tokens,
+                "request_latency_ms": result.latency_ms,
+                "ttft_ms": result.ttft_ms,
+                "tpot_ms": result.tpot_ms,
                 "prefix_tokens": count_tokens(shared_context, model),
                 "text": common_analysis,
             }
@@ -375,9 +489,8 @@ async def run_api_case(
             if dp_routing == "prefix_skewed" and branch_index == 1
             else output_tokens
         )
-        started = time.perf_counter()
         async with semaphore:
-            text, input_tokens, actual_output_tokens = await request(
+            result = await request(
                 messages,
                 request_output_tokens,
                 route_rank,
@@ -385,16 +498,21 @@ async def run_api_case(
                 if dp_routing == "prefix_skewed" and branch_index == 0
                 else 0,
             )
-        latency_ms = (time.perf_counter() - started) * 1000
         return APIBranchResult(
             branch_id=index,
             case_index=case_index,
             group_id=group_id,
-            route_rank=route_rank,
-            input_tokens=input_tokens,
-            output_tokens=actual_output_tokens,
-            latency_ms=latency_ms,
-            text=text,
+            route_rank=_reported_route_rank(
+                internal_dp_size,
+                dp_routing,
+                route_rank,
+            ),
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            latency_ms=result.latency_ms,
+            ttft_ms=result.ttft_ms,
+            tpot_ms=result.tpot_ms,
+            text=result.text,
             strategy=strategy,
         )
 
@@ -408,6 +526,14 @@ async def run_api_case(
     branch_phase_latency_ms = (time.perf_counter() - branch_phase_started) * 1000
     # API input usage includes message framing. The tokenizer-derived shared text
     # length makes that framing part of each observed private suffix.
+    branch_route_counts, common_route_counts = _client_route_counts(
+        internal_dp_size,
+        dp_routing,
+        route_map,
+        common_ranks,
+        dp_size,
+    )
+    routing_source = "client" if branch_route_counts is not None else "server"
     trace = BenchmarkTrace(
         case_id=(
             f"api_forest_c{case_count}_p{local_prefix_tokens}_"
@@ -425,6 +551,8 @@ async def run_api_case(
                 decode_tokens=result.output_tokens,
                 input_tokens=result.input_tokens,
                 latency_ms=result.latency_ms,
+                ttft_ms=result.ttft_ms,
+                tpot_ms=result.tpot_ms,
                 strategy=result.strategy,
             )
             for result in branches
@@ -447,11 +575,10 @@ async def run_api_case(
             "dp_routing": dp_routing,
             "dp_size": dp_size,
             "minority_headstart_ms": minority_headstart_ms,
-            "branch_route_counts": _rank_counts(route_map, dp_size),
-            "common_route_counts": [
-                sum(1 for rank in common_ranks if rank == index)
-                for index in range(dp_size)
-            ],
+            "stream": stream,
+            "routing_source": routing_source,
+            "branch_route_counts": branch_route_counts,
+            "common_route_counts": common_route_counts,
             "prefix_tokens_by_case": local_prefix_tokens_by_case,
         },
     )
@@ -469,10 +596,10 @@ async def run_api_case(
         "dp_routing": dp_routing,
         "dp_size": dp_size,
         "minority_headstart_ms": minority_headstart_ms,
-        "branch_route_counts": _rank_counts(route_map, dp_size),
-        "common_route_counts": [
-            sum(1 for rank in common_ranks if rank == index) for index in range(dp_size)
-        ],
+        "stream": stream,
+        "routing_source": routing_source,
+        "branch_route_counts": branch_route_counts,
+        "common_route_counts": common_route_counts,
         "total_latency_ms": (time.perf_counter() - case_started) * 1000,
         "branch_phase_latency_ms": branch_phase_latency_ms,
         "common": {
@@ -485,3 +612,15 @@ async def run_api_case(
     }
     await asyncio.gather(*(client.close() for client in clients))
     return trace, raw
+
+
+def _time_per_output_token(
+    latency_ms: float,
+    ttft_ms: float | None,
+    output_tokens: int,
+) -> float | None:
+    if ttft_ms is None or output_tokens <= 0:
+        return None
+    if output_tokens == 1:
+        return 0.0
+    return max(0.0, latency_ms - ttft_ms) / (output_tokens - 1)
