@@ -5,15 +5,22 @@ LMCache integration, and the end-to-end benchmark suite in one repository:
 
 - `vllm/` is a Git submodule pinned to the experimental implementation.
 - `LMCache/` is a Git submodule pinned to the tiered KV storage implementation.
+- `llama.cpp/` is a Git submodule pinned to the CUDA/MUSA ForkAttention implementation.
 - `benchmark/` contains simulation, API, and local vLLM benchmarks.
 
 ## Documentation
 
 - [AutoDL CUDA 12.8 build and benchmark guide](docs/autodl_build_and_benchmark.md)
+- [llama.cpp CUDA/MUSA ForkAttention build and runtime guide](docs/llama_cpp_forkattention_usage.md)
+- [llama.cpp EulerOS and CentOS adaptation notes](docs/llama_cpp_forkattention_hce_centos_adaptation.md)
 - [Prefix-aware data parallel experiment results](docs/dp_experiment_results.md)
 - [ForkAttention TP model compatibility](docs/tp_model_compatibility.md)
 
 ## System Requirements
+
+The following requirements apply to the vLLM and LMCache workflow. The
+`llama.cpp` submodule can instead use a supported Moore Threads GPU and MUSA
+SDK as described in its build and runtime guide.
 
 - Linux x86_64 with an NVIDIA GPU.
 - A working NVIDIA driver and CUDA Toolkit, with `nvcc` available in `PATH`.
@@ -31,7 +38,7 @@ nvidia-smi
 
 ## Clone the Repository
 
-Initialize both submodules when cloning:
+Initialize all three submodules when cloning:
 
 ```bash
 git clone --recurse-submodules <agentrix-repository-url> agentrix
@@ -47,7 +54,7 @@ git submodule sync --recursive
 git submodule update --init --recursive
 ```
 
-Both submodules track their `fork-attn` branches. Agentrix records exact commit
+All three submodules track their `fork-attn` branches. Agentrix records exact commit
 IDs, so verify that the pinned commits are available from the remotes in
 `.gitmodules` before publishing the parent repository.
 
