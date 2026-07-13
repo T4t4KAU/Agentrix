@@ -31,6 +31,7 @@ MAX_MODEL_LEN=4096 \
 |---|---|---|---:|---:|---:|---:|
 | `Qwen3ForCausalLM` | Qwen3-8B | Passed | 220,592 tokens | 118.22 | 44.20 | 48.91% |
 | `LlamaForCausalLM` | Meta-Llama-3.1-8B-Instruct | Passed | 251,344 tokens | 152.92 | 49.41 | 48.45% |
+| `MiniCPMForCausalLM` | MiniCPM4.1-8B | Passed | 1,001,680 tokens | 167.12 | 33.51 | 40.18% |
 
 ## Qwen3ForCausalLM
 
@@ -56,4 +57,18 @@ Raw results are stored at:
 
 ```text
 /root/autodl-tmp/Agentrix/benchmark/results/tp_model_compat/llama31_8b
+```
+
+## MiniCPMForCausalLM
+
+MiniCPM4.1-8B requires `--trust-remote-code` to load its custom Hugging Face
+configuration. With that model-required option enabled, its two KV heads split
+correctly across two TP ranks, ForkAttention CUDA Graph capture completed, and
+all API requests succeeded. The workload saved 2,098 logical KV token entries,
+equivalent to 0.064 GiB. No vLLM source adaptation was required.
+
+Raw results are stored at:
+
+```text
+/root/autodl-tmp/Agentrix/benchmark/results/tp_model_compat/minicpm41_8b
 ```
