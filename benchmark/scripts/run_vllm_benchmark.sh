@@ -15,6 +15,7 @@ ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-9000}"
 DP_REPLICAS="${DP_REPLICAS:-1}"
+TP_SIZE="${TP_SIZE:-1}"
 DP_DEPLOYMENT="${DP_DEPLOYMENT:-external}"
 DP_ROUTING="${DP_ROUTING:-single}"
 GPU_IDS="${GPU_IDS:-}"
@@ -94,6 +95,10 @@ fi
 
 if ((DP_REPLICAS <= 0)); then
   echo "DP_REPLICAS must be positive." >&2
+  exit 1
+fi
+if ((TP_SIZE <= 0)); then
+  echo "TP_SIZE must be positive." >&2
   exit 1
 fi
 
@@ -476,21 +481,22 @@ run_backend() {
 
   SERVER_PIDS=()
   SERVER_BASE_URLS=()
+  local required_gpu_count=$((DP_REPLICAS * TP_SIZE))
   local gpu_ids_normalized="${GPU_IDS//,/ }"
   local gpu_id_list=()
   if [[ -n "${gpu_ids_normalized}" ]]; then
     read -r -a gpu_id_list <<<"${gpu_ids_normalized}"
   else
-    for ((rank = 0; rank < DP_REPLICAS; rank++)); do
+    for ((rank = 0; rank < required_gpu_count; rank++)); do
       gpu_id_list+=("${rank}")
     done
   fi
-  if ((${#gpu_id_list[@]} < DP_REPLICAS)); then
-    echo "GPU_IDS must provide at least DP_REPLICAS entries." >&2
+  if ((${#gpu_id_list[@]} < required_gpu_count)); then
+    echo "GPU_IDS must provide at least DP_REPLICAS * TP_SIZE entries." >&2
     exit 1
   fi
   local internal_gpu_ids
-  internal_gpu_ids="$(IFS=,; echo "${gpu_id_list[*]:0:${DP_REPLICAS}}")"
+  internal_gpu_ids="$(IFS=,; echo "${gpu_id_list[*]:0:${required_gpu_count}}")"
 
   for ((rank = 0; rank < SERVER_COUNT; rank++)); do
     local rank_port=$((PORT + rank))
@@ -506,7 +512,9 @@ run_backend() {
   for ((rank = 0; rank < SERVER_COUNT; rank++)); do
     local rank_port=$((PORT + rank))
     local rank_base_url="${SERVER_BASE_URLS[$rank]}"
-    local gpu_id="${gpu_id_list[$rank]}"
+    local gpu_offset=$((rank * TP_SIZE))
+    local gpu_id
+    gpu_id="$(IFS=,; echo "${gpu_id_list[*]:${gpu_offset}:${TP_SIZE}}")"
     if [[ "${DP_DEPLOYMENT}" == "internal" ]]; then
       gpu_id="${internal_gpu_ids}"
     fi
@@ -526,6 +534,7 @@ run_backend() {
       --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
       --max-model-len "${MAX_MODEL_LEN}"
       --max-num-seqs "${MAX_NUM_SEQS}"
+      --tensor-parallel-size "${TP_SIZE}"
     )
     if [[ "${ENFORCE_EAGER}" == "1" ]]; then
       vllm_args+=(--enforce-eager)

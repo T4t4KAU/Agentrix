@@ -423,7 +423,9 @@ The Nsight report is written under
 `fork_attention.nsys-rep` plus the regular benchmark CSV/Markdown outputs.
 
 ForkAttention is intended to run with CUDA Graph capture, so the script leaves
-`ENFORCE_EAGER=0` by default. Common overrides include `PORT`,
+`ENFORCE_EAGER=0` by default. Set `TP_SIZE` and provide
+`DP_REPLICAS * TP_SIZE` entries in `GPU_IDS` for tensor-parallel model tests.
+Common overrides include `PORT`,
 `MAX_MODEL_LEN`, `MAX_NUM_SEQS`, `GPU_MEMORY_UTILIZATION`, `DTYPE`,
 `STARTUP_TIMEOUT`, `KEEP_SERVER`, and `VLLM_SERVER_EXTRA_ARGS`.
 Results and server logs are written to the selected `OUTPUT_DIR`.
