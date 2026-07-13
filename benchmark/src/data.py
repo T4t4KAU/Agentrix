@@ -8,8 +8,8 @@ from typing import Any, Iterator
 DEFAULT_PATHS = {
     "swebench": Path("data/swebench_verified.jsonl"),
     "agencybench": Path("data/agencybench_v2.jsonl"),
-    "agentboard": Path("data/AgentBoard"),
-    "appworld": Path("data/appworld"),
+    "agentboard": Path("data/agentboard.jsonl"),
+    "appworld": Path("data/appworld.jsonl"),
 }
 
 
@@ -138,8 +138,7 @@ def record_to_prompt(dataset: str, record: dict[str, Any]) -> str:
             f"场景：{record.get('scenario', '')}\n"
             f"场景 ID：{record.get('scenario_id', '')}\n\n"
             + "\n\n".join(
-                f"子任务 {index}：\n{text}"
-                for index, text in enumerate(subtasks, 1)
+                f"子任务 {index}：\n{text}" for index, text in enumerate(subtasks, 1)
             )
         )
     if dataset == "agentboard":

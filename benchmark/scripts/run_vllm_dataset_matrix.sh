@@ -19,8 +19,8 @@ DATASETS=(
 
 for spec in "${DATASETS[@]}"; do
   IFS="|" read -r dataset data_path <<<"${spec}"
-  if [[ ! -d "${data_path}" ]]; then
-    echo "Dataset directory does not exist: ${data_path}" >&2
+  if [[ ! -e "${data_path}" ]]; then
+    echo "Dataset path does not exist: ${data_path}" >&2
     exit 1
   fi
   for capture_mode in dense sparse; do

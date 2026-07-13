@@ -341,12 +341,19 @@ VLLM_FORK_ATTN_CUDAGRAPH_CAPTURE_BUCKETS="common:4,8;forest:256,512,1024" \
 `server_profile.json` records CUDA Graph hit/miss counters and average
 ForkAttention metadata construction time for selecting these capacities.
 
-AgentBoard and AppWorld directory adapters are also available. Point
-`DATA_PATH` at a checkout containing their prompt assets:
+AgentBoard and AppWorld prompt snapshots are included under `benchmark/data/`:
 
 ```bash
-DATASET=agentboard DATA_PATH=/path/to/AgentBoard ./scripts/run_vllm_benchmark.sh
-DATASET=appworld DATA_PATH=/path/to/appworld ./scripts/run_vllm_benchmark.sh
+DATASET=agentboard ./scripts/run_vllm_benchmark.sh
+DATASET=appworld ./scripts/run_vllm_benchmark.sh
+```
+
+Regenerate both snapshots from complete dataset checkouts with:
+
+```bash
+benchmark/scripts/import_agent_datasets.py \
+  --agentboard-source /path/to/AgentBoard \
+  --appworld-source /path/to/appworld
 ```
 
 On a two-GPU machine, run two single-GPU vLLM replicas and compare DP routing
