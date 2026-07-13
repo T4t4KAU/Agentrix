@@ -154,6 +154,9 @@ def collect_run(manifest_path: Path) -> dict[str, Any]:
         "prefix_aware_policy": manifest.get("prefix_aware_policy"),
         "fanout_admission_window": manifest.get("fanout_admission_window"),
         "offload_cpu_gib": manifest.get("offload_cpu_gib"),
+        "max_dataset_records": manifest.get("max_dataset_records"),
+        "full_dataset": manifest.get("full_dataset", True),
+        "dataset_records": len(common_requests),
         "batches": len(raw_batches),
         "requests": len(requests),
         "common_requests": len(common_requests),
@@ -408,6 +411,8 @@ def render_report(rows: list[dict[str, Any]]) -> str:
             row.get("use_flashinfer_sampler"),
             row.get("prefix_aware_policy"),
             row.get("fanout_admission_window"),
+            row.get("max_dataset_records"),
+            row.get("full_dataset", True),
         )
         provenance_counts[key] = provenance_counts.get(key, 0) + 1
     lines.extend(
@@ -415,8 +420,8 @@ def render_report(rows: list[dict[str, Any]]) -> str:
             "",
             "## Provenance",
             "",
-            "| Agentrix commit | Dirty | vLLM commit | Dirty | GPU blocks override | FlashInfer sampler | Prefix-aware policy | Admission window | Runs |",
-            "|---|---:|---|---:|---:|---:|---:|---:|---:|",
+            "| Agentrix commit | Dirty | vLLM commit | Dirty | GPU blocks override | FlashInfer sampler | Prefix-aware policy | Admission window | Record cap | Full dataset | Runs |",
+            "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for provenance, run_count in sorted(
@@ -432,6 +437,8 @@ def render_report(rows: list[dict[str, Any]]) -> str:
             use_flashinfer_sampler,
             prefix_aware_policy,
             fanout_admission_window,
+            max_dataset_records,
+            full_dataset,
         ) = provenance
         lines.append(
             f"| {_short_commit(agentrix_commit)} | {_format_bool(agentrix_dirty)} "
@@ -440,6 +447,8 @@ def render_report(rows: list[dict[str, Any]]) -> str:
             f"| {_format_bool(use_flashinfer_sampler)} "
             f"| {_format_bool(prefix_aware_policy)} "
             f"| {fanout_admission_window if fanout_admission_window is not None else '-'} "
+            f"| {max_dataset_records if max_dataset_records is not None else '-'} "
+            f"| {_format_bool(full_dataset)} "
             f"| {run_count} |"
         )
 
@@ -453,6 +462,7 @@ def render_report(rows: list[dict[str, Any]]) -> str:
             "- Logical KV read reduction estimates repeated prefix KV read volume avoided by ForkAttention; it is not physical cache capacity.",
             "- Peak GPU KV reduction uses sampled physical GPU KV occupancy relative to the baseline named in the delta table.",
             "- Throughput and request latency include both common-analysis and branch requests; branch-only distributions remain in the CSV.",
+            "- Record cap is the deterministic maximum number of source records per dataset; `-` with Full dataset=yes means every available record was used.",
             "- Accuracy is deterministic output agreement against FlashAttention, not environment-level task accuracy.",
             "- Repeat exact match compares Fork TP run 2 directly with Fork TP run 1.",
             "- Experimental KV reload rebalance is disabled for this experiment matrix.",

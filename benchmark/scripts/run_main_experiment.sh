@@ -13,6 +13,7 @@ SUFFIX_MEAN="${SUFFIX_MEAN:-256}"
 OUTPUT_TOKENS="${OUTPUT_TOKENS:-64}"
 COMMON_ANALYSIS_TOKENS="${COMMON_ANALYSIS_TOKENS:-64}"
 CASE_COUNT="${CASE_COUNT:-4}"
+MAX_DATASET_RECORDS="${MAX_DATASET_RECORDS:-32}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.70}"
 OFFLOAD_CPU_GIB="${OFFLOAD_CPU_GIB:-8}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
@@ -41,6 +42,17 @@ fi
 if ! [[ "${FANOUT_ADMISSION_WINDOW}" =~ ^[0-9]+$ ]]; then
   echo "FANOUT_ADMISSION_WINDOW must be a non-negative integer." >&2
   exit 1
+fi
+if ! [[ "${MAX_DATASET_RECORDS}" =~ ^[0-9]+$ ]]; then
+  echo "MAX_DATASET_RECORDS must be a non-negative integer." >&2
+  exit 1
+fi
+
+FULL_DATASET=0
+SAMPLE_COUNT="${MAX_DATASET_RECORDS}"
+if ((MAX_DATASET_RECORDS == 0)); then
+  FULL_DATASET=1
+  SAMPLE_COUNT="${CASE_COUNT}"
 fi
 
 case "${MODE}" in
@@ -109,7 +121,7 @@ write_manifest() {
     "${VLLM_GIT_COMMIT}" "${VLLM_GIT_DIRTY}" \
     "${NUM_GPU_BLOCKS_OVERRIDE}" "${VLLM_USE_FLASHINFER_SAMPLER}" \
     "${prefix_aware_policy}" "${fanout_admission_window}" \
-    "${OFFLOAD_CPU_GIB}" <<'PY'
+    "${OFFLOAD_CPU_GIB}" "${MAX_DATASET_RECORDS}" "${FULL_DATASET}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -135,6 +147,8 @@ from pathlib import Path
     prefix_aware_policy,
     fanout_admission_window,
     offload_cpu_gib,
+    max_dataset_records,
+    full_dataset,
 ) = sys.argv[1:]
 Path(path).write_text(
     json.dumps(
@@ -160,6 +174,10 @@ Path(path).write_text(
             "prefix_aware_policy": bool(int(prefix_aware_policy)),
             "fanout_admission_window": int(fanout_admission_window),
             "offload_cpu_gib": float(offload_cpu_gib),
+            "max_dataset_records": (
+                int(max_dataset_records) if int(max_dataset_records) else None
+            ),
+            "full_dataset": bool(int(full_dataset)),
         },
         indent=2,
     )
@@ -221,14 +239,14 @@ run_variant() {
     if MODEL_PATH="${model_path}" \
       SERVED_MODEL_NAME="${model_name}" \
       DATASET="${dataset}" \
-      FULL_DATASET=1 \
+      FULL_DATASET="${FULL_DATASET}" \
       BACKENDS="${backend}" \
       PREFIX_TOKENS="${prefix_tokens}" \
       BRANCHES="${branches}" \
       BRANCH_GROUP_SIZE="${branches}" \
       BRANCH_ORDER=round_robin \
       CASE_COUNT="${CASE_COUNT}" \
-      SAMPLE_COUNT="${CASE_COUNT}" \
+      SAMPLE_COUNT="${SAMPLE_COUNT}" \
       CONCURRENCY="${concurrency}" \
       SUFFIX_DISTRIBUTION=lognormal \
       SUFFIX_MEAN="${SUFFIX_MEAN}" \

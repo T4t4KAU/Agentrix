@@ -381,9 +381,9 @@ MODE=tp_accuracy MODEL_SPECS='qwen3-14b|/path/to/Qwen3-14B' \
 ```
 
 Override `PREFIX_LENGTHS`, `BRANCH_COUNTS`, `DATASETS`, `CASE_COUNT`,
-`GPU_IDS`, `DP_REPLICAS`, `TP_SIZE`, and `VARIANT_SPECS` without editing the
-scripts. Completed run directories are skipped, so an interrupted matrix can
-resume in place.
+`MAX_DATASET_RECORDS`, `GPU_IDS`, `DP_REPLICAS`, `TP_SIZE`, and
+`VARIANT_SPECS` without editing the scripts. Completed run directories are
+skipped, so an interrupted matrix can resume in place.
 Each mode writes `main_experiment_report.md` and a machine-readable CSV under
 `benchmark/results/main_experiment/<mode>/`. Accuracy means deterministic
 output agreement against FlashAttention; the bundled prompt snapshots do not
@@ -393,6 +393,12 @@ The runner sets `VLLM_USE_FLASHINFER_SAMPLER=0` by default so sampler JIT does
 not confound attention backend measurements. Set it to `1` explicitly to
 benchmark the FlashInfer sampler; the selected value is recorded in every run
 manifest.
+
+The main matrix uses at most 32 deterministic source records per dataset by
+default. This runs the complete AgentBoard, AppWorld, and AgencyBench snapshots
+and the first 32 SWE-bench Verified records. Set `MAX_DATASET_RECORDS=0` to run
+every available record. The configured cap and full-dataset flag are recorded
+in every run manifest and report.
 
 The ordinary offload baseline is vLLM's native `OffloadingConnector` with LRU
 eviction and all fanout admission, preemption, hotset, and connector planning

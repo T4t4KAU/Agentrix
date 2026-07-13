@@ -4,8 +4,12 @@
 
 This document is the canonical record for the Agentrix main experiment. The
 matrix uses all four bundled datasets: SWE-bench Verified, AgencyBench,
-AgentBoard, and AppWorld. Every workload expands each dataset prompt into a
-long common prefix followed by multiple branch suffixes.
+AgentBoard, and AppWorld. Every workload expands each selected dataset prompt
+into a long common prefix followed by multiple branch suffixes. The final
+matrix uses a deterministic cap of 32 records per dataset: all 9 AgentBoard,
+13 AppWorld, and 32 AgencyBench records, plus the first 32 SWE-bench Verified
+records. This yields 256 to 1,024 branch requests per matrix point. Set
+`MAX_DATASET_RECORDS=0` for an uncapped run.
 
 The experimental KV reload rebalance feature is disabled throughout. The DP
 comparison isolates the stable prefix-aware routing path.
@@ -112,6 +116,8 @@ MODE=tp_accuracy MODEL_SPECS='qwen3-14b|/path/to/Qwen3-14B' \
 
 The runner resumes by skipping completed result files. Generated Markdown and
 CSV reports are stored under `benchmark/results/main_experiment/<mode>/`.
+The default `MAX_DATASET_RECORDS=32` and whether a run is uncapped are included
+in its provenance manifest.
 
 For policy comparisons, pin the same physical GPU KV capacity across variants
 with `NUM_GPU_BLOCKS_OVERRIDE`. The host run recorded here uses 1700 blocks

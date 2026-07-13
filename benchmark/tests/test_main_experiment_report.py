@@ -27,6 +27,8 @@ def test_collect_run_combines_latency_kv_and_telemetry(tmp_path) -> None:
         "prefix_aware_policy": True,
         "fanout_admission_window": 16,
         "offload_cpu_gib": 8,
+        "max_dataset_records": 32,
+        "full_dataset": False,
     }
     (run_root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     with (backend_root / "benchmark_results.csv").open(
@@ -156,6 +158,9 @@ def test_collect_run_combines_latency_kv_and_telemetry(tmp_path) -> None:
     assert row["use_flashinfer_sampler"] is False
     assert row["prefix_aware_policy"] is True
     assert row["fanout_admission_window"] == 16
+    assert row["max_dataset_records"] == 32
+    assert row["full_dataset"] is False
+    assert row["dataset_records"] == 1
     assert row["dp_affinity_route_percent"] == 75
     assert row["dp_average_route_us"] == 125.5
     report = render_report([row])
@@ -166,6 +171,8 @@ def test_collect_run_combines_latency_kv_and_telemetry(tmp_path) -> None:
     assert "Provenance" in report
     assert "FlashInfer sampler" in report
     assert "Admission window" in report
+    assert "Record cap" in report
+    assert "| 32 | no | 1 |" in report
 
 
 def test_annotate_baselines_compares_policy_to_ordinary_fork() -> None:
