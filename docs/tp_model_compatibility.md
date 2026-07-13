@@ -87,3 +87,22 @@ Raw results are stored at:
 ```text
 /root/autodl-tmp/Agentrix/benchmark/results/tp_model_compat/glm4_9b
 ```
+
+## Agent Dataset Smoke Tests
+
+The checked-in AgentBoard and AppWorld directory adapters were also validated
+end to end with Qwen3-8B and TP=2. The source prompt directories contained 9
+AgentBoard records and 13 AppWorld records.
+
+| Dataset | Branch tok/s | E2E tok/s | Logical KV reduction | Logical KV saved |
+|---|---:|---:|---:|---:|
+| AgentBoard | 131.64 | 45.71 | 48.45% | 0.288 GiB |
+| AppWorld | 124.84 | 45.53 | 48.41% | 0.285 GiB |
+
+Both runs completed all API requests and wrote the regular benchmark metrics.
+Raw results are stored at:
+
+```text
+/root/autodl-tmp/Agentrix/benchmark/results/tp_dataset_smoke/agentboard
+/root/autodl-tmp/Agentrix/benchmark/results/tp_dataset_smoke/appworld
+```
