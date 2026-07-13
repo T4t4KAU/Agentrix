@@ -32,6 +32,7 @@ MAX_MODEL_LEN=4096 \
 | `Qwen3ForCausalLM` | Qwen3-8B | Passed | 220,592 tokens | 118.22 | 44.20 | 48.91% |
 | `LlamaForCausalLM` | Meta-Llama-3.1-8B-Instruct | Passed | 251,344 tokens | 152.92 | 49.41 | 48.45% |
 | `MiniCPMForCausalLM` | MiniCPM4.1-8B | Passed | 1,001,680 tokens | 167.12 | 33.51 | 40.18% |
+| `ChatGLMModel` | GLM-4-9B-chat | Passed | 722,992 tokens | 183.69 | 37.62 | 49.56% |
 
 ## Qwen3ForCausalLM
 
@@ -71,4 +72,18 @@ Raw results are stored at:
 
 ```text
 /root/autodl-tmp/Agentrix/benchmark/results/tp_model_compat/minicpm41_8b
+```
+
+## ChatGLMModel
+
+GLM-4-9B-chat also requires `--trust-remote-code` for its custom Hugging Face
+implementation. Both TP ranks selected ForkAttention, CUDA Graph capture
+completed, and all API requests succeeded. The workload saved 2,100 logical
+KV token entries, equivalent to 1.282 GiB for this architecture. No vLLM
+source adaptation was required.
+
+Raw results are stored at:
+
+```text
+/root/autodl-tmp/Agentrix/benchmark/results/tp_model_compat/glm4_9b
 ```
