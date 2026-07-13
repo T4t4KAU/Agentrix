@@ -11,6 +11,7 @@ LMCache integration, and the end-to-end benchmark suite in one repository:
 
 - [AutoDL CUDA 12.8 build and benchmark guide](docs/autodl_build_and_benchmark.md)
 - [Prefix-aware data parallel experiment results](docs/dp_experiment_results.md)
+- [ForkAttention TP model compatibility](docs/tp_model_compatibility.md)
 
 ## System Requirements
 
