@@ -77,6 +77,50 @@ The command below reproduces the historical mixed-prefix scheduler/offload
 stress matrix. Keep `EXPERIMENT_PROFILE=legacy` explicit when publishing those
 numbers; they must not be described as a pure ForkAttention operator result.
 
+Use `offload_validated` for an attributable offload comparison. It runs four
+case-major roots without explicit warm-up and separates ordinary offload,
+ordinary offload with fanout scheduling, and the optimized connector policy.
+The workload must report nonzero load and store traffic; otherwise lower
+`NUM_GPU_BLOCKS_OVERRIDE` or add cases before interpreting it as an offload
+experiment.
+
+```bash
+cd benchmark
+
+VLLM_BIN="$PWD/.venv/bin/vllm" \
+MODE=single_gpu \
+EXPERIMENT_PROFILE=offload_validated \
+MODEL_SPECS='qwen3-1.7b|/path/to/Qwen3-1.7B' \
+DATASETS=agentboard \
+PREFIX_LENGTHS='8192,16384' \
+BRANCH_COUNTS=16 \
+MAX_DATASET_RECORDS=4 \
+NUM_GPU_BLOCKS_OVERRIDE=1700 \
+OFFLOAD_CPU_GIB=8 \
+./scripts/run_main_experiment.sh
+```
+
+Keep `FANOUT_PROFILE=0` for performance measurements. Set
+`FANOUT_PROFILE=1` only for scheduler diagnostics; it emits one detailed
+fanout-admission record per scheduling step and can measurably reduce the
+optimized variant's throughput. A minimal post-change LMCache CPU/disk
+correctness smoke is:
+
+```bash
+cd /path/to/Agentrix
+
+OUTPUT_DIR=results/lmcache_tiered_smoke \
+LMCACHE_CACHE_POLICY=FORK_AWARE \
+MODEL_PATH=/path/to/Qwen3-1.7B \
+VLLM_BIN="$PWD/benchmark/.venv/bin/vllm" \
+bash benchmark/scripts/run_lmcache_tiered_smoke.sh
+```
+
+This smoke verifies that `disk_cache_mode=eviction` initializes, the request
+completes without storage errors, and CPU evictions create disk chunks. It is a
+correctness check, not a throughput comparison; LMCache remains outside the
+published main matrix.
+
 Calibrate `NUM_GPU_BLOCKS_OVERRIDE` to the lowest capacity supported by all
 five variants on the target GPU. The value below is only an example.
 

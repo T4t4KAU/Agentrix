@@ -270,9 +270,132 @@ checkout, so its manifest records both worktrees as dirty.
 
 ## Single-GPU Offload
 
-The table compares optimized ForkAttention offload against ordinary
-ForkAttention LRU offload. Positive throughput is an improvement; negative
-TTFT and KV load values are reductions.
+### Corrected Offload Validation
+
+The historical offload matrix combined a round-robin mixed-prefix workload
+with a policy change that simultaneously enabled fanout admission, preemption,
+GPU hotset protection, and connector planning. A corrected experiment added an
+intermediate `fork_scheduled_ordinary_offload` variant so scheduler and
+connector effects can be measured separately.
+
+The local validation used an RTX 5070 12 GiB, Qwen3-1.7B, the first four
+AgentBoard records, four case-major roots, 16 branches per root, no explicit
+prefix warm-up, lognormal 256-token mean suffixes, 256 output tokens, 1,700 GPU
+blocks (27,200 tokens), an 8 GiB CPU cache, and forest CUDA Graphs. Every 8K
+variant was repeated three times. The 16K scheduler/connector pair was also
+repeated three times. All cells generated nonzero CPU-to-GPU reload traffic.
+
+The 8K/16 medians are:
+
+| Variant | Output tok/s | Branch TTFT P50 | Branch TPOT P50 | KV load | Preemptions | Fork active steps |
+|---|---:|---:|---:|---:|---:|---:|
+| Flash ordinary offload | 474.12 | 10,406.08 ms | 47.57 ms | 4.51 GiB | 113 | - |
+| Fork ordinary offload | 791.64 | 4,968.23 ms | 16.91 ms | 6.19 GiB | 41 | 92.28% |
+| Fork scheduled ordinary offload | 792.05 | 5,410.28 ms | 20.74 ms | 4.21 GiB | 113 | 90.68% |
+| Fork optimized offload | 673.46 | 7,384.82 ms | 25.96 ms | 3.86 GiB | 25 | 90.74% |
+
+Paired medians show that changing only FlashAttention to ForkAttention with the
+ordinary connector improves throughput by 66.97% and reduces TPOT by 64.81%.
+Adding fanout scheduling to the already case-major workload changes throughput
+by only +0.95%. Changing only the connector policy from scheduled ordinary to
+optimized reduces throughput by 12.86%, increases TTFT by 37.10%, and reduces
+reload traffic by only 2.57%. The complete optimized system remains 44.95%
+faster than Flash ordinary offload, but that is a backend/system gain rather
+than evidence that the optimized connector is faster.
+
+The 16K/16 pair confirms the connector regression:
+
+| Variant | Output tok/s | Branch TTFT P50 | Branch TPOT P50 | KV load | Fork active steps |
+|---|---:|---:|---:|---:|---:|
+| Fork scheduled ordinary offload | 511.83 | 10,751.97 ms | 12.41 ms | 11.06 GiB | 85.20% |
+| Fork optimized offload | 386.25 | 12,842.16 ms | 27.10 ms | 9.30 GiB | 80.89% |
+
+Across paired runs the optimized connector lowers reload traffic by 17.61% but
+lowers throughput by 24.54%, increases TTFT by 17.60%, and more than doubles
+TPOT (+118.34%). A `PROFILE_FORK=1` diagnostic run found similar graph-miss
+rates (about 2-3%) but a different graph mix: forest-graph hits were 32.4% of
+successful graph dispatches with scheduled ordinary offload and 12.6% with
+optimized offload. Measured GPU load-copy time was only 0.26-0.33 seconds, so
+copy bandwidth does not explain the end-to-end regression. The evidence is
+consistent with the optimized restore/residency policy changing cohort shape
+and reducing multi-root forest execution; scheduler-level tracing is still
+needed to establish the precise causal path.
+
+This pre-remediation result does not reproduce the old claim that the optimized
+connector itself provides a 70-150% gain. It established the regression that
+the remediation below targets. Raw local results are in
+`benchmark/results/investigation_20260714/offload_validated_*`.
+
+### Offload Remediation and Revalidation
+
+Static analysis found three concrete native-offload defects rather than a flaw
+in the basic residency objective. First, CPU admission was tracked only by
+request and logical block index. Sibling requests with the same `OffloadKey`
+therefore planned and prepared the same shared-prefix backup repeatedly.
+Second, a CPU LRU eviction did not clear those per-request admission markers,
+so an evicted key could remain permanently ineligible for backup and later be
+recomputed. Third, hot-prefix backup was delayed until critical pressure even
+though `OffloadingConnector` creates a CPU copy without releasing the GPU
+block. The GPU hotset reservation is short-lived, so a useful prefix could lose
+GPU residency before a recoverable CPU copy existed.
+
+The repaired connector now maintains one process-wide admitted-key set plus a
+reverse key-to-request index. All branches reuse one CPU copy, CPU evictions
+invalidate every affected request marker, and request completion removes only
+the reverse references while retaining knowledge of a still-resident CPU key.
+When explicitly enabled, a hot shared prefix is backed up at normal pressure;
+the GPU copy remains resident and the backup becomes useful only if later GPU
+allocation pressure evicts it.
+
+The same 16K/16 four-root experiment was repeated three times after the fix.
+These production measurements used `FANOUT_PROFILE=0`; per-step fanout logging
+was used only in separate diagnostic runs because it writes one detailed line
+per scheduler step and materially perturbs the optimized variant.
+
+| Variant | Output tok/s | Branch TTFT P50 | Branch TPOT P50 | KV load | Load ops | KV store | Store ops | Fork active steps |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Fork scheduled ordinary offload | 518.86 | 10,702.94 ms | 12.10 ms | 11.88 GiB | 11 | 8.26 GiB | 103 | 73.34% |
+| Fork optimized offload | 626.13 | 7,552.10 ms | 12.08 ms | 8.89 GiB | 7 | 8.15 GiB | 135 | 80.68% |
+
+Across paired runs, optimized offload improves throughput by 22.51%, reduces
+TTFT by 27.84%, reduces CPU-to-GPU KV load by 25.84%, and leaves TPOT
+effectively unchanged (-0.10%). All three throughput pairs are positive
+(+7.00%, +22.51%, and +24.88%). The ordinary control remains close to its
+pre-fix median, while optimized throughput rises from 386.25 to 626.13 tok/s;
+this rules out a generally faster machine run as the explanation. The higher
+optimized store-operation count is a remaining small-transfer/job-overhead
+target even though total store bytes fall by 1.37%.
+
+The LMCache three-tier path had a separate set of correctness and admission
+problems:
+
+- Async disk prefetch held `disk_lock` while CPU allocation could evict and
+  demote another object back to disk, creating a lock inversion. Allocation
+  failure also leaked the lock/pin.
+- `FORK_AWARE` admission compared only against pressure-eligible victims and
+  used a strict greater-than comparison. A full cache of protected or
+  equal-valued entries could therefore stop making LRU progress, while a more
+  valuable incoming entry could fail to replace a less valuable protected one.
+- Disk-to-CPU promotion unconditionally polluted L1. Mandatory reads now use
+  CPU memory as transient staging when necessary, but remain in CPU only when
+  their value justifies admission. Disk admission applies the same comparison
+  and falls back to an emergency evictable victim under capacity pressure.
+
+An end-to-end `FORK_AWARE` LMCache smoke used a 0.10 GiB CPU tier, 1 GiB local
+disk tier, 2K prefix, four branches, and Qwen3-1.7B. It completed successfully
+and demoted three chunks totaling 88,080,384 bytes to disk. The first attempt
+also exposed an unrelated initialization bug: LMCache installed an OTel
+`LoggingHandler` while OpenTelemetry still exposed only a proxy provider. The
+logger now attaches that handler only after a real SDK `LoggerProvider` exists.
+The smoke artifact is under
+`benchmark/results/investigation_20260714/lmcache_tiered_fix_smoke/`.
+
+### Historical Mixed-Prefix Result
+
+The following table compares the old complete optimized policy against
+ordinary ForkAttention LRU offload. Positive throughput is an improvement;
+negative TTFT and KV load values are reductions. It remains a historical
+system stress result, not an isolated connector comparison.
 
 | Model | Dataset | Prefix | Branches | Throughput | TTFT P50 | KV load |
 |---|---|---:|---:|---:|---:|---:|

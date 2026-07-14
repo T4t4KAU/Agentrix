@@ -15,8 +15,14 @@ if [[ -z "${EXPERIMENT_PROFILE:-}" ]]; then
   fi
 fi
 if [[ "${EXPERIMENT_PROFILE}" != "fanout_validated" \
+  && "${EXPERIMENT_PROFILE}" != "offload_validated" \
   && "${EXPERIMENT_PROFILE}" != "legacy" ]]; then
-  echo "EXPERIMENT_PROFILE must be fanout_validated or legacy." >&2
+  echo "EXPERIMENT_PROFILE must be fanout_validated, offload_validated, or legacy." >&2
+  exit 1
+fi
+if [[ "${EXPERIMENT_PROFILE}" == "offload_validated" \
+  && "${MODE}" != "single_gpu" ]]; then
+  echo "EXPERIMENT_PROFILE=offload_validated requires MODE=single_gpu." >&2
   exit 1
 fi
 if [[ "${MODE}" == "single_gpu" \
@@ -26,6 +32,14 @@ if [[ "${MODE}" == "single_gpu" \
   CASE_COUNT="${CASE_COUNT:-1}"
   BRANCH_ORDER="${BRANCH_ORDER:-case_major}"
   WARM_SHARED_PREFIX="${WARM_SHARED_PREFIX:-1}"
+  VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH="${VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH:-1}"
+elif [[ "${MODE}" == "single_gpu" \
+  && "${EXPERIMENT_PROFILE}" == "offload_validated" ]]; then
+  OUTPUT_ROOT="${OUTPUT_ROOT:-results/main_experiment_offload_v2}"
+  OUTPUT_TOKENS="${OUTPUT_TOKENS:-256}"
+  CASE_COUNT="${CASE_COUNT:-4}"
+  BRANCH_ORDER="${BRANCH_ORDER:-case_major}"
+  WARM_SHARED_PREFIX="${WARM_SHARED_PREFIX:-0}"
   VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH="${VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH:-1}"
 else
   OUTPUT_ROOT="${OUTPUT_ROOT:-results/main_experiment}"
@@ -48,6 +62,7 @@ RUN_RETRY_DELAY_SECONDS="${RUN_RETRY_DELAY_SECONDS:-10}"
 NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE:-}"
 VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 FANOUT_ADMISSION_WINDOW="${FANOUT_ADMISSION_WINDOW:-16}"
+FANOUT_PROFILE="${FANOUT_PROFILE:-0}"
 
 AGENTRIX_GIT_COMMIT="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || printf unknown)"
 VLLM_GIT_COMMIT="$(git -C "${REPO_ROOT}/vllm" rev-parse HEAD 2>/dev/null || printf unknown)"
@@ -66,6 +81,10 @@ if ! [[ "${RUN_RETRIES}" =~ ^[0-9]+$ ]]; then
 fi
 if ! [[ "${FANOUT_ADMISSION_WINDOW}" =~ ^[0-9]+$ ]]; then
   echo "FANOUT_ADMISSION_WINDOW must be a non-negative integer." >&2
+  exit 1
+fi
+if [[ "${FANOUT_PROFILE}" != "0" && "${FANOUT_PROFILE}" != "1" ]]; then
+  echo "FANOUT_PROFILE must be 0 or 1." >&2
   exit 1
 fi
 if ! [[ "${MAX_DATASET_RECORDS}" =~ ^[0-9]+$ ]]; then
@@ -94,7 +113,13 @@ case "${MODE}" in
     MODEL_SPECS="${MODEL_SPECS:-qwen3-1.7b|Qwen/Qwen3-1.7B;llama3.2-1b|meta-llama/Llama-3.2-1B-Instruct}"
     PREFIX_LENGTHS="${PREFIX_LENGTHS:-8192,16384}"
     BRANCH_COUNTS="${BRANCH_COUNTS:-8,16}"
-    VARIANT_SPECS="${VARIANT_SPECS:-flash_no_offload|FLASH_ATTN|none|0;fork_no_offload|FORK_ATTN|none|0;flash_ordinary_offload|FLASH_ATTN|ordinary|0;fork_ordinary_offload|FORK_ATTN|ordinary|0;fork_optimized_offload|FORK_ATTN|optimized|0}"
+    if [[ "${EXPERIMENT_PROFILE}" == "offload_validated" ]]; then
+      VARIANT_SPECS="${VARIANT_SPECS:-flash_ordinary_offload|FLASH_ATTN|ordinary|0;fork_ordinary_offload|FORK_ATTN|ordinary|0;fork_scheduled_ordinary_offload|FORK_ATTN|ordinary|0;fork_optimized_offload|FORK_ATTN|optimized|0}"
+    elif [[ "${EXPERIMENT_PROFILE}" == "fanout_validated" ]]; then
+      VARIANT_SPECS="${VARIANT_SPECS:-flash_no_offload|FLASH_ATTN|none|0;fork_no_offload|FORK_ATTN|none|0}"
+    else
+      VARIANT_SPECS="${VARIANT_SPECS:-flash_no_offload|FLASH_ATTN|none|0;fork_no_offload|FORK_ATTN|none|0;flash_ordinary_offload|FLASH_ATTN|ordinary|0;fork_ordinary_offload|FORK_ATTN|ordinary|0;fork_optimized_offload|FORK_ATTN|optimized|0}"
+    fi
     DP_REPLICAS="${DP_REPLICAS:-1}"
     TP_SIZE="${TP_SIZE:-1}"
     GPU_IDS="${GPU_IDS:-0}"
@@ -133,7 +158,11 @@ print(int(float(sys.argv[1]) * 1024**3))
 PY
 )"
 ordinary_offload="{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_load_failure_policy\":\"recompute\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":${cpu_bytes},\"fanout_offload\":false,\"fanout_admission_window\":0,\"fanout_preemption_enabled\":false,\"fanout_gpu_hotset_enabled\":false,\"eviction_policy\":\"lru\"}}"
-optimized_offload="{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_load_failure_policy\":\"recompute\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":${cpu_bytes},\"fanout_offload\":true,\"fanout_profile\":false,\"fanout_allow_hot_prefix_backup\":true,\"eviction_policy\":\"lru\"}}"
+fanout_profile_json=false
+if [[ "${FANOUT_PROFILE}" == "1" ]]; then
+  fanout_profile_json=true
+fi
+optimized_offload="{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_load_failure_policy\":\"recompute\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":${cpu_bytes},\"fanout_offload\":true,\"fanout_profile\":${fanout_profile_json},\"fanout_allow_hot_prefix_backup\":true,\"eviction_policy\":\"lru\"}}"
 
 write_manifest() {
   local path="$1"
@@ -248,6 +277,7 @@ run_variant() {
   local prefix_routing="$9"
   local prefix_aware_policy=0
   if [[ "${variant}" == "fork_optimized_offload" \
+    || "${variant}" == "fork_scheduled_ordinary_offload" \
     || "${variant}" == "fork_prefix_aware_dp" \
     || ( "${variant}" == "fork_no_offload" \
       && "${MODE}" == "single_gpu" \

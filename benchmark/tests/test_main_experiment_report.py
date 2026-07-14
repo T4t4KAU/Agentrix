@@ -98,6 +98,7 @@ def test_collect_run_combines_latency_kv_and_telemetry(tmp_path) -> None:
         "kv_offload_load_average_mib": 64,
         "kv_offload_store_operations": 32,
         "kv_offload_store_average_mib": 8,
+        "num_preemptions": 7,
         "fork_attention_observed_steps": 100,
         "fork_attention_active_steps": 75,
         "fork_attention_active_step_percent": 75,
@@ -165,6 +166,7 @@ def test_collect_run_combines_latency_kv_and_telemetry(tmp_path) -> None:
     assert row["kv_offload_load_gib"] == 1
     assert row["kv_offload_load_operations"] == 16
     assert row["kv_offload_load_average_mib"] == 64
+    assert row["num_preemptions"] == 7
     assert row["repeat_exact_match_percent"] == 99
     assert row["num_gpu_blocks_override"] is None
     assert row["use_flashinfer_sampler"] is False
@@ -232,3 +234,45 @@ def test_annotate_baselines_compares_policy_to_ordinary_fork() -> None:
     assert optimized["output_throughput_change_percent"] == 20
     assert optimized["peak_gpu_kv_reduction_vs_baseline_percent"] == 25
     assert optimized["kv_offload_load_reduction_vs_baseline_percent"] == 25
+
+
+def test_offload_validated_separates_scheduler_and_connector_effects() -> None:
+    shared = {
+        "mode": "single_gpu",
+        "model_name": "model",
+        "dataset": "data",
+        "prefix_tokens": 8192,
+        "branches": 16,
+        "offload": "ordinary",
+        "estimated_peak_gpu_kv_gib": 2,
+        "estimated_peak_total_kv_gib": 6,
+    }
+    rows = [
+        {
+            **shared,
+            "variant": "fork_ordinary_offload",
+            "output_throughput_tokens_per_s": 100,
+            "kv_offload_load_gib": 8,
+        },
+        {
+            **shared,
+            "variant": "fork_scheduled_ordinary_offload",
+            "output_throughput_tokens_per_s": 125,
+            "kv_offload_load_gib": 6,
+        },
+        {
+            **shared,
+            "variant": "fork_optimized_offload",
+            "experiment_profile": "offload_validated",
+            "output_throughput_tokens_per_s": 150,
+            "kv_offload_load_gib": 3,
+        },
+    ]
+
+    annotate_baseline_comparisons(rows)
+
+    assert rows[1]["baseline_variant"] == "fork_ordinary_offload"
+    assert rows[1]["output_throughput_change_percent"] == 25
+    assert rows[2]["baseline_variant"] == "fork_scheduled_ordinary_offload"
+    assert rows[2]["output_throughput_change_percent"] == 20
+    assert rows[2]["kv_offload_load_reduction_vs_baseline_percent"] == 50

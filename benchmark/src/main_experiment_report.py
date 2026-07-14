@@ -17,6 +17,7 @@ BASELINE_VARIANTS = {
     "fork_no_offload": "flash_no_offload",
     "flash_ordinary_offload": "flash_no_offload",
     "fork_ordinary_offload": "flash_ordinary_offload",
+    "fork_scheduled_ordinary_offload": "fork_ordinary_offload",
     "fork_optimized_offload": "fork_ordinary_offload",
     "flash_dp": "flash_dp",
     "fork_dp": "flash_dp",
@@ -160,9 +161,7 @@ def collect_run(manifest_path: Path) -> dict[str, Any]:
         "full_dataset": manifest.get("full_dataset", True),
         "requested_output_tokens": requested_output_tokens,
         "cases_per_batch": cases_per_batch,
-        "enable_forest_cudagraph": manifest.get(
-            "enable_forest_cudagraph", False
-        ),
+        "enable_forest_cudagraph": manifest.get("enable_forest_cudagraph", False),
         "dataset_records": len(common_requests),
         "batches": len(raw_batches),
         "requests": len(requests),
@@ -243,6 +242,7 @@ def collect_run(manifest_path: Path) -> dict[str, Any]:
         "kv_offload_store_average_mib": float(
             profile.get("kv_offload_store_average_mib", 0)
         ),
+        "num_preemptions": int(profile.get("num_preemptions", 0)),
         "output_exact_match_percent": agreement.get("normalized_exact_match_percent"),
         "output_token_f1_percent": agreement.get("mean_token_f1_percent"),
         "output_text_similarity_percent": agreement.get("mean_text_similarity_percent"),
@@ -278,6 +278,11 @@ def annotate_baseline_comparisons(rows: list[dict[str, Any]]) -> None:
     for variants in groups.values():
         for variant, row in variants.items():
             baseline_variant = BASELINE_VARIANTS.get(variant)
+            if (
+                variant == "fork_optimized_offload"
+                and row.get("experiment_profile") == "offload_validated"
+            ):
+                baseline_variant = "fork_scheduled_ordinary_offload"
             baseline = variants.get(baseline_variant or "")
             row["baseline_variant"] = baseline_variant
             row["output_throughput_change_percent"] = _relative_change(
@@ -359,9 +364,9 @@ def render_report(rows: list[dict[str, Any]]) -> str:
                 "## Offload Traffic",
                 "",
                 "| Model | Dataset | Prefix | Branches | Variant | Peak CPU KV GiB (%) | Load GiB | "
-                "Load ops (avg MiB) | Store GiB | Store ops (avg MiB) | "
+                "Load ops (avg MiB) | Store GiB | Store ops (avg MiB) | Preemptions | "
                 "Load reduction vs baseline |",
-                "|---|---|---:|---:|---|---:|---:|---:|---:|---:|---:|",
+                "|---|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
         for row in offload_rows:
@@ -376,6 +381,7 @@ def render_report(rows: list[dict[str, Any]]) -> str:
                 f"| {_format(row['kv_offload_store_gib'])} "
                 f"| {row['kv_offload_store_operations']} "
                 f"({_format(row['kv_offload_store_average_mib'])}) "
+                f"| {row['num_preemptions']} "
                 f"| {_format_percent(row['kv_offload_load_reduction_vs_baseline_percent'])} |"
             )
 
