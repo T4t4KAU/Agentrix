@@ -24,7 +24,7 @@ completed CSV files are intentionally skipped on resume.
 Run commands from the `benchmark` directory. Supply machine-specific model
 paths through `MODEL_SPECS`; do not edit tracked scripts.
 
-The runner fixes the following comparison controls:
+The legacy runner profile fixes the following comparison controls:
 
 - Prefix lengths: 8K and 16K tokens.
 - Deterministic greedy generation with 64 output tokens.
@@ -35,7 +35,8 @@ The runner fixes the following comparison controls:
 - Remote DP and TP experiments use no KV offload.
 
 Each run records Git provenance, the record cap, GPU KV occupancy, logical KV
-read reduction, throughput, TTFT, TPOT, P50/P95/P99 latency, GPU utilization,
+read reduction, physical ForkAttention active steps and CTA counts,
+throughput, TTFT, TPOT, P50/P95/P99 latency, GPU utilization,
 memory-controller utilization, and offload traffic where applicable.
 
 ## Single GPU
@@ -48,6 +49,34 @@ This group compares:
 4. ForkAttention with ordinary LRU CPU offload.
 5. ForkAttention with prefix-aware optimized CPU offload.
 
+For a valid no-offload ForkAttention operator/system comparison, use the
+default `fanout_validated` profile. It uses one case per batch, case-major
+admission, exact shared-prefix warm-up, 256 output tokens, and enables Fork
+fanout admission and forest CUDA Graphs. The forest graph workspace reserves
+the full 32-split range supported by the gather kernel, so branch points cannot
+overflow a sequence-length-derived capture size. Results go to
+`results/main_experiment_v2` so they cannot be silently mixed with the
+historical matrix:
+
+```bash
+cd benchmark
+
+MODE=single_gpu \
+EXPERIMENT_PROFILE=fanout_validated \
+MODEL_SPECS='qwen3-1.7b|/path/to/Qwen3-1.7B' \
+DATASETS='agentboard,appworld,agencybench,swebench' \
+PREFIX_LENGTHS='8192,16384' \
+BRANCH_COUNTS='8,16' \
+MAX_DATASET_RECORDS=32 \
+NUM_GPU_BLOCKS_OVERRIDE=1700 \
+VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH=1 \
+./scripts/run_main_experiment.sh
+```
+
+The command below reproduces the historical mixed-prefix scheduler/offload
+stress matrix. Keep `EXPERIMENT_PROFILE=legacy` explicit when publishing those
+numbers; they must not be described as a pure ForkAttention operator result.
+
 Calibrate `NUM_GPU_BLOCKS_OVERRIDE` to the lowest capacity supported by all
 five variants on the target GPU. The value below is only an example.
 
@@ -55,6 +84,7 @@ five variants on the target GPU. The value below is only an example.
 cd benchmark
 
 MODE=single_gpu \
+EXPERIMENT_PROFILE=legacy \
 MODEL_SPECS='qwen3-1.7b|/path/to/Qwen3-1.7B;llama3.2-1b|/path/to/Llama-3.2-1B-Instruct' \
 DATASETS='agentboard,appworld,agencybench,swebench' \
 PREFIX_LENGTHS='8192,16384' \

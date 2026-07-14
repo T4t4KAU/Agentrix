@@ -45,6 +45,8 @@ STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-300}"
 SHUTDOWN_TIMEOUT="${SHUTDOWN_TIMEOUT:-30}"
 VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 VLLM_FORK_ATTN_FANOUT_SCHEDULING_ENABLED="${VLLM_FORK_ATTN_FANOUT_SCHEDULING_ENABLED:-1}"
+VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH="${VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH:-0}"
+WARM_SHARED_PREFIX="${WARM_SHARED_PREFIX:-0}"
 OUTPUT_DIR="${OUTPUT_DIR:-results/fork_attention_${DATASET}_c${CASE_COUNT}_p${PREFIX_TOKENS}_b${BRANCHES}_g${BRANCH_GROUP_SIZE}_o${OUTPUT_TOKENS}}"
 KEEP_SERVER="${KEEP_SERVER:-0}"
 VLLM_SERVER_EXTRA_ARGS="${VLLM_SERVER_EXTRA_ARGS:-}"
@@ -122,6 +124,15 @@ fi
 if [[ "${VLLM_FORK_ATTN_FANOUT_SCHEDULING_ENABLED}" != "0" \
   && "${VLLM_FORK_ATTN_FANOUT_SCHEDULING_ENABLED}" != "1" ]]; then
   echo "VLLM_FORK_ATTN_FANOUT_SCHEDULING_ENABLED must be 0 or 1." >&2
+  exit 1
+fi
+if [[ "${VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH}" != "0" \
+  && "${VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH}" != "1" ]]; then
+  echo "VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH must be 0 or 1." >&2
+  exit 1
+fi
+if [[ "${WARM_SHARED_PREFIX}" != "0" && "${WARM_SHARED_PREFIX}" != "1" ]]; then
+  echo "WARM_SHARED_PREFIX must be 0 or 1." >&2
   exit 1
 fi
 
@@ -388,6 +399,18 @@ def parse_log(path: Path) -> dict[str, object]:
         "num_preemptions": prometheus_counter(
             metrics_path, "vllm:num_preemptions"
         ),
+        "fork_attention_observed_steps": prometheus_counter(
+            metrics_path, "vllm:fork_attention_observed_steps"
+        ),
+        "fork_attention_active_steps": prometheus_counter(
+            metrics_path, "vllm:fork_attention_active_steps"
+        ),
+        "fork_attention_shared_ctas": prometheus_counter(
+            metrics_path, "vllm:fork_attention_shared_ctas"
+        ),
+        "fork_attention_singleton_ctas": prometheus_counter(
+            metrics_path, "vllm:fork_attention_singleton_ctas"
+        ),
         "fork_cudagraph_dispatch": graph_dispatch,
         "fork_metadata_avg_ms": metadata_averages,
         "fork_dp_prefix_routing": routing_stats,
@@ -443,6 +466,25 @@ def main() -> int:
         if isinstance(rank.get("gpu_kv_cache_tokens"), int)
     ]
     aggregate["gpu_kv_cache_capacity_tokens"] = sum(gpu_kv_capacities)
+    for key in (
+        "fork_attention_observed_steps",
+        "fork_attention_active_steps",
+        "fork_attention_shared_ctas",
+        "fork_attention_singleton_ctas",
+    ):
+        aggregate[key] = sum(float(rank.get(key, 0)) for rank in ranks)
+    observed_steps = float(aggregate["fork_attention_observed_steps"])
+    active_steps = float(aggregate["fork_attention_active_steps"])
+    shared_ctas = float(aggregate["fork_attention_shared_ctas"])
+    singleton_ctas = float(aggregate["fork_attention_singleton_ctas"])
+    aggregate["fork_attention_active_step_percent"] = (
+        100 * active_steps / observed_steps if observed_steps else None
+    )
+    aggregate["fork_attention_shared_cta_percent"] = (
+        100 * shared_ctas / (shared_ctas + singleton_ctas)
+        if shared_ctas + singleton_ctas
+        else None
+    )
     aggregate["gpu_kv_cache_capacity_gib"] = (
         sum(gpu_kv_capacities) * kv_bytes_per_token / 1024**3
     )
@@ -624,6 +666,7 @@ run_backend() {
       CUDA_VISIBLE_DEVICES="${gpu_id}" \
       VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER}" \
       VLLM_FORK_ATTN_FANOUT_SCHEDULING_ENABLED="${VLLM_FORK_ATTN_FANOUT_SCHEDULING_ENABLED}" \
+      VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH="${VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH}" \
       "${VLLM_BIN}" "${vllm_args[@]}" >"${server_log}" 2>&1 &
     SERVER_PIDS+=("$!")
   done
@@ -688,6 +731,9 @@ run_backend() {
     --seed "${SEED}"
     --output-dir "${backend_output_dir}"
   )
+  if [[ "${WARM_SHARED_PREFIX}" == "1" ]]; then
+    benchmark_args+=(--warm-shared-prefix)
+  fi
   if [[ "${DP_DEPLOYMENT}" == "internal" ]]; then
     benchmark_args+=(--internal-dp-size "${DP_REPLICAS}")
   fi

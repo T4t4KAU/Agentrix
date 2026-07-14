@@ -2,7 +2,8 @@
 
 ## Scope
 
-This document is the canonical record for the completed high-value experiment.
+This document is the canonical record for the completed high-value experiment
+and the corrected single-GPU ForkAttention validation performed on 2026-07-14.
 The complete 304-run factorial launch procedure is documented separately in
 [`main_experiment_matrix.md`](main_experiment_matrix.md).
 
@@ -98,11 +99,17 @@ runtime sampler JIT is not a hidden variable in the attention comparison.
 - GPU compute utilization from NVIDIA `utilization.gpu`
 - Memory bandwidth activity proxy from NVIDIA `utilization.memory`
 - FlashAttention-to-ForkAttention output agreement for the TP guardrail
+- Physical ForkAttention observed/active steps and shared/singleton CTA counts
 
 Logical KV read reduction estimates repeated shared-prefix reads avoided by
 ForkAttention; it does not claim that vLLM stores duplicate physical prefix
 blocks. Physical GPU KV reduction is reported separately from sampled vLLM
 occupancy and is compared with the named baseline for each variant.
+
+Logical KV reduction is not evidence that the ForkAttention kernel executed.
+The corrected runner therefore exports cumulative physical execution counters:
+an active step contains at least one CTA serving multiple queries, while the
+shared CTA ratio compares shared-prefix CTAs with singleton suffix CTAs.
 
 `utilization.memory` measures memory-controller activity. It is not a direct
 measurement of HBM bandwidth in GB/s.
@@ -123,8 +130,26 @@ MODE=tp_accuracy MODEL_SPECS='qwen3-14b|/path/to/Qwen3-14B' \
   ./scripts/run_main_experiment.sh
 ```
 
+Single-GPU runs now default to `EXPERIMENT_PROFILE=fanout_validated`. This
+profile writes to `results/main_experiment_v2`, processes one case per batch,
+uses case-major branch admission, warms the exact shared branch context, emits
+256 decode tokens, and enables the 16-request fanout admission window for the
+no-offload Fork variant. It also enables forest CUDA Graph capture for batches
+that contain multiple shared roots. Prefix warm-up is recorded separately and
+excluded from measured case latency. These controls measure the intended
+ForkAttention regime instead of cache-thrashing mixed-prefix admission.
+
+The previously published 4-case, round-robin, 64-token matrix remains exactly
+reproducible with:
+
+```bash
+EXPERIMENT_PROFILE=legacy MODE=single_gpu \
+  MODEL_SPECS='qwen3-1.7b|/path/to/Qwen3-1.7B' \
+  ./scripts/run_main_experiment.sh
+```
+
 The runner resumes by skipping completed result files. Generated Markdown and
-CSV reports are stored under `benchmark/results/main_experiment/<mode>/`.
+CSV reports are stored under the selected `benchmark/results/` root.
 The default `MAX_DATASET_RECORDS=32` and whether a run is uncapped are included
 in its provenance manifest.
 
@@ -150,6 +175,98 @@ The clean result manifests span Agentrix commits `a6db65e`, `26f63d9`, and
 `c95508e`, which changed experiment orchestration, provenance, documentation,
 or submodule registration. Every reported cell uses the same clean vLLM commit
 `287304ad68ce`.
+
+## Corrected Single-GPU ForkAttention Validation
+
+The original no-offload matrix is a mixed-prefix scheduler/cache stress test,
+not a clean operator comparison. It admits four unrelated prefixes in
+round-robin order while pinning the GPU cache to 27,200 tokens. Four 8K roots
+need roughly 32K tokens and four 16K roots roughly 64K tokens. At 16K the
+server reported only 1.24 maximum concurrent requests, usually ran one request
+with up to 59 waiting, and recorded near-zero prefix-cache hits. The logical
+shared tree still reported more than 90% KV reduction even though sibling
+requests rarely reached decode together.
+
+The original raw batches corroborate this diagnosis. The dominant 4-case
+Qwen3-1.7B batches were flat or slower, while the final partial batch containing
+one case accelerated by 2.35x on AgentBoard 8K/16, 2.03x on AppWorld 8K/16,
+and 2.83x on AgentBoard 16K/16.
+
+The corrected validation used the following fixed configuration:
+
+| Setting | Value |
+|---|---|
+| GPU / build | RTX 5070 12 GiB, CUDA 13.0, native `sm_120` build |
+| Model / data | Qwen3-1.7B, AgentBoard record 0 |
+| Prefix / branches | 8K / 16 |
+| Case admission | one case, case-major, concurrency 16 |
+| Shared-prefix setup | exact shared-context warm-up, excluded from measured latency |
+| Suffix / decode | lognormal mean 256 / 256 output tokens |
+| GPU KV | 1,700 blocks = 27,200 tokens |
+| Fork scheduling | enabled, admission window 16 |
+| CUDA graph | common-prefix graph; forest mode is not applicable to this one-case run |
+| Offload | disabled |
+
+| Backend | Output tok/s | Request latency P50 | TPOT P50 | Physical activation |
+|---|---:|---:|---:|---:|
+| FlashAttention | 448.19 | 7,823.08 ms | 29.59 ms | - |
+| ForkAttention | 923.95 | 3,056.12 ms | 11.30 ms | 255/329 steps (77.51%) |
+
+ForkAttention improves output throughput by 106.15%, cuts median request
+latency by 60.9%, and cuts median TPOT by 61.8%. The counters recorded 1,278
+shared and 4,069 singleton CTA-plan entries, accumulated once per model step
+and not multiplied by layer count. The 23.90% shared-CTA ratio is not an
+activation rate because a long shared prefix is represented by a small number
+of shared CTAs while every private suffix contributes singleton CTAs.
+
+A second regression kept four cases, disabled explicit prefix warm-up, restored
+the original 64-token decode length, and changed only admission semantics to
+case-major plus the Fork 16-request scheduling window. On Qwen3-1.7B
+AgentBoard 8K/16, ForkAttention reached 363.76 output tok/s versus 293.69 for
+FlashAttention, a 23.86% improvement. It physically activated on 241/412
+observed steps (58.50%), with 4,109 shared and 8,364 singleton CTA-plan
+entries. The server reached 18 concurrent running requests and a 20.6% prefix
+cache hit rate; the earlier round-robin run generally had only 2-5 running
+requests and 8-13% prefix hits. This four-record regression is not a replacement
+for the complete historical dataset aggregate, but it confirms that the
+remediation still works in a multi-case workload without artificial warm-up.
+
+The first forest CUDA Graph attempt on that same four-record workload exposed
+a real workspace bug: the captured plan reserved 10 splits per sequence while
+the runtime forest required 11, and the engine stopped with a
+`workspace mismatch` instead of silently falling back. The old default derived
+the split capacity mostly from sequence length, but branch points introduce
+additional splits independently of sequence length. Reserving the gather
+kernel's supported maximum of 32 splits fixes the mismatch. With forest graphs
+enabled, the same ForkAttention workload reached 437.15 output tok/s, 20.18%
+above eager/dynamic-forest ForkAttention and 48.85% above FlashAttention. It
+activated on 242/339 steps (71.39%), with 3,795 shared and 8,861 singleton CTA
+plan entries. The measured total latency fell from 11,963.92 ms to 9,955.43 ms.
+
+An independent Nsight Systems capture on Qwen3-0.6B with the same 8K/16 fanout
+shape measured 1,321.1 ms of FlashAttention branch attention work versus
+approximately 173.5 ms for ForkAttention prefix, suffix, and gather kernels:
+7.61x less attention GPU time and 3.07x faster branch-phase wall time. Nsight
+Compute on a two-request tail kernel showed 61.86% DRAM throughput, 11.57%
+compute throughput, 210 registers per thread, and 2.32% achieved occupancy.
+The tail result identifies memory, register, and small-grid inefficiency but
+does not represent the full 16-request cohort.
+
+These measurements narrow the remaining optimization work to forest graph
+bucket/tile efficiency, persistent forest metadata/workspaces, fewer H2D
+metadata copies, prefix/suffix/gather launch fusion, and SM120-specific tile
+tuning. They do not support the conclusion that the ForkAttention algorithm is
+ineffective on one GPU.
+
+The accompanying remediation makes the validated profile the single-GPU
+default, preserves the old workload behind `EXPERIMENT_PROFILE=legacy`, adds
+explicit shared-prefix warm-up provenance, exports physical activation
+counters to Prometheus and the generated report, enables forest CUDA Graphs,
+reserves enough forest split workspace, and fixes the inconsistent backend
+capability check so Ampere/Ada devices accepted by `supports_combination()` are
+also accepted by `supports_compute_capability()`.
+The corrected validation was intentionally run from the modified development
+checkout, so its manifest records both worktrees as dirty.
 
 ## Single-GPU Offload
 

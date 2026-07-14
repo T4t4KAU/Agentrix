@@ -217,6 +217,7 @@ async def run_api_case(
     dp_routing: str = "single",
     internal_dp_size: int | None = None,
     stream: bool = True,
+    warm_shared_prefix: bool = False,
 ) -> tuple[BenchmarkTrace, dict[str, Any]]:
     import random
 
@@ -427,7 +428,23 @@ async def run_api_case(
                 "text": common_analysis,
             }
         )
-    local_prefix_tokens_by_case = [int(case["prefix_tokens"]) for case in common_cases]
+    warmup_started = time.perf_counter()
+    warmup_results: list[APIRequestResult] = []
+    if warm_shared_prefix:
+        warmup_results = await asyncio.gather(
+            *(
+                request(
+                    [{"role": "user", "content": shared_context}],
+                    1,
+                    common_ranks[case_index],
+                )
+                for case_index, shared_context in enumerate(shared_contexts)
+            )
+        )
+    warmup_latency_ms = (time.perf_counter() - warmup_started) * 1000
+    local_prefix_tokens_by_case = [
+        int(case["prefix_tokens"]) for case in common_cases
+    ]
     local_prefix_tokens = int(statistics.fmean(local_prefix_tokens_by_case))
     semaphore = asyncio.Semaphore(concurrency)
     branch_specs = [
@@ -576,12 +593,14 @@ async def run_api_case(
             "dp_size": dp_size,
             "minority_headstart_ms": minority_headstart_ms,
             "stream": stream,
+            "warm_shared_prefix": warm_shared_prefix,
             "routing_source": routing_source,
             "branch_route_counts": branch_route_counts,
             "common_route_counts": common_route_counts,
             "prefix_tokens_by_case": local_prefix_tokens_by_case,
         },
     )
+    total_latency_ms = (time.perf_counter() - case_started) * 1000
     raw = {
         "model": model,
         "api_mode": api_mode,
@@ -597,11 +616,22 @@ async def run_api_case(
         "dp_size": dp_size,
         "minority_headstart_ms": minority_headstart_ms,
         "stream": stream,
+        "warm_shared_prefix": warm_shared_prefix,
         "routing_source": routing_source,
         "branch_route_counts": branch_route_counts,
         "common_route_counts": common_route_counts,
-        "total_latency_ms": (time.perf_counter() - case_started) * 1000,
+        "total_latency_ms": total_latency_ms - (
+            warmup_latency_ms if warm_shared_prefix else 0.0
+        ),
+        "total_with_setup_latency_ms": total_latency_ms,
         "branch_phase_latency_ms": branch_phase_latency_ms,
+        "prefix_warmup": {
+            "enabled": warm_shared_prefix,
+            "latency_ms": warmup_latency_ms if warm_shared_prefix else 0.0,
+            "input_tokens": sum(result.input_tokens for result in warmup_results),
+            "output_tokens": sum(result.output_tokens for result in warmup_results),
+            "requests": len(warmup_results),
+        },
         "common": {
             "input_tokens": sum(case["input_tokens"] for case in common_cases),
             "output_tokens": sum(case["output_tokens"] for case in common_cases),

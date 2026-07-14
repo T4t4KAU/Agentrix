@@ -89,6 +89,12 @@ def _parser() -> argparse.ArgumentParser:
         default=True,
         help="Use streaming chat responses to measure TTFT and TPOT.",
     )
+    api.add_argument(
+        "--warm-shared-prefix",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Issue one exact shared-context request per case before branches.",
+    )
     api.add_argument("--concurrency", type=int, default=8)
     api.add_argument("--arrival-interval-ms", type=int, default=0)
     api.add_argument("--minority-headstart-ms", type=int, default=0)
@@ -179,6 +185,7 @@ def main(argv: list[str] | None = None) -> int:
                 dp_routing=args.dp_routing,
                 internal_dp_size=args.internal_dp_size,
                 stream=args.stream,
+                warm_shared_prefix=args.warm_shared_prefix,
             )
         )
         trace = BenchmarkTrace(

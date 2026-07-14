@@ -29,6 +29,12 @@ def test_collect_run_combines_latency_kv_and_telemetry(tmp_path) -> None:
         "offload_cpu_gib": 8,
         "max_dataset_records": 32,
         "full_dataset": False,
+        "experiment_profile": "fanout_validated",
+        "branch_order": "case_major",
+        "warm_shared_prefix": True,
+        "output_tokens": 32,
+        "case_count": 1,
+        "enable_forest_cudagraph": True,
     }
     (run_root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     with (backend_root / "benchmark_results.csv").open(
@@ -92,6 +98,12 @@ def test_collect_run_combines_latency_kv_and_telemetry(tmp_path) -> None:
         "kv_offload_load_average_mib": 64,
         "kv_offload_store_operations": 32,
         "kv_offload_store_average_mib": 8,
+        "fork_attention_observed_steps": 100,
+        "fork_attention_active_steps": 75,
+        "fork_attention_active_step_percent": 75,
+        "fork_attention_shared_ctas": 600,
+        "fork_attention_singleton_ctas": 200,
+        "fork_attention_shared_cta_percent": 75,
         "ranks": [
             {
                 "fork_dp_prefix_routing": {
@@ -160,17 +172,25 @@ def test_collect_run_combines_latency_kv_and_telemetry(tmp_path) -> None:
     assert row["fanout_admission_window"] == 16
     assert row["max_dataset_records"] == 32
     assert row["full_dataset"] is False
+    assert row["requested_output_tokens"] == 32
+    assert row["cases_per_batch"] == 1
+    assert row["enable_forest_cudagraph"] is True
     assert row["dataset_records"] == 1
     assert row["dp_affinity_route_percent"] == 75
     assert row["dp_average_route_us"] == 125.5
+    assert row["fork_attention_active_step_percent"] == 75
+    assert row["fork_attention_shared_cta_percent"] == 75
     report = render_report([row])
     assert "Memory BW" in report
     assert "Offload Traffic" in report
     assert "16 (64.00)" in report
     assert "Prefix-Aware DP Routing" in report
+    assert "Physical ForkAttention Activation" in report
     assert "Provenance" in report
     assert "FlashInfer sampler" in report
     assert "Admission window" in report
+    assert "Forest graph" in report
+    assert "fanout_validated" in report
     assert "Record cap" in report
     assert "| 32 | no | 1 |" in report
 

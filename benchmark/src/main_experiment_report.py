@@ -143,6 +143,8 @@ def collect_run(manifest_path: Path) -> dict[str, Any]:
     routing = _first_rank_mapping(profile, "fork_dp_prefix_routing")
     routed_requests = int(routing.get("requests", 0))
     affinity_routes = int(routing.get("affinity_routes", 0))
+    requested_output_tokens = manifest.get("output_tokens")
+    cases_per_batch = manifest.get("case_count")
     return {
         **manifest,
         "agentrix_git_commit": manifest.get("agentrix_git_commit"),
@@ -156,6 +158,11 @@ def collect_run(manifest_path: Path) -> dict[str, Any]:
         "offload_cpu_gib": manifest.get("offload_cpu_gib"),
         "max_dataset_records": manifest.get("max_dataset_records"),
         "full_dataset": manifest.get("full_dataset", True),
+        "requested_output_tokens": requested_output_tokens,
+        "cases_per_batch": cases_per_batch,
+        "enable_forest_cudagraph": manifest.get(
+            "enable_forest_cudagraph", False
+        ),
         "dataset_records": len(common_requests),
         "batches": len(raw_batches),
         "requests": len(requests),
@@ -186,6 +193,24 @@ def collect_run(manifest_path: Path) -> dict[str, Any]:
         "logical_kv_read_saved_tokens": baseline_kv - logical_kv,
         "logical_kv_read_reduction_percent": (
             100 * (baseline_kv - logical_kv) / baseline_kv if baseline_kv else 0
+        ),
+        "fork_attention_observed_steps": float(
+            profile.get("fork_attention_observed_steps", 0)
+        ),
+        "fork_attention_active_steps": float(
+            profile.get("fork_attention_active_steps", 0)
+        ),
+        "fork_attention_active_step_percent": profile.get(
+            "fork_attention_active_step_percent"
+        ),
+        "fork_attention_shared_ctas": float(
+            profile.get("fork_attention_shared_ctas", 0)
+        ),
+        "fork_attention_singleton_ctas": float(
+            profile.get("fork_attention_singleton_ctas", 0)
+        ),
+        "fork_attention_shared_cta_percent": profile.get(
+            "fork_attention_shared_cta_percent"
         ),
         "gpu_kv_cache_capacity_gib": capacity_gib,
         "peak_gpu_kv_cache_usage_percent": peak_kv_percent,
@@ -354,6 +379,35 @@ def render_report(rows: list[dict[str, Any]]) -> str:
                 f"| {_format_percent(row['kv_offload_load_reduction_vs_baseline_percent'])} |"
             )
 
+    fork_rows = [
+        row
+        for row in rows
+        if row.get("attention_backend") == "FORK_ATTN"
+        and row.get("fork_attention_observed_steps")
+    ]
+    if fork_rows:
+        lines.extend(
+            [
+                "",
+                "## Physical ForkAttention Activation",
+                "",
+                "| Model | Dataset | Prefix | Branches | Variant | "
+                "Active/observed steps | Active steps | Shared/singleton CTA plan | "
+                "Shared CTA ratio |",
+                "|---|---|---:|---:|---|---:|---:|---:|---:|",
+            ]
+        )
+        for row in fork_rows:
+            lines.append(
+                f"| {row['model_name']} | {row['dataset']} "
+                f"| {row['prefix_tokens']} | {row['branches']} | {row['variant']} "
+                f"| {_format_percent(row['fork_attention_active_step_percent'])} "
+                f"| {_format(row['fork_attention_active_steps'])} "
+                f"| {_format(row['fork_attention_shared_ctas'])}/"
+                f"{_format(row['fork_attention_singleton_ctas'])} "
+                f"| {_format_percent(row['fork_attention_shared_cta_percent'])} |"
+            )
+
     agreement_rows = [
         row for row in rows if row.get("output_exact_match_percent") is not None
     ]
@@ -413,6 +467,12 @@ def render_report(rows: list[dict[str, Any]]) -> str:
             row.get("fanout_admission_window"),
             row.get("max_dataset_records"),
             row.get("full_dataset", True),
+            row.get("experiment_profile", "legacy"),
+            row.get("branch_order", "round_robin"),
+            row.get("warm_shared_prefix", False),
+            row.get("requested_output_tokens"),
+            row.get("cases_per_batch"),
+            row.get("enable_forest_cudagraph", False),
         )
         provenance_counts[key] = provenance_counts.get(key, 0) + 1
     lines.extend(
@@ -420,8 +480,8 @@ def render_report(rows: list[dict[str, Any]]) -> str:
             "",
             "## Provenance",
             "",
-            "| Agentrix commit | Dirty | vLLM commit | Dirty | GPU blocks override | FlashInfer sampler | Prefix-aware policy | Admission window | Record cap | Full dataset | Runs |",
-            "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| Agentrix commit | Dirty | vLLM commit | Dirty | GPU blocks override | FlashInfer sampler | Prefix-aware policy | Admission window | Profile | Order | Warm prefix | Forest graph | Output | Cases/batch | Record cap | Full dataset | Runs |",
+            "|---|---:|---|---:|---:|---:|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for provenance, run_count in sorted(
@@ -439,6 +499,12 @@ def render_report(rows: list[dict[str, Any]]) -> str:
             fanout_admission_window,
             max_dataset_records,
             full_dataset,
+            experiment_profile,
+            branch_order,
+            warm_shared_prefix,
+            output_tokens,
+            case_count,
+            enable_forest_cudagraph,
         ) = provenance
         lines.append(
             f"| {_short_commit(agentrix_commit)} | {_format_bool(agentrix_dirty)} "
@@ -447,6 +513,11 @@ def render_report(rows: list[dict[str, Any]]) -> str:
             f"| {_format_bool(use_flashinfer_sampler)} "
             f"| {_format_bool(prefix_aware_policy)} "
             f"| {fanout_admission_window if fanout_admission_window is not None else '-'} "
+            f"| {experiment_profile} | {branch_order} "
+            f"| {_format_bool(warm_shared_prefix)} "
+            f"| {_format_bool(enable_forest_cudagraph)} "
+            f"| {output_tokens if output_tokens is not None else '-'} "
+            f"| {case_count if case_count is not None else '-'} "
             f"| {max_dataset_records if max_dataset_records is not None else '-'} "
             f"| {_format_bool(full_dataset)} "
             f"| {run_count} |"
@@ -460,6 +531,7 @@ def render_report(rows: list[dict[str, Any]]) -> str:
             "- Memory BW is NVIDIA `utilization.memory`, a memory-controller activity proxy rather than measured HBM GB/s.",
             "- Peak GPU KV is sampled from `vllm:kv_cache_usage_perc` during the request phase.",
             "- Logical KV read reduction estimates repeated prefix KV read volume avoided by ForkAttention; it is not physical cache capacity.",
+            "- Fork active steps are physical execution counters; CTA-plan entries are accumulated once per model step, not multiplied by attention-layer count. Observed steps also include prefill and fallback steps.",
             "- Peak GPU KV reduction uses sampled physical GPU KV occupancy relative to the baseline named in the delta table.",
             "- Throughput and request latency include both common-analysis and branch requests; branch-only distributions remain in the CSV.",
             "- Record cap is the deterministic maximum number of source records per dataset; `-` with Full dataset=yes means every available record was used.",

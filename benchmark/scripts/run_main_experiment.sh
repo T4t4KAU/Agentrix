@@ -7,12 +7,37 @@ RUN_SCRIPT="${RUN_SCRIPT:-${BENCHMARK_DIR}/scripts/run_vllm_benchmark.sh}"
 BENCHMARK_PYTHON="${BENCHMARK_PYTHON:-${BENCHMARK_DIR}/.venv/bin/python}"
 
 MODE="${MODE:-single_gpu}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-results/main_experiment}"
+if [[ -z "${EXPERIMENT_PROFILE:-}" ]]; then
+  if [[ "${MODE}" == "single_gpu" ]]; then
+    EXPERIMENT_PROFILE="fanout_validated"
+  else
+    EXPERIMENT_PROFILE="legacy"
+  fi
+fi
+if [[ "${EXPERIMENT_PROFILE}" != "fanout_validated" \
+  && "${EXPERIMENT_PROFILE}" != "legacy" ]]; then
+  echo "EXPERIMENT_PROFILE must be fanout_validated or legacy." >&2
+  exit 1
+fi
+if [[ "${MODE}" == "single_gpu" \
+  && "${EXPERIMENT_PROFILE}" == "fanout_validated" ]]; then
+  OUTPUT_ROOT="${OUTPUT_ROOT:-results/main_experiment_v2}"
+  OUTPUT_TOKENS="${OUTPUT_TOKENS:-256}"
+  CASE_COUNT="${CASE_COUNT:-1}"
+  BRANCH_ORDER="${BRANCH_ORDER:-case_major}"
+  WARM_SHARED_PREFIX="${WARM_SHARED_PREFIX:-1}"
+  VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH="${VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH:-1}"
+else
+  OUTPUT_ROOT="${OUTPUT_ROOT:-results/main_experiment}"
+  OUTPUT_TOKENS="${OUTPUT_TOKENS:-64}"
+  CASE_COUNT="${CASE_COUNT:-4}"
+  BRANCH_ORDER="${BRANCH_ORDER:-round_robin}"
+  WARM_SHARED_PREFIX="${WARM_SHARED_PREFIX:-0}"
+  VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH="${VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH:-0}"
+fi
 DATASETS="${DATASETS:-swebench,agencybench,agentboard,appworld}"
 SUFFIX_MEAN="${SUFFIX_MEAN:-256}"
-OUTPUT_TOKENS="${OUTPUT_TOKENS:-64}"
 COMMON_ANALYSIS_TOKENS="${COMMON_ANALYSIS_TOKENS:-64}"
-CASE_COUNT="${CASE_COUNT:-4}"
 MAX_DATASET_RECORDS="${MAX_DATASET_RECORDS:-32}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.70}"
 OFFLOAD_CPU_GIB="${OFFLOAD_CPU_GIB:-8}"
@@ -45,6 +70,15 @@ if ! [[ "${FANOUT_ADMISSION_WINDOW}" =~ ^[0-9]+$ ]]; then
 fi
 if ! [[ "${MAX_DATASET_RECORDS}" =~ ^[0-9]+$ ]]; then
   echo "MAX_DATASET_RECORDS must be a non-negative integer." >&2
+  exit 1
+fi
+if [[ "${VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH}" != "0" \
+  && "${VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH}" != "1" ]]; then
+  echo "VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH must be 0 or 1." >&2
+  exit 1
+fi
+if [[ "${WARM_SHARED_PREFIX}" != "0" && "${WARM_SHARED_PREFIX}" != "1" ]]; then
+  echo "WARM_SHARED_PREFIX must be 0 or 1." >&2
   exit 1
 fi
 
@@ -121,7 +155,10 @@ write_manifest() {
     "${VLLM_GIT_COMMIT}" "${VLLM_GIT_DIRTY}" \
     "${NUM_GPU_BLOCKS_OVERRIDE}" "${VLLM_USE_FLASHINFER_SAMPLER}" \
     "${prefix_aware_policy}" "${fanout_admission_window}" \
-    "${OFFLOAD_CPU_GIB}" "${MAX_DATASET_RECORDS}" "${FULL_DATASET}" <<'PY'
+    "${OFFLOAD_CPU_GIB}" "${MAX_DATASET_RECORDS}" "${FULL_DATASET}" \
+    "${EXPERIMENT_PROFILE}" "${BRANCH_ORDER}" "${WARM_SHARED_PREFIX}" \
+    "${OUTPUT_TOKENS}" "${CASE_COUNT}" \
+    "${VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -149,6 +186,12 @@ from pathlib import Path
     offload_cpu_gib,
     max_dataset_records,
     full_dataset,
+    experiment_profile,
+    branch_order,
+    warm_shared_prefix,
+    output_tokens,
+    case_count,
+    enable_forest_cudagraph,
 ) = sys.argv[1:]
 Path(path).write_text(
     json.dumps(
@@ -178,6 +221,12 @@ Path(path).write_text(
                 int(max_dataset_records) if int(max_dataset_records) else None
             ),
             "full_dataset": bool(int(full_dataset)),
+            "experiment_profile": experiment_profile,
+            "branch_order": branch_order,
+            "warm_shared_prefix": bool(int(warm_shared_prefix)),
+            "output_tokens": int(output_tokens),
+            "case_count": int(case_count),
+            "enable_forest_cudagraph": bool(int(enable_forest_cudagraph)),
         },
         indent=2,
     )
@@ -199,7 +248,10 @@ run_variant() {
   local prefix_routing="$9"
   local prefix_aware_policy=0
   if [[ "${variant}" == "fork_optimized_offload" \
-    || "${variant}" == "fork_prefix_aware_dp" ]]; then
+    || "${variant}" == "fork_prefix_aware_dp" \
+    || ( "${variant}" == "fork_no_offload" \
+      && "${MODE}" == "single_gpu" \
+      && "${EXPERIMENT_PROFILE}" == "fanout_validated" ) ]]; then
     prefix_aware_policy=1
   fi
   local variant_fanout_window=0
@@ -244,7 +296,8 @@ run_variant() {
       PREFIX_TOKENS="${prefix_tokens}" \
       BRANCHES="${branches}" \
       BRANCH_GROUP_SIZE="${branches}" \
-      BRANCH_ORDER=round_robin \
+      BRANCH_ORDER="${BRANCH_ORDER}" \
+      WARM_SHARED_PREFIX="${WARM_SHARED_PREFIX}" \
       CASE_COUNT="${CASE_COUNT}" \
       SAMPLE_COUNT="${SAMPLE_COUNT}" \
       CONCURRENCY="${concurrency}" \
@@ -264,6 +317,7 @@ run_variant() {
       KV_TRANSFER_CONFIG="${kv_transfer_config}" \
       TELEMETRY_INTERVAL_SECONDS="${TELEMETRY_INTERVAL_SECONDS}" \
       VLLM_FORK_ATTN_ENABLE_FOREST=1 \
+      VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH="${VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH}" \
       VLLM_FORK_ATTN_FANOUT_SCHEDULING_ENABLED="${prefix_aware_policy}" \
       VLLM_FORK_ATTN_FANOUT_ADMISSION_WINDOW="${variant_fanout_window}" \
       VLLM_FORK_ATTN_DP_PREFIX_ROUTING="${prefix_routing}" \
