@@ -10,3 +10,7 @@
 	path = llama.cpp
 	url = https://github.com/T4t4KAU/llama.cpp.git
 	branch = fork-attn
+[submodule "sglang"]
+	path = sglang
+	url = https://github.com/oyyyyy61/sglang.git
+	branch = fork-attn
