@@ -59,14 +59,13 @@ each. Neither workload explicitly warms the shared prefix.
 
 Variants:
 
+- FlashAttention with ordinary DP and no offload, as the primary baseline
 - ForkAttention with ordinary DP and no offload
 - ForkAttention with the final capacity-aware DP router and no offload
-- FlashAttention with ordinary DP and no offload, as an adaptive follow-up
-  baseline
 
-The two routing variants use the same ForkAttention backend, CUDA Graph
-settings, and physical KV capacity. The FlashAttention baseline retains the
-same workload and KV capacity. The client does not force a data-parallel rank.
+The FlashAttention baseline retains the same workload, CUDA Graph policy, and
+KV capacity. The two ForkAttention variants then isolate the backend and
+routing contributions. The client does not force a data-parallel rank.
 
 The current capacity-aware router bypasses prefix hashing and arrival waves
 for prompts smaller than 20% of one rank's KV capacity. For eligible long
@@ -172,7 +171,7 @@ the lowest observed backend capacity.
 | Group | Hardware | CUDA | Executed coverage |
 |---|---|---|---|
 | Single GPU | RTX 5070 12 GiB | 13.0 build | 75 runs: Qwen complete grid on AgentBoard/AppWorld; Qwen and Llama 16K/16 stress replications on four datasets |
-| Data parallel | 2x RTX 5090 32 GiB | 12.8 | 9 focused Qwen3-8B runs: Adaptive16K three-way validation and two-repeat Pressure32K/32 comparisons |
+| Data parallel | 2x RTX 5090 32 GiB | 12.8 | 18 focused Qwen3-8B runs: Adaptive16K validation, repeated AgencyBench Pressure32K/32, and three-way checks on three additional datasets |
 | TP accuracy | 2x RTX 5090 32 GiB | 12.8 | 12 standard Qwen3-14B 16K/32 runs plus two Flash repeatability controls |
 
 Single-GPU comparisons pin 1,700 GPU blocks and an 8 GiB CPU offload cache.
@@ -485,8 +484,30 @@ exact 33/33 rank allocation; both 32K prefix owners are balanced and all 64
 post-bootstrap requests preserve prefix affinity. Ordinary ForkAttention and
 FlashAttention show much larger run-to-run variation, so the 32K evidence is
 best read as stable prefix-aware throughput above 1,570 branch tok/s rather
-than as a single maximum speedup ratio. The paired gain over ordinary
-ForkAttention ranges from 4.27x to 5.93x.
+than as a single maximum speedup ratio. Against the primary Flash ordinary-DP
+baseline, the paired gains are 3.98x and 7.58x; against the Fork ordinary-DP
+ablation, they are 5.93x and 4.27x.
+
+The same Pressure32K/32 shape was run once on each remaining bundled dataset.
+Flash ordinary DP is the primary baseline; Fork ordinary DP isolates the
+routing contribution. Each variant starts a fresh service and receives the
+same two fixed records, deterministic 32K prompt construction, suffix budgets,
+shuffled 64-request fanout, and output limits. The client does not select DP
+ranks. A required 64-token common-analysis request bootstraps each case before
+fanout, but no extra exact-prefix warmup request is sent. Branch throughput
+measures only the fanout phase, not service startup or common analysis.
+
+| Dataset | Flash ordinary branch tok/s | Fork ordinary branch tok/s | Fork prefix-aware branch tok/s | Gain vs Flash | Gain vs Fork | Prefix-aware TTFT P50 |
+|---|---:|---:|---:|---:|---:|---:|
+| AgentBoard | 231.4 | 233.7 | 1,007.1 | 4.35x | 4.31x | 2,135.6 ms |
+| AppWorld | 173.8 | 163.1 | 1,033.4 | 5.95x | 6.33x | 2,131.5 ms |
+| SWE-bench Verified | 185.8 | 174.4 | 1,032.7 | 5.56x | 5.92x | 1,964.3 ms |
+
+All nine cross-dataset runs completed 66/66 requests without preemption. Each
+prefix-aware run recorded 64 affinity routes and cohort locks and ended with a
+33/33 rank split. The cross-dataset result is one run per variant and dataset,
+so it establishes consistency for this controlled pressure shape rather than
+a universal average speedup.
 
 The measured shared prefix is 32,850 tokens after chat formatting. The service
 uses a conservative 42,560-token configured limit because the harness adds a
@@ -496,11 +517,9 @@ an uncommitted server-side vLLM patch; it must be synchronized before the new
 rows are reproducible from a clean checkout.
 
 The evidence supports a scoped claim: the current router is high-value for the
-tested long-prefix memory-pressure shapes, but it is not expected to accelerate
-every DP request. Pressure32K/32 shows stable cohort placement under higher
-fanout, but covers one controlled AgencyBench-derived stress shape rather than
-a broad workload average. Detailed routing activity, pressure-run methodology,
-and validation notes are recorded in
+tested long-prefix memory-pressure shape across all four bundled dataset
+sources, but it is not expected to accelerate every DP request. Detailed
+routing activity, pressure-run methodology, and validation notes are recorded in
 [`dp_experiment_results.md`](dp_experiment_results.md).
 
 ## TP Accuracy Guardrail

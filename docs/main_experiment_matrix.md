@@ -151,11 +151,13 @@ The current group compares FlashAttention ordinary DP, ForkAttention ordinary
 DP, and ForkAttention with the final capacity-aware prefix router on two
 internal DP ranks.
 
-The validation contains one three-way Adaptive16K run and two repetitions per
-variant for Pressure32K/32, for nine variant runs in total. All variants pin
-3,852 KV blocks per rank, use the same workload and physical KV capacity, and
-disable offload and reload rebalance. ForkAttention runs enable Prefix Forest
-CUDA Graphs. The exact setup and current results are documented in
+The validation contains one three-way Adaptive16K run, two repetitions per
+variant for AgencyBench Pressure32K/32, and one three-way Pressure32K/32 run on
+each of AgentBoard, AppWorld, and SWE-bench Verified, for 18 variant runs in
+total. All variants pin 3,852 KV blocks per rank, use the same controlled shape
+and physical KV capacity, and disable offload and reload rebalance.
+ForkAttention runs enable Prefix Forest CUDA Graphs. The exact setup and
+current results are documented in
 [`dp_experiment_results.md`](dp_experiment_results.md).
 
 ## TP Accuracy
