@@ -24,6 +24,88 @@ implemented for both eager and CUDA Graph execution. The remaining work is:
 Gather fusion, raw metadata-copy bandwidth, and register-count reduction on
 their own are lower-return projects according to the current traces.
 
+## Applicability Boundary
+
+ForkAttention does not reduce the physical KV-cache footprint already shared
+by vLLM prefix caching. It reduces repeated GPU reads and attention work when
+multiple queries consume the same physical KV blocks in the same decode step.
+The relevant branch count is therefore not the number of requests submitted,
+but the effective cohort `B_eff`: sibling requests that are simultaneously
+active and still share a resident prefix.
+
+For one shared segment, a useful first-order model is:
+
+```text
+Flash KV work ~= B_eff * (P + S)
+Fork KV work  ~= ceil(B_eff / C) * P + B_eff * S + split/gather overhead
+C             = floor(32 / (H_q / H_kv))
+```
+
+Here `P` is the shared resident prefix, `S` is the mean private suffix plus
+generated context at the current step, and `C` is the maximum shared-query
+cohort per CTA. For both evaluated Qwen3 models, `H_q/H_kv=2` and `C=16`.
+The approximate KV-work saving before operator overhead is:
+
+```text
+1 - (ceil(B_eff / C) * P + B_eff * S) / (B_eff * (P + S))
+```
+
+For `P=8K` and `S=227`, this predicts 48.7% fewer KV reads at `B_eff=2` and
+91.2% at `B_eff=16`. The observed speedup is lower because model layers,
+private-suffix attention, split/gather, and scheduling remain. The reuse factor
+also saturates at `C`; requests above that count form additional cohorts.
+
+### Deployment Rule on the Evaluated `sm_120` GPU
+
+| Signal | Strong-benefit region | Weak or no-benefit region |
+|---|---|---|
+| Execution phase | Single-token causal decode | Prefill, chunked prefill, or a singleton common-analysis request |
+| Effective cohort | `B_eff >= 8` is strongly validated; `2-4` is a tail/moderate regime | `B_eff=1` cannot reuse a KV load |
+| Shared-prefix length | `P >= 4K`; 8K has the strongest controlled evidence | Around 1K or shorter does not amortize planning, partial-output, and gather work |
+| Shared fraction | Shared prefix dominates each request, preferably `P/(P+S) >= 0.8` | Long private suffixes or long generation make `S` dominate |
+| Scheduling | Siblings are case-major/cohort-aligned and decode together | Round-robin unrelated cases, staggered arrivals, preemption, or early branch completion reduce `B_eff` |
+| KV residency | The exact physical prefix blocks are resident and shared | Textually equal prompts that miss/evict/recompute the prefix provide no operator reuse |
+| Runtime | CUDA Graph enabled is preferred | Eager works, but the measured system-level gain is smaller |
+
+These are performance routing rules, not correctness restrictions. The backend
+continues to fall back to FlashAttention for unsupported or non-decode shapes.
+For a multi-level prefix tree, apply the same rule independently to each shared
+segment: a segment is valuable only while at least two active descendants
+consume it together.
+
+These performance thresholds are not all hard-coded today.
+`VLLM_FORK_ATTN_ADAPTIVE_SPLIT_MIN_TOKENS=4096` controls only extra tail
+splitting; it is not a Fork-versus-Flash routing threshold. The current backend
+can still enter an eligible short-prefix forest, so production routing should
+apply the table above until a clean prefix/branch sweep justifies an automatic
+selector.
+
+### Evidence Behind the Boundary
+
+- Strong positive control: one 8K/16 Qwen3-0.6B cohort improves branch-phase
+  throughput by 3.57x and end-to-end throughput by 2.30x versus
+  FlashAttention. Qwen3-1.7B improves output throughput by 106.15% in the
+  corrected one-case validation.
+- Multi-case positive control: case-major 8K/16 Qwen3-1.7B improves by 23.86%
+  without explicit prefix warm-up and by 48.85% with forest CUDA Graphs.
+- Short-prefix negative control: the historical 1K/8 smoke run changes branch
+  throughput by -1.71% and TPOT by +2.67%; it is not a reason to route short
+  prefixes to ForkAttention.
+- Scheduling negative control: the original mixed-prefix round-robin matrix
+  was flat or slower despite reporting over 90% logical KV saving, because
+  siblings rarely reached decode together and prefix-cache hits were near
+  zero. Logical tree similarity alone is insufficient.
+- Tail regime: the 8K/two-request adaptive policy improves ForkAttention over
+  its static split policy by 10.29% with CUDA Graphs, but a matched current
+  Fork-versus-Flash sweep is still needed before assigning a backend speedup to
+  all two-request workloads.
+
+Accordingly, the current high-confidence target is a long-lived agent fanout:
+one cached 4K-8K or longer context spawning several tool/reasoning branches
+that remain concurrently decoded. Ordinary chat with one continuation,
+prefill-heavy serving, short prompts, or unrelated batched users should stay on
+FlashAttention.
+
 ## Profile Configuration
 
 | Setting | Value |
@@ -244,10 +326,39 @@ telemetry subsequently records 126 active two-request steps. This independently
 supports the launch-count inference that the largest remaining FlashAttention
 group is not eligible shared decode.
 
+### Wide-Cohort Guardrail
+
+The 8K-prefix, 16-branch guardrail uses the same model and server settings,
+with concurrency and branch-group size both set to 16. The four-case aggregate
+was run with CUDA Graphs both enabled and disabled.
+
+| Execution | Metric | Static chunks | Adaptive policy | Change |
+|---|---|---:|---:|---:|
+| CUDA Graph on | Branch-phase wall time | 3,586.12 ms | 3,592.19 ms | +0.17% |
+| CUDA Graph on | Branch output throughput | 2,284.36 tok/s | 2,280.50 tok/s | -0.17% |
+| CUDA Graph on | End-to-end output throughput | 1,373.14 tok/s | 1,369.96 tok/s | -0.23% |
+| CUDA Graph on | TPOT P50 | 6.07 ms | 6.08 ms | +0.22% |
+| CUDA Graph on | TTFT P50 | 112.80 ms | 115.95 ms | +2.79% |
+| CUDA Graph off | Branch-phase wall time | 5,320.30 ms | 5,288.08 ms | -0.61% |
+| CUDA Graph off | Branch output throughput | 1,539.76 tok/s | 1,549.14 tok/s | +0.61% |
+| CUDA Graph off | End-to-end output throughput | 1,046.93 tok/s | 1,049.73 tok/s | +0.27% |
+| CUDA Graph off | TPOT P50 | 9.50 ms | 9.46 ms | -0.40% |
+| CUDA Graph off | TTFT P50 | 123.06 ms | 110.38 ms | -10.31% |
+
+Two independent one-case repeats show a mean branch-throughput decrease of
+0.55% and TPOT increase of 0.75%. The longer four-case result and identical CTA
+counts show no meaningful wide-cohort regression: with 16 active requests the
+base four-chunk plan already supplies the target CTA count, so adaptive
+splitting does not activate. Graph-on telemetry is exactly identical at 2,569
+shared CTAs, 9,298 singleton CTAs, and 561 active Fork steps. Eager telemetry
+has 564 versus 561 active steps, which explains its small total-CTA difference;
+the per-step topology remains unchanged. The TTFT movements in both directions
+are outside the unchanged decode plan and are treated as run-to-run noise.
+
 The artifacts are under
 `benchmark/results/investigation_20260715/{graph,eager}_c4_b2_adaptive*/` and
 the one-case repeats are in the nearby `graph_b2_*` and `eager_b2_*`
-directories.
+directories. Wide-cohort artifacts use `graph_b16_*` and `graph_c4_b16_*`.
 
 ### Tail Tile A/B
 
@@ -262,7 +373,7 @@ the `sm_120` default from this result.
 
 | Priority | Optimization | Evidence and expected scope | Main risk |
 |---|---|---|---|
-| Implemented; broaden | Adaptive prefix split-K / CTA count | Tail sample launches only 56 CTAs on 48 SMs and is strongly imbalanced. The new two-wave policy improves branch throughput by 10.29% with CUDA Graphs and 2.21% in eager mode on the four-case workload. | Extra partial-output traffic and gather work can erase the gain if applied to wide cohorts. |
+| Implemented; monitor | Adaptive prefix split-K / CTA count | The new two-wave policy improves two-request branch throughput by 10.29% with CUDA Graphs and 2.21% in eager mode. The 16-request guardrail changes throughput by -0.17% with graphs and +0.61% in eager mode, with no topology change. | Mixed request counts and irregular completion order still need longer validation. |
 | P1 validation | Classify and convert eligible Flash fallbacks | Flash kernels remain 231.20 ms, but launch arithmetic assigns the largest group to 64 singleton decode steps. Use reason counters before extending coverage. | Prefill, no-sharing, and unsupported shapes should continue to fall back for correctness. |
 | P1 | `sm_120` tile autotuning | `N=32` uses less shared memory than `N=64`, but regresses branch throughput by 1.69% in the measured two-request eager shape. Keep automatic `N=64` and sweep other cohort/KV lengths before adding an architecture table. | `N=32` doubles loop iterations and can regress once adaptive splitting supplies enough CTAs. |
 | P1 | K/V load-path and cache-efficiency tuning | 61.86% DRAM versus 11.57% compute confirms memory pressure. Inspect sector utilization/replay in a full-cohort NCU sample before changing vectorization or page traversal. | The current algorithm already removes most repeated bytes; micro-tuning has a lower ceiling than CTA/fallback work. |
@@ -273,8 +384,8 @@ the `sm_120` default from this result.
 
 ### Recommended Implementation Order
 
-1. Run the adaptive policy on the 8K/16 full-cohort benchmark and on mixed-case
-   concurrency; reject it if wide-cohort throughput regresses.
+1. Run longer mixed 2/4/8/16-request traces with irregular completion order;
+   retain the policy only if the transition between cohort sizes stays stable.
 2. Correlate the new `PROFILE_FORK=1` reason counters with an Nsys capture to
    attach kernel time, not only step counts, to each fallback class.
 3. Sweep the already compiled `N=32` and `N=64` one-warp kernels on `sm_120`,
