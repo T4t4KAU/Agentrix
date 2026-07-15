@@ -124,6 +124,42 @@ OUTPUT_ROOT=results/dp_pressure32k_b32_crossdatasets_r1 \
 ./scripts/run_main_experiment.sh
 ```
 
+## Representative Route-Ownership Snapshot
+
+One diagnostic repeat of the AgentBoard Pressure32K/32 Fork prefix-aware
+variant was used to inspect the actual per-rank placement. This is a single
+illustrative run, not an additional performance repeat. The workload and
+request order were unchanged. After each routing decision, diagnostic-only
+logging hashed the first 4,096 prompt token IDs into an anonymous case
+fingerprint and recorded the selected DP rank. The fingerprint was computed
+after rank selection and was not an input to the router. Because this logging
+adds CPU and I/O overhead, its throughput is not used in the result tables.
+
+The two fingerprints below are labeled A and B. Fanout rows are cumulative and
+exclude the two bootstrap requests.
+
+| Dispatch point | A to rank 0 | A to rank 1 | B to rank 0 | B to rank 1 | Total by rank |
+|---|---:|---:|---:|---:|---:|
+| Bootstrap, one request per case | 1 | 0 | 0 | 1 | 1 / 1 |
+| First 16 fanout requests | 12 | 0 | 0 | 4 | 12 / 4 |
+| First 32 fanout requests | 17 | 0 | 0 | 15 | 17 / 15 |
+| First 48 fanout requests | 31 | 0 | 0 | 17 | 31 / 17 |
+| All 64 fanout requests | 32 | 0 | 0 | 32 | 32 / 32 |
+
+The fixed shuffle therefore did not create two separate client streams or an
+artificially alternating arrival order: it produced substantial transient
+skew, including 12/4 and 31/17 cumulative splits. Nevertheless, every branch
+of prefix A followed its rank-0 owner and every branch of prefix B followed its
+rank-1 owner. Including bootstrap, the final route count was 33/33, with 64
+affinity routes and 64 cohort locks.
+
+A server sample during the fanout dispatch window reported rank 0 with 31
+running and 0 waiting requests at 63.9% KV usage, and rank 1 with 16 running and
+0 waiting requests at 60.9% KV usage. The corresponding GPU telemetry sample
+reported 97% compute utilization on both GPUs. This is evidence of actual
+request ownership and concurrent device activity; it is not a claim that the
+two GPUs execute identical CTA sets at a single clock instant.
+
 ## Current Router Behavior
 
 The corrected router:
