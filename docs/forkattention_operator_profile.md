@@ -244,10 +244,32 @@ telemetry subsequently records 126 active two-request steps. This independently
 supports the launch-count inference that the largest remaining FlashAttention
 group is not eligible shared decode.
 
+### Wide-Cohort Guardrail
+
+The 8K-prefix, 16-branch guardrail uses the same model and server settings,
+with concurrency and branch-group size both set to 16. In the four-case
+aggregate, the adaptive policy leaves the physical plan unchanged: both runs
+record 2,569 shared CTAs, 9,298 singleton CTAs, and 561 active Fork steps.
+
+| Metric | Static chunks | Adaptive policy | Change |
+|---|---:|---:|---:|
+| Branch-phase wall time | 3,586.12 ms | 3,592.19 ms | +0.17% |
+| Branch output throughput | 2,284.36 tok/s | 2,280.50 tok/s | -0.17% |
+| End-to-end output throughput | 1,373.14 tok/s | 1,369.96 tok/s | -0.23% |
+| TPOT P50 | 6.07 ms | 6.08 ms | +0.22% |
+| TTFT P50 | 112.80 ms | 115.95 ms | +2.79% |
+
+Two independent one-case repeats show a mean branch-throughput decrease of
+0.55% and TPOT increase of 0.75%. The longer four-case result and identical CTA
+counts show no meaningful wide-cohort regression: with 16 active requests the
+base four-chunk plan already supplies the target CTA count, so adaptive
+splitting does not activate. The TTFT movement is outside the decode-only
+policy and is treated as run-to-run noise.
+
 The artifacts are under
 `benchmark/results/investigation_20260715/{graph,eager}_c4_b2_adaptive*/` and
 the one-case repeats are in the nearby `graph_b2_*` and `eager_b2_*`
-directories.
+directories. Wide-cohort artifacts use `graph_b16_*` and `graph_c4_b16_*`.
 
 ### Tail Tile A/B
 
@@ -262,7 +284,7 @@ the `sm_120` default from this result.
 
 | Priority | Optimization | Evidence and expected scope | Main risk |
 |---|---|---|---|
-| Implemented; broaden | Adaptive prefix split-K / CTA count | Tail sample launches only 56 CTAs on 48 SMs and is strongly imbalanced. The new two-wave policy improves branch throughput by 10.29% with CUDA Graphs and 2.21% in eager mode on the four-case workload. | Extra partial-output traffic and gather work can erase the gain if applied to wide cohorts. |
+| Implemented; monitor | Adaptive prefix split-K / CTA count | The new two-wave policy improves two-request branch throughput by 10.29% with CUDA Graphs and 2.21% in eager mode. The 16-request guardrail changes throughput by only -0.17% and leaves CTA counts identical. | Mixed request counts and irregular completion order still need longer validation. |
 | P1 validation | Classify and convert eligible Flash fallbacks | Flash kernels remain 231.20 ms, but launch arithmetic assigns the largest group to 64 singleton decode steps. Use reason counters before extending coverage. | Prefill, no-sharing, and unsupported shapes should continue to fall back for correctness. |
 | P1 | `sm_120` tile autotuning | `N=32` uses less shared memory than `N=64`, but regresses branch throughput by 1.69% in the measured two-request eager shape. Keep automatic `N=64` and sweep other cohort/KV lengths before adding an architecture table. | `N=32` doubles loop iterations and can regress once adaptive splitting supplies enough CTAs. |
 | P1 | K/V load-path and cache-efficiency tuning | 61.86% DRAM versus 11.57% compute confirms memory pressure. Inspect sector utilization/replay in a full-cohort NCU sample before changing vectorization or page traversal. | The current algorithm already removes most repeated bytes; micro-tuning has a lower ceiling than CTA/fallback work. |
@@ -273,8 +295,8 @@ the `sm_120` default from this result.
 
 ### Recommended Implementation Order
 
-1. Run the adaptive policy on the 8K/16 full-cohort benchmark and on mixed-case
-   concurrency; reject it if wide-cohort throughput regresses.
+1. Run longer mixed 2/4/8/16-request traces with irregular completion order;
+   retain the policy only if the transition between cohort sizes stays stable.
 2. Correlate the new `PROFILE_FORK=1` reason counters with an Nsys capture to
    attach kernel time, not only step counts, to each fallback class.
 3. Sweep the already compiled `N=32` and `N=64` one-warp kernels on `sm_120`,
