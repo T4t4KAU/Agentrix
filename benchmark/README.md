@@ -18,6 +18,12 @@ BRANCHES=16 \
 OUTPUT_TOKENS=64 \
 ./scripts/run_vllm_benchmark.sh
 
+MODEL_PATH=/path/to/Qwen3-0.6B \
+PREFIX_TOKENS=2048 \
+BRANCHES=2 \
+OUTPUT_TOKENS=64 \
+./scripts/run_sglang_benchmark.sh
+
 DRY_RUN=1 ./scripts/run_vllm_fanout_matrix.sh
 ```
 
@@ -70,6 +76,26 @@ Hugging Face model or a local model directory. All output is written under
 the Git-ignored `results/` directory. The vLLM script writes one subdirectory
 per backend plus `backend_comparison.csv` and `backend_comparison.md` with the
 end-to-end latency and throughput deltas.
+
+## SGLang Local Benchmark
+
+After adding and installing the `sglang` submodule, run the same Agentrix
+OpenAI-compatible workload against SGLang:
+
+```bash
+MODEL_PATH=/path/to/Qwen3-0.6B \
+SGLANG_PYTHON=/path/to/python \
+PREFIX_TOKENS=2048 \
+BRANCHES=2 \
+OUTPUT_TOKENS=64 \
+./scripts/run_sglang_benchmark.sh
+```
+
+The script launches one SGLang server per `DP_REPLICAS`, routes Agentrix
+branches through the existing `agentrix-bench run-api` client, and writes
+results under `benchmark/results/sglang_*`. It defaults to `--no-stream` for
+the benchmark client because SGLang deployments vary in streaming usage
+reporting support. Set `BENCHMARK_EXTRA_ARGS=""` to request streaming mode.
 
 Use `run_vllm_fanout_matrix.sh` for stronger shared-prefix cases. It compares
 `FLASH_ATTN` and `FORK_ATTN` over five long-prefix, high-branch-count workloads
