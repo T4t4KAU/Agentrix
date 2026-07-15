@@ -47,6 +47,7 @@ VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 VLLM_FORK_ATTN_FANOUT_SCHEDULING_ENABLED="${VLLM_FORK_ATTN_FANOUT_SCHEDULING_ENABLED:-1}"
 VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH="${VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH:-0}"
 WARM_SHARED_PREFIX="${WARM_SHARED_PREFIX:-0}"
+CACHE_PRIME_SAMPLE_INDICES="${CACHE_PRIME_SAMPLE_INDICES:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-results/fork_attention_${DATASET}_c${CASE_COUNT}_p${PREFIX_TOKENS}_b${BRANCHES}_g${BRANCH_GROUP_SIZE}_o${OUTPUT_TOKENS}}"
 KEEP_SERVER="${KEEP_SERVER:-0}"
 VLLM_SERVER_EXTRA_ARGS="${VLLM_SERVER_EXTRA_ARGS:-}"
@@ -134,6 +135,16 @@ fi
 if [[ "${WARM_SHARED_PREFIX}" != "0" && "${WARM_SHARED_PREFIX}" != "1" ]]; then
   echo "WARM_SHARED_PREFIX must be 0 or 1." >&2
   exit 1
+fi
+if [[ -n "${CACHE_PRIME_SAMPLE_INDICES}" ]]; then
+  IFS=',' read -r -a cache_prime_sample_indices \
+    <<<"${CACHE_PRIME_SAMPLE_INDICES}"
+  for sample_index in "${cache_prime_sample_indices[@]}"; do
+    if ! [[ "${sample_index}" =~ ^[0-9]+$ ]]; then
+      echo "CACHE_PRIME_SAMPLE_INDICES must be comma-separated non-negative integers." >&2
+      exit 1
+    fi
+  done
 fi
 
 if [[ "${DP_DEPLOYMENT}" != "external" && "${DP_DEPLOYMENT}" != "internal" ]]; then
@@ -746,6 +757,19 @@ run_backend() {
   if [[ -n "${BENCHMARK_EXTRA_ARGS}" ]]; then
     read -r -a extra_benchmark_args <<<"${BENCHMARK_EXTRA_ARGS}"
     benchmark_args+=("${extra_benchmark_args[@]}")
+  fi
+
+  if [[ -n "${CACHE_PRIME_SAMPLE_INDICES}" ]]; then
+    local prime_index
+    local prime_pass=0
+    for prime_index in "${cache_prime_sample_indices[@]}"; do
+      prime_pass=$((prime_pass + 1))
+      echo "Priming cache with dataset sample index ${prime_index}..."
+      OPENAI_API_KEY="vllm-local" "${BENCHMARK_PYTHON}" \
+        "${benchmark_args[@]}" \
+        --sample-index "${prime_index}" \
+        --output-dir "${backend_output_dir}/cache_prime_pass${prime_pass}"
+    done
   fi
 
   if [[ "${ENABLE_TELEMETRY}" == "1" ]]; then

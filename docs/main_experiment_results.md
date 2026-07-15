@@ -284,6 +284,29 @@ also accepted by `supports_compute_capability()`.
 The corrected validation was intentionally run from the modified development
 checkout, so its manifest records both worktrees as dirty.
 
+### Cross-Dataset Pure-GPU Revalidation
+
+A larger pure-GPU revalidation used Qwen3-1.7B, 16K prefixes, 16 branches,
+256-token outputs, exact shared-prefix warm-up, forest CUDA Graphs, and 1,700
+GPU blocks for both backends. It covered 32 SWE-bench records, all 32
+AgencyBench records, all 9 AgentBoard records, and all 13 AppWorld records: 86
+independent roots and 1,376 measured branch requests per backend. FlashAttention
+and ForkAttention had identical per-case input-token counts and zero
+preemptions. ForkAttention physically activated on about 76% of observed steps.
+
+| Dataset | Records | Flash tok/s | Fork tok/s | Throughput improvement | TTFT P50 Flash/Fork | TPOT P50 Flash/Fork |
+|---|---:|---:|---:|---:|---:|---:|
+| SWE-bench | 32 | 257.10 | 667.12 | +159.47% | 470.51/424.94 ms | 52.73/13.56 ms |
+| AgencyBench | 32 | 251.91 | 684.74 | +171.82% | 462.62/430.39 ms | 53.71/13.21 ms |
+| AgentBoard | 9 | 247.41 | 649.72 | +162.61% | 471.64/440.00 ms | 54.82/14.11 ms |
+| AppWorld | 13 | 250.23 | 676.96 | +170.54% | 474.64/436.01 ms | 54.30/13.31 ms |
+
+Across all 86 paired cases, the median Fork/Flash speedup was 2.66x; the
+minimum and maximum were 2.44x and 2.91x. This is a controlled, dataset-seeded
+serving benchmark: each real record is padded to the same long-prefix shape and
+expanded into branches. It establishes cross-dataset systems consistency, not
+interactive task success.
+
 ## Single-GPU Offload
 
 ### Corrected Offload Validation
@@ -395,6 +418,24 @@ pads each root to the controlled 16K prefix and creates 16 suffix branches.
 It therefore tests the intended long-prefix, multi-branch Agent serving shape,
 but does not by itself establish end-to-end Agent task quality.
 
+### Cross-Dataset CPU-Offload Replication
+
+The same cold 16K/16 four-root offload profile was then repeated three times on
+SWE-bench and AgencyBench. Both backends used 1,700 GPU blocks and an 8 GiB CPU
+tier; every run generated nonzero load/store traffic and no run preempted.
+
+| Dataset | Flash ordinary | Fork ordinary | Paired improvement | Fork optimized | Paired improvement | Optimized KV load |
+|---|---:|---:|---:|---:|---:|---:|
+| SWE-bench | 218.22 tok/s | 535.39 tok/s | +145.34% | 542.96 tok/s | +143.80% | 8.56 GiB |
+| AgencyBench | 233.66 tok/s | 532.37 tok/s | +117.26% | 597.60 tok/s | +155.76% | 8.84 GiB |
+
+The ordinary-connector comparison is the cleaner backend result. Relative to
+scheduled ordinary ForkAttention, the optimized connector's paired-median
+throughput gain was only 6.13% on SWE-bench and 8.10% on AgencyBench, while KV
+reload fell by 11.57% and 16.68%, respectively. Connector performance varied
+substantially across individual runs, so the larger Flash-to-Fork system gain
+must not be attributed to the connector alone.
+
 The LMCache three-tier path had a separate set of correctness and admission
 problems:
 
@@ -418,6 +459,31 @@ also exposed an unrelated initialization bug: LMCache installed an OTel
 logger now attaches that handler only after a real SDK `LoggerProvider` exists.
 The smoke artifact is under
 `benchmark/results/investigation_20260714/lmcache_tiered_fix_smoke/`.
+
+### FlashAttention-Controlled Disk Reload
+
+A separate small disk experiment compared FlashAttention and ForkAttention
+with the same LMCache LRU policy, 2 GiB CPU tier, 8 GiB disk tier, 1,700 GPU
+blocks, and forest CUDA Graph policy. Four AgentBoard roots used 4K prefixes,
+eight branches, and 64-token outputs. Each server first ran roots 0-3, then
+roots 4-7 to evict the target cohort, and finally measured a replay of roots
+0-3. The runner records these pre-measurement waves with
+`CACHE_PRIME_SAMPLE_INDICES=0,4`.
+
+| Backend | E2E tok/s | Branch tok/s | TTFT P50 | TPOT P50 | Retrieved tokens |
+|---|---:|---:|---:|---:|---:|
+| FlashAttention + LMCache disk | 522.08 | 819.20 | 422.04 ms | 32.62 ms | 21,248 |
+| ForkAttention + LMCache disk | 688.35 | 1,306.04 | 437.60 ms | 16.93 ms | 20,992 |
+
+All three pairs had identical input/output token counts and nonzero disk
+retrieval. None reported a disk allocation failure, failed load, or fatal
+storage error; the realized disk footprint was about 5.1-5.3 GiB. Fork branch
+throughput improved in every pair (+56.12%, +71.29%, and +59.43%), for a
+paired median of +59.43%. End-to-end changes were +28.16%, +36.60%, and
+-11.89%, for a paired median of +28.16%. The negative third E2E pair shows that
+disk/common-stage variability is still material: this result supports stable
+branch-phase acceleration, not an assertion that every end-to-end disk run is
+faster.
 
 ### Historical Mixed-Prefix Result
 
