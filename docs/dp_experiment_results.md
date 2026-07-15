@@ -183,6 +183,60 @@ concurrent device activity; they are not single-clock CTA or physical KV-block
 maps, and one diagnostic run must not be generalized to every ordinary-DP
 schedule.
 
+## Why Branch TTFT Drops
+
+The route snapshots above show placement, not the amount of KV actually reused.
+The formal AgencyBench Pressure32K/32 runs also exported vLLM's scheduler-derived
+prompt-token source counters, which provide the missing prefill evidence. All
+four runs processed the same 2,191,629 prompt tokens and used no external KV
+transfer.
+
+| Variant / branch tok/s | Local prompt compute | Local cache hit | Cache-hit share | Cumulative prefill time | Cumulative queue time |
+|---|---:|---:|---:|---:|---:|
+| Flash ordinary / 394.7 | 190,173 | 2,001,456 | 91.32% | 66.202 s | 1,002.421 s |
+| Flash ordinary / 212.6 | 279,757 | 1,911,872 | 87.24% | 66.690 s | 2,379.357 s |
+| Fork prefix-aware / 1,570.1 | 76,285 | 2,115,344 | 96.52% | 15.988 s | 0.000595 s |
+| Fork prefix-aware / 1,611.9 | 76,285 | 2,115,344 | 96.52% | 16.001 s | 0.000644 s |
+
+`Local prompt compute` is the number of prompt tokens that the scheduler says
+must be prefilled locally after prefix-cache lookup; `Local cache hit` is the
+number skipped through resident KV reuse. The time columns sum per-request
+durations across all 66 concurrent requests and therefore are not experiment
+wall time.
+
+Prefix-aware placement reduces actual prompt computation by 60-73% relative to
+the two Flash ordinary runs and cumulative prefill time by about 76%. The much
+larger TTFT change is the resulting queueing amplification: ordinary DP spends
+large cumulative time waiting behind long or repeated prefills, whereas the
+prefix-aware runs admit the shared-prefix cohorts without a material scheduler
+queue. Thus the causal description is not simply "each prefill becomes 30
+seconds faster"; reduced prefill work and KV pressure collapse the queue in
+front of the median request.
+
+The capacity point explains why the amplification is strong. Each rank has
+61,632 tokens of physical GPU KV capacity. The two common requests contain
+32,854 and 32,889 prompt tokens, or 65,743 tokens together, before branch
+suffixes and outputs. When ordinary DP mixes both roots across a rank, as the
+diagnostic snapshot demonstrates, that rank cannot retain both complete roots
+plus active branch state. Prefix-aware DP keeps one root cohort per rank and
+avoids this capacity cliff.
+
+The latency measurements are internally consistent with this explanation.
+Branch TTFT is measured from immediately before the streaming API call until
+the first non-empty generated content and includes HTTP handling, the arrival
+wave, scheduler waiting, and prefill. The common-analysis bootstrap happens
+before fanout and is not part of branch TTFT. Fork ordinary DP remains close to
+Flash ordinary DP at 29.65 versus 32.46 seconds TTFT P50, while prefix-aware DP
+falls to 2.15 seconds. TPOT does not improve: it changes from 25.47 ms for Flash
+ordinary to 26.82 ms for Fork prefix-aware. The large gain is therefore a
+prefill-locality and queueing result, not faster steady-state decode.
+
+This mechanism is credible for the controlled Agent fanout shape, but the exact
+TTFT ratio is not universal. The benchmark intentionally places two long roots
+near a per-rank KV-capacity boundary, and the two Flash repeats show substantial
+run-to-run variation. It also measures fanout after the required common-analysis
+stage, not cold end-to-end latency from the first root request.
+
 ## Current Router Behavior
 
 The corrected router:
