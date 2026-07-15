@@ -1,17 +1,17 @@
-# Complete Main Experiment Matrix
+# Main Experiment Procedures
 
 ## Purpose
 
-This guide launches the complete Agentrix shared-prefix experiment matrix. It
-keeps offload measurements on a physical single-GPU host and runs only
-no-offload DP/TP measurements on the multi-GPU server.
+This guide launches the current Agentrix shared-prefix experiments. It keeps
+offload measurements on a physical single-GPU host and runs no-offload DP/TP
+measurements on the multi-GPU server.
 
-The complete shape matrix contains 304 runs:
+The documented groups are:
 
 | Group | Models | Datasets | Prefixes | Branches | Variants | Runs |
 |---|---:|---:|---:|---:|---:|---:|
 | Single GPU | 2 | 4 | 2 | 2 | 5 | 160 |
-| Data parallel | 1 | 4 | 2 | 3 | 3 | 72 |
+| Data parallel | 1 | 1 | 2 | 1 | 2 | 12 |
 | TP accuracy | 1 | 4 | 2 | 3 | 3 | 72 |
 
 The default record cap is 32 records per dataset. Set
@@ -24,7 +24,7 @@ completed CSV files are intentionally skipped on resume.
 Run commands from the `benchmark` directory. Supply machine-specific model
 paths through `MODEL_SPECS`; do not edit tracked scripts.
 
-The legacy runner profile fixes the following comparison controls:
+The single-GPU and TP matrix controls include:
 
 - Prefix lengths: 8K and 16K tokens.
 - Deterministic greedy generation with 64 output tokens.
@@ -56,7 +56,9 @@ fanout admission and forest CUDA Graphs. The forest graph workspace reserves
 the full 32-split range supported by the gather kernel, so branch points cannot
 overflow a sequence-length-derived capture size. Results go to
 `results/main_experiment_v2` so they cannot be silently mixed with the
-historical matrix:
+historical matrix. The matched Nsight operator breakdown and optimization
+ranking are documented in
+[`forkattention_operator_profile.md`](forkattention_operator_profile.md):
 
 ```bash
 cd benchmark
@@ -145,29 +147,16 @@ OUTPUT_ROOT=results/main_experiment_full32 \
 
 ## Data Parallel
 
-This group compares FlashAttention ordinary DP, ForkAttention ordinary DP,
-and ForkAttention prefix-aware DP on two internal DP ranks. All variants run
-without offload. `NUM_GPU_BLOCKS_OVERRIDE` is per rank for this deployment.
+The current group compares ForkAttention ordinary DP with the final
+capacity-aware prefix router on two internal DP ranks. The obsolete
+Flash/Fork/legacy-router shape matrix is not part of the current result.
 
-```bash
-cd benchmark
-
-MODE=dp \
-MODEL_SPECS='qwen3-8b|/path/to/Qwen3-8B' \
-DATASETS='agentboard,appworld,agencybench,swebench' \
-PREFIX_LENGTHS='8192,16384' \
-BRANCH_COUNTS='8,16,32' \
-CASE_COUNT=4 \
-MAX_DATASET_RECORDS=32 \
-OUTPUT_TOKENS=64 \
-COMMON_ANALYSIS_TOKENS=64 \
-GPU_IDS='0,1' \
-DP_REPLICAS=2 \
-TP_SIZE=1 \
-NUM_GPU_BLOCKS_OVERRIDE=3852 \
-OUTPUT_ROOT=results/main_experiment_full32 \
-./scripts/run_main_experiment.sh
-```
+The validation contains three paired Warm8K repetitions and three repetitions
+per variant for Pressure16K, for 12 variant runs in total. Both variants pin
+3,852 KV blocks per rank, enable Prefix Forest CUDA Graphs, and disable
+offload, fanout admission, and reload rebalance. Exact portable commands and
+the required alternating run order are documented in
+[`dp_experiment_results.md`](dp_experiment_results.md).
 
 ## TP Accuracy
 
@@ -200,37 +189,15 @@ OUTPUT_ROOT=results/main_experiment_full32 \
 
 ## Detached Runs
 
-Long matrices should be detached from the SSH or IDE session:
-
-```bash
-cd benchmark
-
-nohup env MODE=dp \
-  MODEL_SPECS='qwen3-8b|/path/to/Qwen3-8B' \
-  DATASETS='agentboard,appworld,agencybench,swebench' \
-  PREFIX_LENGTHS='8192,16384' \
-  BRANCH_COUNTS='8,16,32' \
-  CASE_COUNT=4 \
-  MAX_DATASET_RECORDS=32 \
-  OUTPUT_TOKENS=64 \
-  COMMON_ANALYSIS_TOKENS=64 \
-  GPU_IDS='0,1' \
-  DP_REPLICAS=2 \
-  TP_SIZE=1 \
-  NUM_GPU_BLOCKS_OVERRIDE=3852 \
-  OUTPUT_ROOT=results/main_experiment_full32 \
-  ./scripts/run_main_experiment.sh \
-  >main_experiment_dp.log 2>&1 < /dev/null &
-```
-
-Re-running the same command resumes the matrix. Inspect progress by counting
-non-empty result files:
+Long runs should be detached from the SSH or IDE session by wrapping the exact
+group command in `nohup env ... >experiment.log 2>&1 < /dev/null &`. Use a new
+output root for every DP repetition so paired runs cannot overwrite one
+another. The single-GPU and TP matrices resume by skipping completed result
+files. Inspect their progress with:
 
 ```bash
 find results/main_experiment_full32/single_gpu \
   -name benchmark_results.csv -size +0c | wc -l  # expected: 160
-find results/main_experiment_full32/dp \
-  -name benchmark_results.csv -size +0c | wc -l  # expected: 72
 find results/main_experiment_full32/tp_accuracy \
   -name benchmark_results.csv -size +0c | wc -l  # expected: 72
 ```
@@ -249,8 +216,8 @@ Regenerate a report after copying results between machines:
 
 ```bash
 .venv/bin/python src/main_experiment_report.py \
-  results/main_experiment_full32/dp \
-  --output results/main_experiment_full32/dp/main_experiment_report.md
+  results/dp_capacity_aware_pressure16k/dp \
+  --output results/dp_capacity_aware_pressure16k/dp/main_experiment_report.md
 ```
 
 Before publishing results, verify that every compared cell contains all of its

@@ -15,7 +15,8 @@ LMCache integration, and the end-to-end benchmark suite in one repository:
 - [llama.cpp EulerOS and CentOS adaptation notes](docs/llama_cpp_forkattention_hce_centos_adaptation.md)
 - [Prefix-aware data parallel experiment results](docs/dp_experiment_results.md)
 - [Main shared-prefix experiment results](docs/main_experiment_results.md)
-- [Complete main experiment matrix](docs/main_experiment_matrix.md)
+- [ForkAttention CUDA operator profile](docs/forkattention_operator_profile.md)
+- [Main experiment procedures](docs/main_experiment_matrix.md)
 - [ForkAttention TP model compatibility](docs/tp_model_compatibility.md)
 
 ## System Requirements
@@ -370,7 +371,7 @@ benchmark/scripts/import_agent_datasets.py \
 `run_main_experiment.sh` runs all four bundled datasets and records streaming
 TTFT/TPOT, P50/P95/P99 request latency, throughput, logical and observed KV
 usage, GPU compute utilization, and NVIDIA memory-controller utilization.
-Select one of the three experiment groups with `MODE`:
+The single-GPU and TP groups use `MODE` directly:
 
 ```bash
 cd benchmark
@@ -380,14 +381,15 @@ MODE=single_gpu \
 MODEL_SPECS='qwen3-1.7b|/path/to/Qwen3-1.7B;llama3.2-1b|/path/to/Llama-3.2-1B' \
 ./scripts/run_main_experiment.sh
 
-# Internal DP: Flash, Fork, and prefix-aware Fork. Experimental reload is disabled.
-MODE=dp MODEL_SPECS='qwen3-8b|/path/to/Qwen3-8B' \
-./scripts/run_main_experiment.sh
-
 # TP accuracy guardrail: one Flash run and two Fork repeats.
 MODE=tp_accuracy MODEL_SPECS='qwen3-14b|/path/to/Qwen3-14B' \
 ./scripts/run_main_experiment.sh
 ```
+
+The current DP validation compares ordinary ForkAttention DP with the final
+capacity-aware router using separate Warm8K and Pressure16K workloads. Use the
+commands in [the current DP results](docs/dp_experiment_results.md); the old
+generic DP defaults no longer represent the routing implementation.
 
 Override `PREFIX_LENGTHS`, `BRANCH_COUNTS`, `DATASETS`, `CASE_COUNT`,
 `MAX_DATASET_RECORDS`, `GPU_IDS`, `DP_REPLICAS`, `TP_SIZE`, and
