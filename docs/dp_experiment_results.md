@@ -149,6 +149,101 @@ Raw results are stored on the AutoDL host under:
 /root/autodl-tmp/Agentrix/benchmark/results/dp_agencybench_qwen3_8b_cu128_r3
 ```
 
+## Capacity-Aware Router Follow-up
+
+The prefix-aware router was reworked and retested on 2026-07-14 and
+2026-07-15 after focused pressure runs exposed two sources of instability.
+This follow-up is implemented by vLLM commit `0cff6d857` and does not enable
+or modify the offload policy.
+
+The first issue was the affinity ordering. The old score compared active,
+live, and warm residency classes before comparing total match depth. A shallow
+but active common ancestor could therefore beat a deeper, case-specific warm
+prefix on another rank. The second issue was request-local balancing: moving
+only two branches of a 16K prefix cohort to the other rank duplicated roughly
+32K prefix tokens, pushed peak KV usage above 99.8%, and caused 13 to 14
+preemptions in repeated runs.
+
+The corrected policy now:
+
+- compares prefix match depth first and uses active/live/warm residency only
+  to break ties at the same depth;
+- balances a new long-prefix owner before applying prefix affinity;
+- keeps a deep-prefix cohort together under a cumulative skew budget derived
+  from matched prefix size, per-rank KV capacity, and `max_num_seqs`;
+- relaxes work balance only by the amount of prefix recomputation avoided;
+- sends prompts smaller than 20% of per-rank KV capacity through the native
+  ordinary-DP path without building prefix hashes or delaying them in an
+  arrival wave; and
+- uses a 10 ms arrival wave for eligible long-prefix requests.
+
+### Focused Test Configuration
+
+Both ordinary and prefix-aware variants used the same ForkAttention backend,
+Prefix Forest CUDA Graphs, Qwen3-8B float16 model, two internal DP ranks,
+`max_num_seqs=64`, and 3,852 KV blocks per rank. Offload, fanout admission,
+reload rebalance, and the FlashInfer sampler were disabled. Each run contained
+four cases, 16 branches per case, concurrency 64, a deterministic lognormal
+suffix distribution with mean 256, 256 branch output tokens, 64 common-analysis
+tokens, and seed 2026.
+
+| Scenario | Prefix construction | Branch input tokens/run | Branch output tokens/run |
+|---|---|---:|---:|
+| Warm8K | exact warm prefix, case-major order | 554,291 | 16,384 |
+| Pressure16K | no explicit warmup, deterministic four-case shuffle | 1,086,003 | 16,384 |
+
+Warm8K used three same-session paired repetitions with alternating variant
+order: ordinary then final, final then ordinary, and ordinary then final. This
+controls for the substantial run-to-run variance observed on the host. The
+Pressure16K table reports three repetitions for each variant.
+
+### Warm8K Paired Result
+
+| Variant | Branch tok/s runs | Median | Branch phase | TTFT P50 | TPOT P50 | Peak KV | Max waiting | Preemptions |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| Fork ordinary DP | 2,142.3 / 2,124.5 / 2,014.0 | 2,124.5 | 7,711.8 ms | 1,002.3 ms | 24.73 ms | 76.40% | 14 | 0 |
+| Final prefix-aware policy | 2,210.3 / 2,116.7 / 2,021.3 | 2,116.7 | 7,740.2 ms | 1,003.4 ms | 23.82 ms | 76.53% | 14 | 0 |
+
+The final policy differs from ordinary DP by -0.37% branch throughput, +0.37%
+branch-phase time, +0.11% TTFT P50, and -3.67% TPOT P50. All 72 requests per
+run took the native bypass, with zero arrival waves and zero prefix-routing
+time. The short-prefix result is therefore neutral within measured variance
+rather than the double-digit regression produced by the earlier router.
+
+### Pressure16K Result
+
+| Variant | Branch tok/s runs | Median | Branch phase | TTFT P50 | TPOT P50 | Peak KV | Max waiting | Median preemptions |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| Fork ordinary DP | 443.6 / 385.8 / 454.3 | 443.6 | 36,937.9 ms | 17,253.2 ms | 21.66 ms | 88.28% | 56 | 0 |
+| Legacy prefix-aware DP | 1,642.9 / 1,654.4 / 1,193.2 | 1,642.9 | 9,972.7 ms | 1,338.8 ms | 32.56 ms | 75.72% | 2 | 0 |
+| Final prefix-aware DP | 1,677.2 / 1,689.4 / 1,716.0 | 1,689.4 | 9,698.4 ms | 1,432.5 ms | 31.32 ms | 75.19% | 2 | 0 |
+
+Relative to ordinary DP, the final router improves branch throughput by
+280.87% (3.81x), reduces branch-phase time by 73.74%, reduces TTFT P50 by
+91.70%, and lowers peak KV usage by 13.09 percentage points. Its higher TPOT
+than ordinary DP does not contradict the throughput result: ordinary DP leaves
+many requests waiting before decode, as shown by its 56-request maximum queue
+and 17.3-second TTFT.
+
+Relative to the legacy prefix-aware router, the final router improves median
+throughput by 2.83% and branch-phase time by 2.75%. More importantly, the
+legacy third run fell to 1,193.2 tok/s with 13 preemptions, while all three
+final runs completed without preemption. Every final run recorded 64/64
+affinity routes, 64/64 cohort-locked routes, four balanced bootstrap routes,
+a 34/34 rank split, peak KV usage between 75.14% and 75.50%, and a maximum
+waiting queue of two.
+
+The generated common-analysis text is not guaranteed to be byte-identical
+across different DP schedules even with temperature zero. The compared runs
+do, however, use identical request counts, input/output token totals, length
+distribution, seed, model, KV capacity, backend, and CUDA Graph settings. The
+claims above use measured end-to-end timing rather than logical KV or CTA
+savings estimates.
+
+The host validation combined 31 prefix-router tests with the 22 targeted
+offload admission/planner tests introduced by the preceding offload commit;
+all 53 passed. The DP and offload patches touch disjoint implementation files.
+
 ## Experimental KV Reload Rebalance
 
 An additional experiment evaluated the default-off KV-reload Prefix Forest
