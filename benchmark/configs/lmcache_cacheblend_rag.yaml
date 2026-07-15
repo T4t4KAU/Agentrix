@@ -1,0 +1,10 @@
+chunk_size: 256
+local_cpu: true
+max_local_cpu_size: 8
+use_layerwise: true
+enable_blending: true
+save_unfull_chunk: true
+blend_special_str: "§CACHEBLEND§"
+blend_check_layers: [1]
+blend_recompute_ratios: [0.15]
+blend_min_tokens: 512

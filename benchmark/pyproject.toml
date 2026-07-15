@@ -24,17 +24,21 @@ test = ["pytest>=8.0", "langgraph>=1.2,<2"]
 [project.scripts]
 agentrix-bench = "cli:main"
 agentrix-langgraph = "langgraph_runner:main"
+agentrix-cacheblend-report = "cacheblend_rag_report:main"
+agentrix-langgraph-e2e-report = "langgraph_e2e_report:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 py-modules = [
   "accuracy",
   "api_runner",
+  "cacheblend_rag_report",
   "cli",
   "data",
   "metrics",
   "models",
   "langgraph_runner",
+  "langgraph_e2e_report",
   "reporting",
   "synthetic",
   "telemetry",
@@ -44,3 +48,4 @@ py-modules = [
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+pythonpath = ["src", "../application/src"]

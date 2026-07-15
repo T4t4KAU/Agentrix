@@ -10,6 +10,9 @@ LMCache integration, and the end-to-end benchmark suite in one repository:
 
 ## Documentation
 
+- [Agentrix system overview](docs/agentrix_system_overview.md)
+- [LangGraph end-to-end and ablation experiment](docs/langgraph_end_to_end_experiment.md)
+- [LangGraph Agent case design](docs/langgraph_case_design.md)
 - [AutoDL CUDA 12.8 build and benchmark guide](docs/autodl_build_and_benchmark.md)
 - [llama.cpp CUDA/MUSA ForkAttention build and runtime guide](docs/llama_cpp_forkattention_usage.md)
 - [llama.cpp EulerOS and CentOS adaptation notes](docs/llama_cpp_forkattention_hce_centos_adaptation.md)
@@ -273,6 +276,7 @@ vLLM build dependencies:
 cd benchmark
 uv venv --python 3.12 --seed
 source .venv/bin/activate
+uv pip install -e ../application
 uv pip install -e ".[data,test]"
 .venv/bin/python -m pytest
 .venv/bin/agentrix-bench inspect-data
