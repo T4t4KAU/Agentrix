@@ -124,41 +124,64 @@ OUTPUT_ROOT=results/dp_pressure32k_b32_crossdatasets_r1 \
 ./scripts/run_main_experiment.sh
 ```
 
-## Representative Route-Ownership Snapshot
+## Representative Route-Ownership Snapshots
 
 One diagnostic repeat of the AgentBoard Pressure32K/32 Fork prefix-aware
-variant was used to inspect the actual per-rank placement. This is a single
-illustrative run, not an additional performance repeat. The workload and
-request order were unchanged. After each routing decision, diagnostic-only
-logging hashed the first 4,096 prompt token IDs into an anonymous case
-fingerprint and recorded the selected DP rank. The fingerprint was computed
-after rank selection and was not an input to the router. Because this logging
-adds CPU and I/O overhead, its throughput is not used in the result tables.
+variant and one of the Flash ordinary-DP baseline were used to inspect actual
+per-rank placement. These are illustrative routing runs, not additional
+performance repeats. Both used the same seeded client workload and submission
+configuration as the formal runs. Concurrent HTTP handling and the
+prefix-aware arrival wave can change server dispatch order, so intermediate
+rows describe each run's observed order rather than paired requests.
 
-The two fingerprints below are labeled A and B. Fanout rows are cumulative and
-exclude the two bootstrap requests.
+After each routing decision, diagnostic-only logging hashed the first 4,096
+prompt token IDs into an opaque case fingerprint and recorded the selected DP
+rank. The fingerprint was computed after rank selection and was not an input
+to either router. The two stable fingerprints are labeled A and B below. Each
+log contained exactly 66 contiguous records: two distinct bootstrap requests,
+then 32 A branches and 32 B branches. Both runs completed 66/66 requests with
+zero preemptions. Because synchronous hashing and logging can perturb later
+load observations, diagnostic-run throughput is not used in the result tables.
 
-| Dispatch point | A to rank 0 | A to rank 1 | B to rank 0 | B to rank 1 | Total by rank |
+Fanout rows are cumulative and exclude the two bootstrap requests.
+
+| Variant / dispatch point | A to rank 0 | A to rank 1 | B to rank 0 | B to rank 1 | Total by rank |
 |---|---:|---:|---:|---:|---:|
-| Bootstrap, one request per case | 1 | 0 | 0 | 1 | 1 / 1 |
-| First 16 fanout requests | 12 | 0 | 0 | 4 | 12 / 4 |
-| First 32 fanout requests | 17 | 0 | 0 | 15 | 17 / 15 |
-| First 48 fanout requests | 31 | 0 | 0 | 17 | 31 / 17 |
-| All 64 fanout requests | 32 | 0 | 0 | 32 | 32 / 32 |
+| Prefix-aware: bootstrap | 1 | 0 | 0 | 1 | 1 / 1 |
+| Prefix-aware: first 16 fanout | 12 | 0 | 0 | 4 | 12 / 4 |
+| Prefix-aware: first 32 fanout | 17 | 0 | 0 | 15 | 17 / 15 |
+| Prefix-aware: first 48 fanout | 31 | 0 | 0 | 17 | 31 / 17 |
+| Prefix-aware: all 64 fanout | 32 | 0 | 0 | 32 | 32 / 32 |
+| Flash ordinary: bootstrap | 0 | 1 | 1 | 0 | 1 / 1 |
+| Flash ordinary: first 16 fanout | 5 | 6 | 3 | 2 | 8 / 8 |
+| Flash ordinary: first 32 fanout | 10 | 9 | 6 | 7 | 16 / 16 |
+| Flash ordinary: first 48 fanout | 13 | 13 | 11 | 11 | 24 / 24 |
+| Flash ordinary: all 64 fanout | 18 | 14 | 14 | 18 | 32 / 32 |
 
-The fixed shuffle therefore did not create two separate client streams or an
-artificially alternating arrival order: it produced substantial transient
-skew, including 12/4 and 31/17 cumulative splits. Nevertheless, every branch
-of prefix A followed its rank-0 owner and every branch of prefix B followed its
-rank-1 owner. Including bootstrap, the final route count was 33/33, with 64
-affinity routes and 64 cohort locks.
+Both variants therefore finish with a superficially perfect 33/33 total rank
+split after bootstrap. The composition is different. Prefix-aware routing
+keeps all 32 A branches on rank 0 and all 32 B branches on rank 1. Flash
+ordinary DP balances request counts but places both roots on both replicas:
+rank 0 receives 18 A and 14 B branches, while rank 1 receives 14 A and 18 B
+branches. Aggregate rank counts alone therefore cannot establish prefix
+locality.
 
-A server sample during the fanout dispatch window reported rank 0 with 31
-running and 0 waiting requests at 63.9% KV usage, and rank 1 with 16 running and
-0 waiting requests at 60.9% KV usage. The corresponding GPU telemetry sample
-reported 97% compute utilization on both GPUs. This is evidence of actual
-request ownership and concurrent device activity; it is not a claim that the
-two GPUs execute identical CTA sets at a single clock instant.
+The prefix-aware run's observed dispatch order contained substantial transient
+skew, including 12/4 and 31/17 cumulative rank splits, rather than an
+artificially alternating order. It still preserved the two prefix owners.
+Flash ordinary DP instead tracked its load score closely,
+reaching 8/8, 16/16, 24/24, and 32/32 while progressively mixing both cases
+across both ranks.
+
+Representative server samples confirm concurrent activity. During the
+prefix-aware dispatch window, rank 0 reported 31 running requests at 63.9% KV
+usage and rank 1 reported 16 at 60.9%, with both GPUs at 97% compute
+utilization. During the Flash run, rank 0 reported 2 running and 29 waiting at
+57.5% KV usage and rank 1 reported 1 running and 30 waiting at 55.9%, with both
+GPUs at 100% utilization. These records prove coordinator route ownership and
+concurrent device activity; they are not single-clock CTA or physical KV-block
+maps, and one diagnostic run must not be generalized to every ordinary-DP
+schedule.
 
 ## Current Router Behavior
 
