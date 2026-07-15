@@ -26,8 +26,8 @@ On the development machine, create and transfer a Git bundle:
 ```bash
 cd /path/to/Agentrix
 git bundle create /tmp/agentrix-main.bundle main
-scp -P 40658 /tmp/agentrix-main.bundle \
-  root@connect.westd.seetacloud.com:/root/autodl-tmp/
+scp -P <autodl-ssh-port> /tmp/agentrix-main.bundle \
+  root@<autodl-ssh-host>:/root/autodl-tmp/
 ```
 
 On the AutoDL host:
@@ -114,7 +114,7 @@ For example, transfer a prepared dependency directory with:
 ```bash
 tar -C /path/to/prepared-vllm-deps --exclude='*/.git' -cf - . \
   | pigz -p 16 -3 \
-  | ssh -p 40658 root@connect.westd.seetacloud.com \
+  | ssh -p <autodl-ssh-port> root@<autodl-ssh-host> \
       'mkdir -p /root/autodl-tmp/deps/vllm && \
        gzip -dc | tar -C /root/autodl-tmp/deps/vllm -xf -'
 ```

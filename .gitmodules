@@ -13,4 +13,4 @@
 [submodule "sglang"]
 	path = sglang
 	url = https://github.com/oyyyyy61/sglang.git
-	branch = main
+	branch = fork-attn

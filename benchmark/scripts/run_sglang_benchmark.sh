@@ -247,7 +247,7 @@ for ((rank = 0; rank < DP_REPLICAS; rank++)); do
     --port "${rank_port}"
     --served-model-name "${SERVED_MODEL_NAME}"
     --dtype "${DTYPE}"
-    --tp "${TP_SIZE}"
+    --tp-size "${TP_SIZE}"
     --context-length "${CONTEXT_LENGTH}"
     --mem-fraction-static "${MEM_FRACTION_STATIC}"
     --max-running-requests "${MAX_RUNNING_REQUESTS}"
