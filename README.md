@@ -351,6 +351,15 @@ VLLM_FORK_ATTN_CUDAGRAPH_CAPTURE_BUCKETS="common:4,8;forest:256,512,1024" \
 `server_profile.json` records CUDA Graph hit/miss counters and average
 ForkAttention metadata construction time for selecting these capacities.
 
+ForkAttention is intended for synchronized decode fanout, not arbitrary prompt
+batching: several active requests must consume the same resident physical KV
+prefix in the same decode step. On the evaluated GPU, use it primarily for
+4K-8K or longer shared prefixes with high shared-context ratio and at least two
+active siblings; 8-16 aligned branches have the strongest evidence. Single
+continuations, prefill, short prefixes, or unrelated round-robin cases should
+remain on FlashAttention. The exact boundary and KV-work model are documented
+in [the operator profile](docs/forkattention_operator_profile.md#applicability-boundary).
+
 Long-prefix tail batches use shape-aware adaptive splitting by default. The
 planner targets about two CTA waves only when the shared prefix is at least 4K
 tokens; wide cohorts retain the base 2K chunk. CUDA Graph runs select a matching

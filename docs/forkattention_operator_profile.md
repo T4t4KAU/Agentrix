@@ -24,6 +24,88 @@ implemented for both eager and CUDA Graph execution. The remaining work is:
 Gather fusion, raw metadata-copy bandwidth, and register-count reduction on
 their own are lower-return projects according to the current traces.
 
+## Applicability Boundary
+
+ForkAttention does not reduce the physical KV-cache footprint already shared
+by vLLM prefix caching. It reduces repeated GPU reads and attention work when
+multiple queries consume the same physical KV blocks in the same decode step.
+The relevant branch count is therefore not the number of requests submitted,
+but the effective cohort `B_eff`: sibling requests that are simultaneously
+active and still share a resident prefix.
+
+For one shared segment, a useful first-order model is:
+
+```text
+Flash KV work ~= B_eff * (P + S)
+Fork KV work  ~= ceil(B_eff / C) * P + B_eff * S + split/gather overhead
+C             = floor(32 / (H_q / H_kv))
+```
+
+Here `P` is the shared resident prefix, `S` is the mean private suffix plus
+generated context at the current step, and `C` is the maximum shared-query
+cohort per CTA. For both evaluated Qwen3 models, `H_q/H_kv=2` and `C=16`.
+The approximate KV-work saving before operator overhead is:
+
+```text
+1 - (ceil(B_eff / C) * P + B_eff * S) / (B_eff * (P + S))
+```
+
+For `P=8K` and `S=227`, this predicts 48.7% fewer KV reads at `B_eff=2` and
+91.2% at `B_eff=16`. The observed speedup is lower because model layers,
+private-suffix attention, split/gather, and scheduling remain. The reuse factor
+also saturates at `C`; requests above that count form additional cohorts.
+
+### Deployment Rule on the Evaluated `sm_120` GPU
+
+| Signal | Strong-benefit region | Weak or no-benefit region |
+|---|---|---|
+| Execution phase | Single-token causal decode | Prefill, chunked prefill, or a singleton common-analysis request |
+| Effective cohort | `B_eff >= 8` is strongly validated; `2-4` is a tail/moderate regime | `B_eff=1` cannot reuse a KV load |
+| Shared-prefix length | `P >= 4K`; 8K has the strongest controlled evidence | Around 1K or shorter does not amortize planning, partial-output, and gather work |
+| Shared fraction | Shared prefix dominates each request, preferably `P/(P+S) >= 0.8` | Long private suffixes or long generation make `S` dominate |
+| Scheduling | Siblings are case-major/cohort-aligned and decode together | Round-robin unrelated cases, staggered arrivals, preemption, or early branch completion reduce `B_eff` |
+| KV residency | The exact physical prefix blocks are resident and shared | Textually equal prompts that miss/evict/recompute the prefix provide no operator reuse |
+| Runtime | CUDA Graph enabled is preferred | Eager works, but the measured system-level gain is smaller |
+
+These are performance routing rules, not correctness restrictions. The backend
+continues to fall back to FlashAttention for unsupported or non-decode shapes.
+For a multi-level prefix tree, apply the same rule independently to each shared
+segment: a segment is valuable only while at least two active descendants
+consume it together.
+
+These performance thresholds are not all hard-coded today.
+`VLLM_FORK_ATTN_ADAPTIVE_SPLIT_MIN_TOKENS=4096` controls only extra tail
+splitting; it is not a Fork-versus-Flash routing threshold. The current backend
+can still enter an eligible short-prefix forest, so production routing should
+apply the table above until a clean prefix/branch sweep justifies an automatic
+selector.
+
+### Evidence Behind the Boundary
+
+- Strong positive control: one 8K/16 Qwen3-0.6B cohort improves branch-phase
+  throughput by 3.57x and end-to-end throughput by 2.30x versus
+  FlashAttention. Qwen3-1.7B improves output throughput by 106.15% in the
+  corrected one-case validation.
+- Multi-case positive control: case-major 8K/16 Qwen3-1.7B improves by 23.86%
+  without explicit prefix warm-up and by 48.85% with forest CUDA Graphs.
+- Short-prefix negative control: the historical 1K/8 smoke run changes branch
+  throughput by -1.71% and TPOT by +2.67%; it is not a reason to route short
+  prefixes to ForkAttention.
+- Scheduling negative control: the original mixed-prefix round-robin matrix
+  was flat or slower despite reporting over 90% logical KV saving, because
+  siblings rarely reached decode together and prefix-cache hits were near
+  zero. Logical tree similarity alone is insufficient.
+- Tail regime: the 8K/two-request adaptive policy improves ForkAttention over
+  its static split policy by 10.29% with CUDA Graphs, but a matched current
+  Fork-versus-Flash sweep is still needed before assigning a backend speedup to
+  all two-request workloads.
+
+Accordingly, the current high-confidence target is a long-lived agent fanout:
+one cached 4K-8K or longer context spawning several tool/reasoning branches
+that remain concurrently decoded. Ordinary chat with one continuation,
+prefill-heavy serving, short prompts, or unrelated batched users should stay on
+FlashAttention.
+
 ## Profile Configuration
 
 | Setting | Value |
