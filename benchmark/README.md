@@ -21,6 +21,50 @@ OUTPUT_TOKENS=64 \
 DRY_RUN=1 ./scripts/run_vllm_fanout_matrix.sh
 ```
 
+## LangGraph RAG Agent Benchmark
+
+Install the optional Agent dependency and run a live graph against an
+OpenAI-compatible Agentrix vLLM server:
+
+```bash
+uv pip install -e ".[agent,test]"
+
+.venv/bin/agentrix-langgraph live \
+  --base-url http://127.0.0.1:9000/v1 \
+  --model qwen3-0.6b \
+  --task-file configs/langgraph_agent_tasks.jsonl \
+  --cases 1 \
+  --branches 16 \
+  --rag-root ../docs \
+  --bootstrap-chunks 24 \
+  --bootstrap-max-chars 30000 \
+  --concurrency 16 \
+  --output results/langgraph/live.json
+```
+
+The graph performs an initial retrieval over real local files, plans over the
+retrieved evidence, fans out parallel research branches, requires every branch
+to issue an OpenAI function call to `rag_search`, feeds each tool result back
+to the model, and reduces the branch answers. The live result records every
+exact LLM request and tool result.
+
+Use dependency-ordered replay for fair backend comparisons. It preserves the
+captured request bodies and runs `planner -> parallel tool calls -> parallel
+reflections -> reducer` without carrying live orchestration idle time into the
+backend measurement:
+
+```bash
+.venv/bin/agentrix-langgraph replay \
+  --base-url http://127.0.0.1:9000/v1 \
+  --model qwen3-0.6b \
+  --trace results/langgraph/live.json \
+  --concurrency 16 \
+  --output results/langgraph/replay.json
+```
+
+Set `--timing captured` only when reproducing the original absolute arrival
+timeline. It is not the default throughput comparison mode.
+
 The default model is `Qwen/Qwen3-0.6B`. Set `MODEL_PATH` to use another
 Hugging Face model or a local model directory. All output is written under
 the Git-ignored `results/` directory. The vLLM script writes one subdirectory

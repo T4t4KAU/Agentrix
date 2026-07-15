@@ -15,11 +15,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+agent = [
+  "langgraph>=1.2,<2",
+]
 data = ["datasets>=2.19", "huggingface_hub>=0.23"]
-test = ["pytest>=8.0"]
+test = ["pytest>=8.0", "langgraph>=1.2,<2"]
 
 [project.scripts]
 agentrix-bench = "cli:main"
+agentrix-langgraph = "langgraph_runner:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -30,6 +34,7 @@ py-modules = [
   "data",
   "metrics",
   "models",
+  "langgraph_runner",
   "reporting",
   "synthetic",
   "telemetry",
