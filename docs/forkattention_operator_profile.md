@@ -247,24 +247,31 @@ group is not eligible shared decode.
 ### Wide-Cohort Guardrail
 
 The 8K-prefix, 16-branch guardrail uses the same model and server settings,
-with concurrency and branch-group size both set to 16. In the four-case
-aggregate, the adaptive policy leaves the physical plan unchanged: both runs
-record 2,569 shared CTAs, 9,298 singleton CTAs, and 561 active Fork steps.
+with concurrency and branch-group size both set to 16. The four-case aggregate
+was run with CUDA Graphs both enabled and disabled.
 
-| Metric | Static chunks | Adaptive policy | Change |
-|---|---:|---:|---:|
-| Branch-phase wall time | 3,586.12 ms | 3,592.19 ms | +0.17% |
-| Branch output throughput | 2,284.36 tok/s | 2,280.50 tok/s | -0.17% |
-| End-to-end output throughput | 1,373.14 tok/s | 1,369.96 tok/s | -0.23% |
-| TPOT P50 | 6.07 ms | 6.08 ms | +0.22% |
-| TTFT P50 | 112.80 ms | 115.95 ms | +2.79% |
+| Execution | Metric | Static chunks | Adaptive policy | Change |
+|---|---|---:|---:|---:|
+| CUDA Graph on | Branch-phase wall time | 3,586.12 ms | 3,592.19 ms | +0.17% |
+| CUDA Graph on | Branch output throughput | 2,284.36 tok/s | 2,280.50 tok/s | -0.17% |
+| CUDA Graph on | End-to-end output throughput | 1,373.14 tok/s | 1,369.96 tok/s | -0.23% |
+| CUDA Graph on | TPOT P50 | 6.07 ms | 6.08 ms | +0.22% |
+| CUDA Graph on | TTFT P50 | 112.80 ms | 115.95 ms | +2.79% |
+| CUDA Graph off | Branch-phase wall time | 5,320.30 ms | 5,288.08 ms | -0.61% |
+| CUDA Graph off | Branch output throughput | 1,539.76 tok/s | 1,549.14 tok/s | +0.61% |
+| CUDA Graph off | End-to-end output throughput | 1,046.93 tok/s | 1,049.73 tok/s | +0.27% |
+| CUDA Graph off | TPOT P50 | 9.50 ms | 9.46 ms | -0.40% |
+| CUDA Graph off | TTFT P50 | 123.06 ms | 110.38 ms | -10.31% |
 
 Two independent one-case repeats show a mean branch-throughput decrease of
 0.55% and TPOT increase of 0.75%. The longer four-case result and identical CTA
 counts show no meaningful wide-cohort regression: with 16 active requests the
 base four-chunk plan already supplies the target CTA count, so adaptive
-splitting does not activate. The TTFT movement is outside the decode-only
-policy and is treated as run-to-run noise.
+splitting does not activate. Graph-on telemetry is exactly identical at 2,569
+shared CTAs, 9,298 singleton CTAs, and 561 active Fork steps. Eager telemetry
+has 564 versus 561 active steps, which explains its small total-CTA difference;
+the per-step topology remains unchanged. The TTFT movements in both directions
+are outside the unchanged decode plan and are treated as run-to-run noise.
 
 The artifacts are under
 `benchmark/results/investigation_20260715/{graph,eager}_c4_b2_adaptive*/` and
@@ -284,7 +291,7 @@ the `sm_120` default from this result.
 
 | Priority | Optimization | Evidence and expected scope | Main risk |
 |---|---|---|---|
-| Implemented; monitor | Adaptive prefix split-K / CTA count | The new two-wave policy improves two-request branch throughput by 10.29% with CUDA Graphs and 2.21% in eager mode. The 16-request guardrail changes throughput by only -0.17% and leaves CTA counts identical. | Mixed request counts and irregular completion order still need longer validation. |
+| Implemented; monitor | Adaptive prefix split-K / CTA count | The new two-wave policy improves two-request branch throughput by 10.29% with CUDA Graphs and 2.21% in eager mode. The 16-request guardrail changes throughput by -0.17% with graphs and +0.61% in eager mode, with no topology change. | Mixed request counts and irregular completion order still need longer validation. |
 | P1 validation | Classify and convert eligible Flash fallbacks | Flash kernels remain 231.20 ms, but launch arithmetic assigns the largest group to 64 singleton decode steps. Use reason counters before extending coverage. | Prefill, no-sharing, and unsupported shapes should continue to fall back for correctness. |
 | P1 | `sm_120` tile autotuning | `N=32` uses less shared memory than `N=64`, but regresses branch throughput by 1.69% in the measured two-request eager shape. Keep automatic `N=64` and sweep other cohort/KV lengths before adding an architecture table. | `N=32` doubles loop iterations and can regress once adaptive splitting supplies enough CTAs. |
 | P1 | K/V load-path and cache-efficiency tuning | 61.86% DRAM versus 11.57% compute confirms memory pressure. Inspect sector utilization/replay in a full-cohort NCU sample before changing vectorization or page traversal. | The current algorithm already removes most repeated bytes; micro-tuning has a lower ceiling than CTA/fallback work. |
