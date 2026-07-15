@@ -147,15 +147,15 @@ OUTPUT_ROOT=results/main_experiment_full32 \
 
 ## Data Parallel
 
-The current group compares ForkAttention ordinary DP with the final
-capacity-aware prefix router on two internal DP ranks. The obsolete
-Flash/Fork/legacy-router shape matrix is not part of the current result.
+The current group compares FlashAttention ordinary DP, ForkAttention ordinary
+DP, and ForkAttention with the final capacity-aware prefix router on two
+internal DP ranks.
 
-The validation contains three paired Warm8K repetitions and three repetitions
-per variant for Pressure16K, for 12 variant runs in total. Both variants pin
-3,852 KV blocks per rank, enable Prefix Forest CUDA Graphs, and disable
-offload, fanout admission, and reload rebalance. Exact portable commands and
-the required alternating run order are documented in
+The validation contains one three-way Adaptive16K run and two repetitions per
+variant for Pressure32K/32, for nine variant runs in total. All variants pin
+3,852 KV blocks per rank, use the same workload and physical KV capacity, and
+disable offload and reload rebalance. ForkAttention runs enable Prefix Forest
+CUDA Graphs. The exact setup and current results are documented in
 [`dp_experiment_results.md`](dp_experiment_results.md).
 
 ## TP Accuracy

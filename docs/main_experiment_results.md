@@ -12,16 +12,15 @@ The high-value run uses all four bundled datasets: SWE-bench Verified,
 AgencyBench, AgentBoard, and AppWorld. It retains the complete Qwen3-1.7B
 8K/16K by 8/16-branch grid on AgentBoard and AppWorld, adds cross-dataset
 16K/16 stress replications, and validates Llama-3.2-1B on the same stress
-shape. The two-rank Qwen3-8B DP result uses paired Warm8K and
-pressure-oriented 16K validation of the current capacity-aware routing policy.
-Qwen3-14B TP accuracy uses the maximum 16K/32 shape.
+shape. The two-rank Qwen3-8B DP result uses the current adaptive-graph path at
+16K/16 and 32K/32. Qwen3-14B TP accuracy uses the maximum 16K/32 shape.
 
 The Qwen single-GPU core grid consumes all 9 AgentBoard and 13 AppWorld
 records. Its AgencyBench 8K/8 cell uses 32 records; all 16K/16 stress
-replications use eight records. The current DP validation uses four
-AgencyBench cases per run. TP accuracy uses the first eight records per
-dataset. Every comparison within a cell uses identical prompts, and reported
-cross-cell means are unweighted.
+replications use eight records. Adaptive16K uses four AgencyBench cases per
+run; Pressure32K/32 uses two cases and 32 branches per case. TP accuracy uses
+the first eight records per dataset. Every comparison within a cell uses
+identical prompts, and reported cross-cell means are unweighted.
 
 The experimental KV reload rebalance feature is disabled throughout. The DP
 comparison isolates the stable prefix-aware routing path.
@@ -54,17 +53,20 @@ settings can be selected through `PREFIX_LENGTHS` and `BRANCH_COUNTS`.
 
 ### Data Parallel
 
-Model: Qwen3-8B on two internal DP ranks. The current validation uses four
-cases, 16 branches per case, and either an exact warm 8K prefix or a shuffled,
-non-warmed 16K pressure workload.
+Model: Qwen3-8B on two internal DP ranks. Adaptive16K uses four shuffled cases
+with 16 branches each; Pressure32K/32 uses two shuffled cases with 32 branches
+each. Neither workload explicitly warms the shared prefix.
 
 Variants:
 
 - ForkAttention with ordinary DP and no offload
 - ForkAttention with the final capacity-aware DP router and no offload
+- FlashAttention with ordinary DP and no offload, as an adaptive follow-up
+  baseline
 
-Both variants use the same ForkAttention backend, CUDA Graph settings, and
-physical KV capacity. The client does not force a data-parallel rank.
+The two routing variants use the same ForkAttention backend, CUDA Graph
+settings, and physical KV capacity. The FlashAttention baseline retains the
+same workload and KV capacity. The client does not force a data-parallel rank.
 
 The current capacity-aware router bypasses prefix hashing and arrival waves
 for prompts smaller than 20% of one rank's KV capacity. For eligible long
@@ -132,8 +134,8 @@ MODE=tp_accuracy MODEL_SPECS='qwen3-14b|/path/to/Qwen3-14B' \
   ./scripts/run_main_experiment.sh
 ```
 
-The current Warm8K and Pressure16K DP commands, including the two-variant
-restriction and routing controls, are in
+The current Adaptive16K and Pressure32K/32 DP setup, routing controls, and
+results are recorded in
 [`dp_experiment_results.md`](dp_experiment_results.md). The generic `MODE=dp`
 defaults must not be used as evidence for the current router.
 
@@ -170,7 +172,7 @@ the lowest observed backend capacity.
 | Group | Hardware | CUDA | Executed coverage |
 |---|---|---|---|
 | Single GPU | RTX 5070 12 GiB | 13.0 build | 75 runs: Qwen complete grid on AgentBoard/AppWorld; Qwen and Llama 16K/16 stress replications on four datasets |
-| Data parallel | 2x RTX 5090 32 GiB | 12.8 | 12 focused Qwen3-8B runs: paired Warm8K and repeated Pressure16K comparisons |
+| Data parallel | 2x RTX 5090 32 GiB | 12.8 | 9 focused Qwen3-8B runs: Adaptive16K three-way validation and two-repeat Pressure32K/32 comparisons |
 | TP accuracy | 2x RTX 5090 32 GiB | 12.8 | 12 standard Qwen3-14B 16K/32 runs plus two Flash repeatability controls |
 
 Single-GPU comparisons pin 1,700 GPU blocks and an 8 GiB CPU offload cache.
@@ -362,24 +364,37 @@ When explicitly enabled, a hot shared prefix is backed up at normal pressure;
 the GPU copy remains resident and the backup becomes useful only if later GPU
 allocation pressure evicts it.
 
-The same 16K/16 four-root experiment was repeated three times after the fix.
-These production measurements used `FANOUT_PROFILE=0`; per-step fanout logging
-was used only in separate diagnostic runs because it writes one detailed line
-per scheduler step and materially perturbs the optimized variant.
+The same 16K/16 four-root experiment was repeated three times after the fix and
+again on the current checkout. These production measurements used
+`FANOUT_PROFILE=0`; per-step fanout logging was used only in separate diagnostic
+runs because it writes one detailed line per scheduler step and materially
+perturbs the optimized variant. The current three-run medians are:
 
 | Variant | Output tok/s | Branch TTFT P50 | Branch TPOT P50 | KV load | Load ops | KV store | Store ops | Fork active steps |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Fork scheduled ordinary offload | 518.86 | 10,702.94 ms | 12.10 ms | 11.88 GiB | 11 | 8.26 GiB | 103 | 73.34% |
-| Fork optimized offload | 626.13 | 7,552.10 ms | 12.08 ms | 8.89 GiB | 7 | 8.15 GiB | 135 | 80.68% |
+| Flash ordinary offload | 240.88 | 23,747.12 ms | 51.36 ms | 10.71 GiB | 7 | 8.26 GiB | 103 | - |
+| Fork ordinary offload | 549.37 | 10,959.79 ms | 12.50 ms | 9.59 GiB | 9 | 8.26 GiB | 103 | 73.03% |
+| Fork scheduled ordinary offload | 514.64 | 10,538.35 ms | 12.57 ms | 10.45 GiB | 11 | 8.26 GiB | 103 | 83.41% |
+| Fork optimized offload | 616.45 | 7,521.23 ms | 12.56 ms | 8.87 GiB | 5 | 8.15 GiB | 137 | 81.00% |
 
-Across paired runs, optimized offload improves throughput by 22.51%, reduces
-TTFT by 27.84%, reduces CPU-to-GPU KV load by 25.84%, and leaves TPOT
-effectively unchanged (-0.10%). All three throughput pairs are positive
-(+7.00%, +22.51%, and +24.88%). The ordinary control remains close to its
-pre-fix median, while optimized throughput rises from 386.25 to 626.13 tok/s;
-this rules out a generally faster machine run as the explanation. The higher
-optimized store-operation count is a remaining small-transfer/job-overhead
-target even though total store bytes fall by 1.37%.
+Across paired current-checkout runs, optimized offload improves throughput by
+19.78%, reduces TTFT by 31.74%, reduces CPU-to-GPU KV load by 15.12%, and
+leaves TPOT effectively unchanged (-0.48%). All three throughput pairs are
+positive (+23.75%, +19.78%, and +13.54%). The complete optimized system is
+156.89% faster than Flash ordinary offload, while changing only FlashAttention
+to ForkAttention with the ordinary connector improves throughput by 128.93%.
+The former is a system-level result; the latter is the cleaner backend
+comparison. The optimized and scheduled throughput medians are within 1.6% of
+the earlier 626.13 and 518.86 tok/s validation, respectively, although the new
+paired reload reduction is smaller than the earlier 25.84% estimate. The higher
+optimized store-operation count remains a small-transfer/job-overhead target
+even though total store bytes are about 1.3% lower.
+
+This is a dataset-seeded systems benchmark rather than an AgentBoard task-score
+evaluation: four real records provide the root content, after which the harness
+pads each root to the controlled 16K prefix and creates 16 suffix branches.
+It therefore tests the intended long-prefix, multi-branch Agent serving shape,
+but does not by itself establish end-to-end Agent task quality.
 
 The LMCache three-tier path had a separate set of correctness and admission
 problems:
@@ -442,45 +457,50 @@ specific to Qwen3.
 
 ## Data-Parallel Results
 
-### Current Capacity-Aware Router Follow-up
+### Current Adaptive Forest Results
 
-The current router was retested on two RTX 5090 GPUs with Qwen3-8B FP16, two
-internal DP ranks, ForkAttention on both variants, Prefix Forest CUDA Graphs,
-3,852 KV blocks per rank, `max_num_seqs=64`, and no offload. Each run contains
-four cases and 16 branches per case at concurrency 64, with a deterministic
-lognormal mean-256 suffix, 256 output tokens, and seed 2026. The only policy
-difference is ordinary DP versus the final capacity-aware prefix router.
+Adaptive CTA planning exposed a Prefix Forest CUDA Graph capacity bug: a
+`forest-64` selection could expand beyond 64 runtime CTAs. The repaired server
+path makes bucket selection
+adaptive-aware and constrains the final plan to the captured CTA and split
+capacities. The default adaptive configuration then completed the three-way
+16K comparison and a 32K-prefix, 32-branch-per-case extension without graph
+mismatch, preemption, OOM, or request failure.
 
-| Scenario / variant | Branch tok/s runs | Median | Branch phase | TTFT P50 | TPOT P50 | Peak KV | Max waiting | Preemptions |
-|---|---|---:|---:|---:|---:|---:|---:|---:|
-| Warm8K, ordinary DP | 2,142.3 / 2,124.5 / 2,014.0 | 2,124.5 | 7,711.8 ms | 1,002.3 ms | 24.73 ms | 76.40% | 14 | 0 |
-| Warm8K, final router | 2,210.3 / 2,116.7 / 2,021.3 | 2,116.7 | 7,740.2 ms | 1,003.4 ms | 23.82 ms | 76.53% | 14 | 0 |
-| Pressure16K, ordinary DP | 443.6 / 385.8 / 454.3 | 443.6 | 36,937.9 ms | 17,253.2 ms | 21.66 ms | 88.28% | 56 | 0 |
-| Pressure16K, final router | 1,677.2 / 1,689.4 / 1,716.0 | 1,689.4 | 9,698.4 ms | 1,432.5 ms | 31.32 ms | 75.19% | 2 | 0 |
+The following table reports branch-only output throughput.
 
-Warm8K uses an exact warm prefix and case-major order. All 72 requests per run
-take the native small-prompt bypass, so the final policy is neutral within
-variance: -0.37% branch throughput, +0.37% branch-phase time, +0.11% TTFT P50,
-and -3.67% TPOT P50 relative to ordinary DP. This is intentional; the current
-router does not impose prefix hashing or an arrival wave where a rank has
-enough capacity for the short prompt.
+| Scenario / variant | Branch tok/s runs | Median | Branch phase | TTFT P50 | TPOT P50 | Peak KV |
+|---|---|---:|---:|---:|---:|---:|
+| Adaptive16K, Flash ordinary DP | 496.3 | 496.3 | 33,009.4 ms | 16,357.7 ms | 23.45 ms | 89.04% |
+| Adaptive16K, Fork ordinary DP | 424.1 | 424.1 | 38,634.7 ms | 18,212.5 ms | 22.77 ms | 87.60% |
+| Adaptive16K, Fork prefix-aware DP | 1,529.1 | 1,529.1 | 10,714.6 ms | 1,413.3 ms | 35.05 ms | 75.10% |
+| Pressure32K/32, Flash ordinary DP | 394.7 / 212.6 | 303.7 | 59,284.8 ms | 32,462.9 ms | 25.47 ms | 59.01% |
+| Pressure32K/32, Fork ordinary DP | 264.8 / 377.9 | 321.3 | 52,619.6 ms | 29,645.3 ms | 21.88 ms | 59.74% |
+| Pressure32K/32, Fork prefix-aware DP | 1,570.1 / 1,611.9 | 1,591.0 | 10,299.8 ms | 2,153.2 ms | 26.82 ms | 72.62% |
 
-Pressure16K uses no explicit warmup and a deterministic four-case shuffle.
-Here the final router improves median branch throughput by 280.87% (3.81x),
-reduces branch-phase time by 73.74%, reduces TTFT P50 by 91.70%, and lowers
-peak KV usage by 13.09 percentage points. Every final run records 64/64
-affinity routes and cohort locks, a balanced 34/34 request split, at most two
-waiting requests, and zero preemptions.
+Adaptive16K prefix-aware ForkAttention reaches 3.08x Flash ordinary DP and
+3.61x Fork ordinary DP branch throughput in the repair-validation run. For
+Pressure32K/32, the two prefix-aware runs vary by only 2.67% and finish with an
+exact 33/33 rank allocation; both 32K prefix owners are balanced and all 64
+post-bootstrap requests preserve prefix affinity. Ordinary ForkAttention and
+FlashAttention show much larger run-to-run variation, so the 32K evidence is
+best read as stable prefix-aware throughput above 1,570 branch tok/s rather
+than as a single maximum speedup ratio. The paired gain over ordinary
+ForkAttention ranges from 4.27x to 5.93x.
 
-The final router's higher TPOT P50 does not contradict the throughput gain.
-Ordinary DP leaves up to 56 requests waiting before decode and has a
-17.3-second TTFT P50, while the routed cohort starts promptly and keeps both
-ranks occupied.
+The measured shared prefix is 32,850 tokens after chat formatting. The service
+uses a conservative 42,560-token configured limit because the harness adds a
+25% tokenizer margin, while measured request lengths remain below the model's
+declared 40,960-token position limit. The adaptive capacity repair is currently
+an uncommitted server-side vLLM patch; it must be synchronized before the new
+rows are reproducible from a clean checkout.
 
-The evidence supports a scoped claim: the current router is neutral for
-bypassed 8K traffic and high-value under long-prefix memory pressure; it is
-not expected to accelerate every DP request. Detailed routing activity,
-pressure-run methodology, and validation notes are recorded in
+The evidence supports a scoped claim: the current router is high-value for the
+tested long-prefix memory-pressure shapes, but it is not expected to accelerate
+every DP request. Pressure32K/32 shows stable cohort placement under higher
+fanout, but covers one controlled AgencyBench-derived stress shape rather than
+a broad workload average. Detailed routing activity, pressure-run methodology,
+and validation notes are recorded in
 [`dp_experiment_results.md`](dp_experiment_results.md).
 
 ## TP Accuracy Guardrail
