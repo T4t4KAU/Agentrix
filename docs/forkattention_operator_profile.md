@@ -13,10 +13,12 @@ The main result is that ForkAttention is already effective for the intended
 8K-prefix, 16-branch workload. In the matched Nsight Systems captures, total
 attention kernel time falls from 1,661.09 ms to 404.85 ms, a 4.10x reduction.
 Attention accounts for 97.65% of the total GPU-kernel time saved. The most
-valuable remaining work is therefore not a wholesale kernel rewrite, but:
+valuable remaining work is therefore not a wholesale kernel rewrite. The
+first high-return item, tail-adaptive prefix splitting, has now been
+implemented for both eager and CUDA Graph execution. The remaining work is:
 
-1. create more useful CTAs for long-KV, small-cohort tail steps;
-2. reduce the decode attention work that still falls back to FlashAttention;
+1. validate the policy on wider cohorts and mixed-case concurrency;
+2. classify fallback reasons before extending backend coverage;
 3. autotune the existing tile choices for `sm_120` and similar devices.
 
 Gather fusion, raw metadata-copy bandwidth, and register-count reduction on
@@ -83,9 +85,9 @@ Three conclusions follow from this breakdown:
 - The speedup is caused by eliminating repeated attention work and KV reads,
   not by reducing the total launch count. Total launches fall by only 1.89%.
 - The remaining Flash split/combine kernels are 31.35% of all Fork-run GPU
-  time and 57.11% of its attention time. Some are required prefill or singleton
-  fallbacks, but eligible decode graph misses and incomplete cohorts are a
-  large target.
+  time and 57.11% of its attention time, but launch-count analysis indicates
+  that most are not eligible shared decode work. They must not be treated as a
+  31.35% optimization opportunity without per-reason counters.
 - Once attention is reduced, non-attention model work becomes 45.11% of the
   Fork capture. This is an Amdahl-law floor for operator-only optimization.
 
@@ -104,6 +106,26 @@ GPU optimization in this capture. Production graph-hit paths already use
 persistent device workspaces; any metadata project should first measure graph
 hit rate, host planning/allocation time, and step latency rather than treating
 CPU API duration as transfer time.
+
+### Reclassification of Remaining FlashAttention Work
+
+The earlier profile grouped every FlashAttention kernel in the Fork run as a
+possible backend miss. The per-specialization launch counts allow a narrower
+interpretation:
+
+- The largest remaining Flash split kernel has 1,792 launches, exactly
+  `64 decode steps x 28 model layers`. The benchmark has a 64-token singleton
+  common-generation phase, where there is no sibling request with which to
+  share KV reads. Its matching combine kernel also has 1,792 launches.
+- The other Flash split kernels have 280 and 112 launches, or 10 and 4
+  complete 28-layer passes. Their template shapes and placement are consistent
+  with prefill/chunked-prefill and setup work rather than a shared decode
+  cohort.
+
+This is an inference from the launch arithmetic and benchmark trace, not a
+per-request kernel label. The new `PROFILE_FORK=1` reason counters should be
+used in the next capture to confirm it. Until then, extending ForkAttention to
+more fallback paths is P1 validation work rather than an assumed P0 speedup.
 
 ## Nsight Compute Tail-Kernel Analysis
 
@@ -150,19 +172,99 @@ The operator has two distinct regimes:
   synchronization inside the K/V pipeline prevents that one warp from hiding
   latency. This is the clearest remaining kernel bottleneck.
 
-The current implementation already contains the mechanisms needed to address
-much of this: split outputs and a gather kernel, `M/N/warp` specializations
-including `N=32`, CUDA Graph workspace buckets, and forest plans. The missing
-piece is measured shape-aware selection rather than a single static prefix
-chunk and the current coarse cohort/KV-length thresholds.
+The implementation contains the mechanisms needed to address much of this:
+split outputs and a gather kernel, `M/N/warp` specializations including
+`N=32`, CUDA Graph workspace buckets, and forest plans. Shape-aware prefix
+splitting is now implemented; measured tile selection remains.
+
+## Implemented Tail-Adaptive Split Policy
+
+The implementation now targets about two CTA waves only for long-prefix,
+small-cohort decode. The default policy is:
+
+- retain the 2,048-token base chunk for short prefixes and already-wide
+  cohorts;
+- enable adaptive splitting at 4,096 prefix tokens;
+- estimate physical CTA demand from active requests, Q/KV head ratio, KV-head
+  count, and the device SM count;
+- cap common-prefix CUDA Graph plans to captured `4,8,12` chunk buckets and
+  forest plans to the gather kernel's 32 splits per request;
+- set `VLLM_FORK_ATTN_TARGET_CTA_WAVES=0` to reproduce the static policy.
+
+CUDA Graph state changes the planning mechanism, so both paths were changed:
+
+| Execution mode | Planning path | Adaptive behavior |
+|---|---|---|
+| CUDA Graph enabled | Scheduler selects a captured common/forest capacity, then the metadata builder fills a persistent device workspace. | Scheduler and runtime use the same request/head geometry. An 8K, two-request common prefix selects `common:12` instead of being capped at `common:4`. |
+| CUDA Graph disabled | The metadata builder constructs a prefix trie and dynamic forest boxes for the current batch. | Long shared segments are re-chunked before packing; the same two-request shape produces 10 shared-prefix boxes plus two suffix boxes. |
+
+This separation matters: changing only the runtime chunk size is ineffective
+if the CUDA Graph scheduler has already selected a four-chunk workspace.
+
+### CUDA Graph On/Off A/B
+
+The matched service benchmark uses four 8K-prefix AgentBoard cases, two equal
+branches per case, concurrency two, 128 output tokens per branch, Qwen3-0.6B
+FP16, `max_model_len=10240`, and `max_num_seqs=32`. The static control sets
+target waves to zero; the candidate uses the default target of two. Tile
+override is disabled in both.
+
+| Execution | Metric | Static chunks | Adaptive chunks | Change |
+|---|---|---:|---:|---:|
+| CUDA Graph on | Branch-phase wall time | 3,063.60 ms | 2,777.67 ms | -9.33% |
+| CUDA Graph on | Branch output throughput | 334.25 tok/s | 368.65 tok/s | +10.29% |
+| CUDA Graph on | End-to-end output throughput | 192.44 tok/s | 201.77 tok/s | +4.85% |
+| CUDA Graph on | TPOT P50 | 5.68 ms | 5.11 ms | -9.89% |
+| CUDA Graph on | TTFT P50 | 41.97 ms | 42.37 ms | +0.97% |
+| CUDA Graph off | Branch-phase wall time | 3,415.47 ms | 3,341.52 ms | -2.17% |
+| CUDA Graph off | Branch output throughput | 299.81 tok/s | 306.45 tok/s | +2.21% |
+| CUDA Graph off | End-to-end output throughput | 175.33 tok/s | 177.83 tok/s | +1.43% |
+| CUDA Graph off | TPOT P50 | 6.35 ms | 6.19 ms | -2.57% |
+| CUDA Graph off | TTFT P50 | 48.43 ms | 49.25 ms | +1.71% |
+
+Two independent one-case repeats provide a consistency check. With CUDA Graphs
+enabled, their mean branch throughput improves by 8.80% and mean TPOT falls by
+8.63%; both repeats move in the same direction. With graphs disabled, the
+corresponding means move by only +1.12% and -1.41%, with one adaptive repeat
+faster and one slower. The four-case eager result is positive, but materially
+less robust than the graph result.
+
+CUDA Graph capture completed for both FULL and PIECEWISE graphs. Plan telemetry
+confirms that the four-case run raises shared CTAs from 2,579 to 4,154 while
+singleton CTAs remain effectively unchanged. The eager dynamic forest raises
+shared CTAs from 2,579 to 4,146. A profiling-only eager run measures about
+0.65-0.67 ms of forest metadata construction for both policies, so the smaller
+eager gain is not explained by extra adaptive planner time. The likely causes
+are dilution by uncaptured model/launch overhead and the different persistent
+common-plan versus dynamic-forest kernel topologies.
+
+Before the two-request branch phase, the reason log records 63
+`single_request` steps, 9 `non_decode` steps, and 1 `no_shared_kv` step; Fork
+telemetry subsequently records 126 active two-request steps. This independently
+supports the launch-count inference that the largest remaining FlashAttention
+group is not eligible shared decode.
+
+The artifacts are under
+`benchmark/results/investigation_20260715/{graph,eager}_c4_b2_adaptive*/` and
+the one-case repeats are in the nearby `graph_b2_*` and `eager_b2_*`
+directories.
+
+### Tail Tile A/B
+
+For the same four-case eager workload with adaptive splitting enabled, forcing
+`N=32` instead of the automatic `N=64` tail tile reduces branch throughput by
+1.69% and increases TPOT by 1.60%. Smaller shared-memory residency does not
+offset the extra loop work after adaptive splitting has supplied enough CTAs.
+The override remains available for other shapes, but `N=32` is not selected as
+the `sm_120` default from this result.
 
 ## Optimization Priority
 
 | Priority | Optimization | Evidence and expected scope | Main risk |
 |---|---|---|---|
-| P0 | Adaptive prefix split-K / CTA count | Tail sample launches only 56 CTAs on 48 SMs and is strongly imbalanced. Reduce the 2,048-token chunk only when a long-KV launch would provide fewer than roughly two CTA waves. High expected return for 1-4 request tail steps; end-to-end return depends on their time share. | Extra partial-output traffic and gather work can erase the gain if applied to wide cohorts. |
-| P0 | Convert eligible Flash fallbacks | Flash kernels remain 231.20 ms, 31.35% of total Fork GPU time. Track fallback reasons separately and extend forest/graph bucket coverage for shared decode steps. High system-level return when fallback is caused by scheduling or graph coverage. | Prefill, no-sharing, and unsupported shapes should continue to fall back for correctness. |
-| P0/P1 | `sm_120` tile autotuning | The existing `M=16,N=32,warps=1` specialization needs about 20 KiB shared memory versus about 36 KiB for `N=64`, potentially allowing more resident blocks once adaptive splitting supplies them. Benchmark `N=32` and `N=64` by cohort size and KV length, then dispatch from a measured table. | `N=32` doubles loop iterations and can regress well-populated grids. |
+| Implemented; broaden | Adaptive prefix split-K / CTA count | Tail sample launches only 56 CTAs on 48 SMs and is strongly imbalanced. The new two-wave policy improves branch throughput by 10.29% with CUDA Graphs and 2.21% in eager mode on the four-case workload. | Extra partial-output traffic and gather work can erase the gain if applied to wide cohorts. |
+| P1 validation | Classify and convert eligible Flash fallbacks | Flash kernels remain 231.20 ms, but launch arithmetic assigns the largest group to 64 singleton decode steps. Use reason counters before extending coverage. | Prefill, no-sharing, and unsupported shapes should continue to fall back for correctness. |
+| P1 | `sm_120` tile autotuning | `N=32` uses less shared memory than `N=64`, but regresses branch throughput by 1.69% in the measured two-request eager shape. Keep automatic `N=64` and sweep other cohort/KV lengths before adding an architecture table. | `N=32` doubles loop iterations and can regress once adaptive splitting supplies enough CTAs. |
 | P1 | K/V load-path and cache-efficiency tuning | 61.86% DRAM versus 11.57% compute confirms memory pressure. Inspect sector utilization/replay in a full-cohort NCU sample before changing vectorization or page traversal. | The current algorithm already removes most repeated bytes; micro-tuning has a lower ceiling than CTA/fallback work. |
 | P1 | FP8 KV specialization | A supported FP8 path could approximately halve KV bytes for memory-bound kernels. | New kernels, numerical validation, scale handling, and broader compatibility work; current Fork dispatch intentionally accepts FP16/BF16 KV only. |
 | P1/P2 | Persistent GPU forest planning on graph misses | Eager forest construction still creates host plan objects and tensors, while graph-hit paths reuse persistent workspaces. Optimize only if reason counters show material eager/graph-miss time. | GPU copy time itself is only 1.89 ms, so optimizing the wrong layer will not move throughput. |
@@ -171,10 +273,10 @@ chunk and the current coarse cohort/KV-length thresholds.
 
 ### Recommended Implementation Order
 
-1. Export per-reason fallback counters and distributions of active requests,
-   CTAs, KV length, selected tile, and prefix split count.
-2. Add a tail-only adaptive chunk-size policy with a minimum target of about
-   two CTA waves, capped by the existing 32-split gather workspace.
+1. Run the adaptive policy on the 8K/16 full-cohort benchmark and on mixed-case
+   concurrency; reject it if wide-cohort throughput regresses.
+2. Correlate the new `PROFILE_FORK=1` reason counters with an Nsys capture to
+   attach kernel time, not only step counts, to each fallback class.
 3. Sweep the already compiled `N=32` and `N=64` one-warp kernels on `sm_120`,
    then use a small architecture-specific dispatch table.
 4. Re-run the unprofiled 8K/16 benchmark and Nsys capture. Accept a change only

@@ -351,6 +351,27 @@ VLLM_FORK_ATTN_CUDAGRAPH_CAPTURE_BUCKETS="common:4,8;forest:256,512,1024" \
 `server_profile.json` records CUDA Graph hit/miss counters and average
 ForkAttention metadata construction time for selecting these capacities.
 
+Long-prefix tail batches use shape-aware adaptive splitting by default. The
+planner targets about two CTA waves only when the shared prefix is at least 4K
+tokens; wide cohorts retain the base 2K chunk. CUDA Graph runs select a matching
+captured bucket, while `ENFORCE_EAGER=1` runs build the equivalent dynamic
+forest plan. Use these controls for matched A/B experiments:
+
+```bash
+# Static-chunk control, valid with CUDA Graphs enabled or ENFORCE_EAGER=1.
+VLLM_FORK_ATTN_TARGET_CTA_WAVES=0 ./scripts/run_vllm_benchmark.sh
+
+# Adaptive default; 4/8/12 are captured common-prefix chunk capacities.
+VLLM_FORK_ATTN_TARGET_CTA_WAVES=2 \
+VLLM_FORK_ATTN_ADAPTIVE_SPLIT_MIN_TOKENS=4096 \
+VLLM_FORK_ATTN_PREFIX_CHUNK_BUCKETS=4,8,12 \
+./scripts/run_vllm_benchmark.sh
+```
+
+`VLLM_FORK_ATTN_TAIL_TILE_N=32` is an experimental tail-kernel A/B override;
+zero keeps automatic tile selection. Do not make an architecture-specific tile
+the default without measuring both small-tail and full-cohort cases.
+
 AgentBoard and AppWorld prompt snapshots are included under `benchmark/data/`:
 
 ```bash
