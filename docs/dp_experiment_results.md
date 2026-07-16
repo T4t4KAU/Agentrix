@@ -575,3 +575,216 @@ least three times with randomized variant order, sweep KV capacity across the
 one-root/two-root boundary, and test two, four, and eight uneven or staggered
 cohorts. A resident-KV decode-only Nsight/NCU sweep is separately required to
 isolate the H20 ForkAttention kernel from routing, prefill, and queueing.
+
+## H20 Qwen3-32B YaRN 64K/96K DP=4 Extension
+
+The same four-GPU H20 server was used on 2026-07-16 to extend the DP capacity
+experiment to approximately 64K and 96K shared prefixes. Both lengths use
+Qwen3-32B with YaRN rather than Qwen2.5-32B. The comparison remains scoped to
+FlashAttention with native ordinary DP and ForkAttention with prefix-aware DP;
+reload rebalance, LMCache, and KV offload are disabled.
+
+The raw server-side artifacts are retained at:
+
+```text
+/test__02/hwx/Agentrix/benchmark/results/
+  h20_dp4_qwen3_32b_yarn_64k_r2/
+  h20_dp4_qwen3_32b_yarn_96k_r1/
+```
+
+### Configuration
+
+| Item | Value |
+|---|---|
+| Validation date | 2026-07-16 |
+| Hardware | 4 x NVIDIA H20-3e, SM90, approximately 140.4 GiB per GPU |
+| Model | Qwen3-32B, float16 |
+| Agentrix commit | `5793805` |
+| vLLM submodule commit | `b5086c8b7` |
+| Parallelism | vLLM internal DP=4, TP=1 |
+| Long-context extension | YaRN, factor 4.0, original maximum position 32,768 |
+| Prefix targets | 65,536 and 98,304 harness-tokenizer tokens |
+| Measured shared prefixes | 65,595 and 98,352 tokens after common analysis |
+| Service maximum lengths | 83,520 for 64K; 124,480 for 96K |
+| Cases and branches | 4 cases, 32 branches per case, 128 concurrent branches |
+| Private suffix / output | Seeded lognormal mean 256; 256 output tokens per branch |
+| Common analysis | 64 output tokens per case |
+| Arrival policy | Deterministically shuffled, zero client arrival interval, seed 2026 |
+| Maximum sequences | 64 per rank |
+| GPU KV capacity | 8,192 blocks per rank, approximately 131,072 tokens or 32 GiB |
+| CUDA Graphs | Standard vLLM graphs for Flash; Prefix Forest graphs for ForkAttention |
+| Offload / reload | Disabled / disabled |
+
+Qwen3-32B's checked-in model configuration declares a 40,960-token default
+maximum, while its tokenizer declares 131,072. Both variants received the
+same Hugging Face override:
+
+```json
+{
+  "rope_scaling": {
+    "rope_type": "yarn",
+    "factor": 4.0,
+    "original_max_position_embeddings": 32768
+  }
+}
+```
+
+`VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` was enabled. The 96K service limit of
+124,480 leaves space below the 131,072-token YaRN target for the measured
+shared context, private suffix, and generated output. This experiment measures
+systems behavior and does not evaluate the model-quality effect of YaRN.
+
+All arms use the same physical KV capacity. One 64K or 96K root fits on a
+rank, while two such roots do not fit together with active branch state. The
+8,192-block setting therefore tests the same one-owner-per-rank capacity
+boundary at both lengths. The 64K and 96K arms processed identical input and
+output token totals within each length. As in the preceding experiments, the
+temperature-zero common-analysis bytes are not explicitly forced to be
+identical across separately launched variants.
+
+### Request-Construction Audit
+
+AgencyBench does not natively contain 64K/96K prompts or 32-way branch trees.
+It supplies the semantic root of each case; the benchmark harness controls the
+length and fanout shape. The construction is as follows:
+
+1. The runner selects records 0-3 from the bundled
+   `data/agencybench_v2.jsonl`. There is no selection based on measured
+   performance. `record_to_prompt` converts each record's category, scenario,
+   scenario ID, and subtasks into an Agent planning prompt.
+2. `fit_text_to_tokens` repeats that real source prompt, inserting the fixed
+   separator `--- 共享背景的后续材料 ---`, and truncates the
+   result to exactly 65,536 or 98,304 harness-tokenizer tokens. The served
+   alias is not registered with `tiktoken`, so the harness falls back to
+   `o200k_base`. This repetition is what creates the very long root; it is not
+   an original AgencyBench document of that length.
+
+   The separator is 11 `o200k_base` tokens. The exact source lengths and
+   numbers of source copies consumed by the repeat-and-truncate loop are:
+
+   | Case / source record | Original prompt tokens | Copies used for 64K | Copies used for 96K |
+   |---|---:|---:|---:|
+   | 0 / Backend scenario 1 | 2,442 | 27 | 41 |
+   | 1 / Backend scenario 2 | 1,694 | 39 | 58 |
+   | 2 / Backend scenario 3 | 2,185 | 30 | 45 |
+   | 3 / Code scenario 1 | 1,659 | 40 | 59 |
+
+   The final copy is truncated at the target boundary. No spaces, zero tokens,
+   random vocabulary tokens, or unrelated corpus documents are inserted.
+3. The runner sends one temperature-zero common-analysis request per case with
+   a 64-token output limit. It appends the generated analysis and a continuation
+   instruction to the root. The resulting shared contexts measure 65,595 and
+   98,352 harness tokens. `WARM_SHARED_PREFIX=0` adds no extra exact-prefix
+   warmup request.
+4. The harness creates 32 branches for each shared context. A seed-2026
+   lognormal distribution is rescaled to a mean suffix budget of 256. Because
+   the main runner sets `BRANCH_GROUP_SIZE=32`, all branches in a case share
+   approximately the first half of their suffix budget and receive a distinct
+   strategy/branch-private template for the remainder. This deliberately
+   creates a nested root -> group -> leaf prefix tree.
+5. Every branch requests at most 256 output tokens at temperature zero. The
+   128 branches are deterministically shuffled and submitted with concurrency
+   128. The client sends no rank-selection header, so the internal-DP server
+   controls rank placement in both variants; only the prefix-aware arm enables
+   the custom DP prefix router.
+
+The dataset therefore supports the content seed but not the tested scale. This
+is a controlled systems benchmark for a long-root Agent fanout shape, not a
+native AgencyBench task-score evaluation and not evidence that a typical
+AgencyBench example naturally contains 32 siblings. A representative end-to-
+end Agent evaluation must separately derive branch count and context growth
+from an actual workflow such as the HotpotQA LangGraph harness.
+
+### Performance Results
+
+All four formal arms completed 128/128 branches and generated 32,768 branch
+tokens. The 64K arms each processed 8,496,433 branch input tokens; the 96K arms
+each processed 12,721,809. No arm reported a request failure or preemption.
+
+| Prefix / variant | Branch wall | Branch tok/s | Case wall | Case tok/s | TTFT P50 / P95 | TPOT P50 / P95 |
+|---|---:|---:|---:|---:|---:|---:|
+| 65,595, Flash ordinary DP | 1,529.478 s | 21.424 | 1,595.735 s | 20.535 | 700.807 / 1,366.373 s | 29.976 / 54.568 ms |
+| 65,595, Fork prefix-aware DP | 60.867 s | 538.354 | 127.221 s | 257.568 | 7.360 / 12.647 s | 198.871 / 211.685 ms |
+| 98,352, Flash ordinary DP | 2,864.424 s | 11.440 | 2,987.680 s | 10.968 | 1,135.477 / 2,262.849 s | 64.550 / 107.346 ms |
+| 98,352, Fork prefix-aware DP | 85.095 s | 385.076 | 208.433 s | 157.211 | 11.383 / 17.982 s | 278.326 / 294.595 ms |
+
+The corresponding single-repeat improvements are:
+
+| Prefix | Branch throughput gain | Branch wall reduction | Case throughput gain | TTFT P50 reduction | TPOT P50 regression |
+|---|---:|---:|---:|---:|---:|
+| 64K | 25.13x | 96.02% | 12.54x | 95.22x | 6.63x worse |
+| 96K | 33.66x | 97.03% | 14.33x | 99.75x | 4.31x worse |
+
+The bootstrap stages reconcile closely and are not the source of the branch
+speedup. Their measured durations were 66.257 versus 66.354 seconds at 64K and
+123.256 versus 123.338 seconds at 96K for Flash and Fork respectively. The
+difference appears after the 128 branches are submitted.
+
+### KV and Memory Behavior
+
+The process-memory values below reflect vLLM's preallocated pool and backend
+workspace; they do not measure useful live KV by themselves. KV usage and
+active/waiting counts are the more informative capacity metrics.
+
+| Prefix / variant | Peak KV use | Approx. live KV per rank | Observed process memory | Max active | Max waiting |
+|---|---:|---:|---:|---:|---:|
+| 64K, Flash ordinary DP | 52.2% | 16.7 GiB | approximately 98.9 GiB/GPU | 6 | 120 |
+| 64K, Fork prefix-aware DP | 60.7% | 19.4 GiB | 100.8 GiB/GPU | 128 | 0 |
+| 96K, Flash ordinary DP | 78.6% | 25.2 GiB | approximately 98.9 GiB/GPU | 9 | 123 |
+| 96K, Fork prefix-aware DP | 86.4% | 27.6 GiB | 100.8 GiB/GPU | 128 | 0 |
+
+The peak-KV column uses the same periodic per-rank server logger for all four
+arms. Fork's complete 0.5-second telemetry reports four-rank average peaks of
+60.17% and 85.38%, consistent with the logger values. The Fork process uses
+approximately 1.8 GiB more device memory per GPU in this configuration, which
+is consistent with additional backend graph/workspace allocation. Its higher
+live-KV peak is useful occupancy: the prefix-aware router keeps one root cohort
+per rank and admits almost or exactly all 32 siblings together. During the 64K
+fanout, a representative sample showed 17/25/27/18 active requests and zero
+waiting; the 96K fanout reached 32/32/32/29 and then 32 per rank, again with
+zero waiting.
+
+Ordinary DP instead stayed near one active request per rank for most of both
+runs while the remaining requests waited for capacity. It can report a lower
+instantaneous KV peak because waiting requests have not been admitted and do
+not yet hold their full useful state. At the tail of the 96K run, three GPUs
+became idle while one rank continued processing its remaining cohort mixture,
+so final request-count balance did not prevent wall-time imbalance.
+
+The Fork final Prometheus snapshots provide an additional prompt-residency
+check:
+
+| Prefix | Total prompt source | Local prompt compute | Local cache hit | Cache-hit share | Cumulative queue |
+|---|---:|---:|---:|---:|---:|
+| 64K | 8,760,560 | 285,472 | 8,475,088 | 96.74% | 0.00114 s |
+| 96K | 13,117,980 | 417,532 | 12,700,448 | 96.82% | 0.00155 s |
+
+ForkAttention physical execution was active in both arms: fork-active steps
+were 73.53% and 74.23% at 64K and 96K, and shared CTAs were 63.63% and 63.66%.
+These counters verify the selected backend path but are not used to claim that
+the attention operator is faster. The supported result remains a DP placement,
+residency, and admission result. The worse TPOT is consistent with the larger
+effective decode batch described in the preceding H20 section.
+
+### Limitations
+
+- Each arm currently has one formal repeat. Four equal-sized roots on four
+  ranks are an ideal ownership mapping, and both lengths deliberately operate
+  at a one-root-fits/two-roots-do-not capacity boundary.
+- The comparison changes the attention backend and routing together. There is
+  no Qwen3-32B long-context Fork ordinary-DP ablation in this run.
+- The Flash result traces and server logs are complete, but their final
+  profile/telemetry aggregation was interrupted by the controlling SSH session
+  disconnecting after request completion. Flash KV peaks and active/waiting
+  maxima above come from the server's periodic logger and direct runtime
+  sampling. Fork has complete 0.5-second telemetry, Prometheus, and server
+  profiles, so the memory sampling sources are not perfectly symmetric.
+- The first 64K attempt hit the OpenAI client's default 600-second read
+  timeout. Formal runs used a server-side benchmark-only patch exposing
+  `OPENAI_TIMEOUT_SECONDS=3600`; it does not change requests or vLLM behavior.
+- The server vLLM worktree retained an unrelated prompt-statistics clamp from
+  the reload investigation. Reload, LMCache, and offload were disabled and all
+  reload counters remained zero, so that path was inactive.
+- YaRN was configured identically for both variants, but long-context task
+  quality was not measured. These results only establish systems behavior for
+  the constructed shape.
