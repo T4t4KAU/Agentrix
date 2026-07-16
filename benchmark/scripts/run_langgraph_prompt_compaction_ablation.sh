@@ -2,11 +2,18 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+export ENABLE_CACHEBLEND="${ENABLE_CACHEBLEND:-0}"
 
-# Core 2x2: attention backend x prompt compaction. The final pair measures
-# whether eliminating duplicate RAG chunks complements or competes with
-# CacheBlend. Every variant gets the same warm-up and a fresh server.
-export VARIANTS="${VARIANTS:-baseline baseline_compact forkattention forkattention_compact cacheblend cacheblend_compact}"
+# The default is the core 2x2 attention-backend x prompt-compaction matrix.
+# CacheBlend is opt-in because it regressed this host workload; when enabled,
+# its final pair measures whether compaction complements or competes with it.
+if [[ -z "${VARIANTS+x}" ]]; then
+  if [[ "${ENABLE_CACHEBLEND}" == "1" ]]; then
+    export VARIANTS="baseline baseline_compact forkattention forkattention_compact cacheblend cacheblend_compact"
+  else
+    export VARIANTS="baseline baseline_compact forkattention forkattention_compact"
+  fi
+fi
 export OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/../results/langgraph_prompt_compaction_ablation}"
 
 exec "${SCRIPT_DIR}/run_langgraph_fork_cacheblend_20_e2e.sh"

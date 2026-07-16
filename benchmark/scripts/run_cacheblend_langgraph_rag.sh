@@ -23,8 +23,18 @@ MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-16384}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
 DTYPE="${DTYPE:-bfloat16}"
 REPEATS="${REPEATS:-3}"
+ENABLE_CACHEBLEND="${ENABLE_CACHEBLEND:-0}"
 SERVER_PID=""
 SERVER_LOG=""
+
+if [[ "${ENABLE_CACHEBLEND}" != "0" && "${ENABLE_CACHEBLEND}" != "1" ]]; then
+  echo "ENABLE_CACHEBLEND must be 0 or 1; got ${ENABLE_CACHEBLEND}." >&2
+  exit 2
+fi
+if [[ "${ENABLE_CACHEBLEND}" != "1" ]]; then
+  echo "CacheBlend is disabled by default. Re-run with ENABLE_CACHEBLEND=1." >&2
+  exit 2
+fi
 
 export PYTHONPATH="${REPO_ROOT}/vllm:${REPO_ROOT}/LMCache${PYTHONPATH:+:${PYTHONPATH}}"
 

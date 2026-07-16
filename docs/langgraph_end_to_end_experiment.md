@@ -211,9 +211,13 @@ on the current `b01c0c10bb027921` corpus with:
 ```bash
 CASES=20 CASE_CONCURRENCY=1 CONCURRENCY=16 \
 MEMORY_SAMPLE_INTERVAL=0.5 \
+ENABLE_CACHEBLEND=1 \
 OUTPUT_ROOT=/tmp/agentrix_langgraph_full_ablation \
 benchmark/scripts/run_langgraph_prompt_compaction_ablation.sh
 ```
+
+CacheBlend is now disabled by default. Omitting `ENABLE_CACHEBLEND=1` runs only
+the four Flash/Fork compaction variants and never loads its LMCache connector.
 
 Each formal publication should add at least three repetitions, alternate
 variant order, and report paired medians. Use live runs for Agent relevance and

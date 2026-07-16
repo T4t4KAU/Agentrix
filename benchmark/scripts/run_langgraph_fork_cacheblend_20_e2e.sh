@@ -17,12 +17,38 @@ PORT="${PORT:-9000}"
 CONCURRENCY="${CONCURRENCY:-16}"
 CASE_CONCURRENCY="${CASE_CONCURRENCY:-1}"
 CASES="${CASES:-20}"
-VARIANTS="${VARIANTS:-cacheblend forkattention baseline}"
+ENABLE_CACHEBLEND="${ENABLE_CACHEBLEND:-0}"
+VARIANTS="${VARIANTS:-baseline forkattention}"
 PROMPT_COMPACTION="${PROMPT_COMPACTION:-0}"
 SERVER_PID=""
 SERVER_LOG=""
 MEMORY_SAMPLER_PID=""
 MEMORY_SAMPLE_INTERVAL="${MEMORY_SAMPLE_INTERVAL:-0.5}"
+
+if [[ "${ENABLE_CACHEBLEND}" != "0" && "${ENABLE_CACHEBLEND}" != "1" ]]; then
+  echo "ENABLE_CACHEBLEND must be 0 or 1; got ${ENABLE_CACHEBLEND}." >&2
+  exit 2
+fi
+CACHEBLEND_REQUESTED=0
+for variant in ${VARIANTS}; do
+  if [[ "${variant}" == cacheblend* ]]; then
+    CACHEBLEND_REQUESTED=1
+  fi
+done
+if [[ -z "${RAG_FORMAT:-}" ]]; then
+  RAG_FORMAT="plain"
+  if [[ "${CACHEBLEND_REQUESTED}" == "1" ]]; then
+    RAG_FORMAT="cacheblend"
+  fi
+fi
+if [[ "${CACHEBLEND_REQUESTED}" == "1" && "${ENABLE_CACHEBLEND}" != "1" ]]; then
+  echo "CacheBlend is disabled by default. Re-run with ENABLE_CACHEBLEND=1." >&2
+  exit 2
+fi
+if [[ "${CACHEBLEND_REQUESTED}" == "1" && "${RAG_FORMAT}" != "cacheblend" ]]; then
+  echo "CacheBlend variants require RAG_FORMAT=cacheblend." >&2
+  exit 2
+fi
 
 export PYTHONPATH="${REPO_ROOT}/application/src:${REPO_ROOT}/vllm:${REPO_ROOT}/LMCache${PYTHONPATH:+:${PYTHONPATH}}"
 
@@ -231,7 +257,7 @@ run_variant() {
     --case-concurrency "${CASE_CONCURRENCY}" --rag-root "${REPO_ROOT}/docs" \
     --rag-manifest "${RAG_MANIFEST}" \
     --expected-rag-corpus-version "${EXPECTED_RAG_CORPUS_VERSION}" \
-    --rag-format cacheblend --concurrency "${CONCURRENCY}" \
+    --rag-format "${RAG_FORMAT}" --concurrency "${CONCURRENCY}" \
     "${compaction[@]}" \
     --planner-tokens 128 --tool-tokens 64 --reflect-tokens 256 --reduce-tokens 192 \
     --output "${output_dir}/run.json"

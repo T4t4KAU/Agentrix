@@ -39,7 +39,15 @@ CASES=20 CASE_CONCURRENCY=1 \
   benchmark/scripts/run_langgraph_prompt_compaction_ablation.sh
 ```
 
-It runs six fresh-server variants over the same 20 tasks:
+By default it runs the four Flash/Fork fresh-server variants over the same 20
+tasks. CacheBlend is opt-in:
+
+```bash
+ENABLE_CACHEBLEND=1 CASES=20 CASE_CONCURRENCY=1 \
+  benchmark/scripts/run_langgraph_prompt_compaction_ablation.sh
+```
+
+The opt-in run adds the final CacheBlend pair:
 
 | Pair | Off | On | Live matched question |
 |---|---|---|---|
@@ -47,10 +55,11 @@ It runs six fresh-server variants over the same 20 tasks:
 | ForkAttention | `forkattention` | `forkattention_compact` | compaction/Fork interaction |
 | CacheBlend | `cacheblend` | `cacheblend_compact` | compaction/CacheBlend interaction |
 
-All variants use the same task file, RAG corpus, token limits, case-major
-admission, unrelated backend warm-up, and one fresh vLLM process. CacheBlend is
-kept on its required FlashAttention/eager path and is not combined with
-ForkAttention. Formal numbers should use at least three repetitions with
+All selected variants use the same task file, RAG corpus, token limits,
+case-major admission, unrelated backend warm-up, and one fresh vLLM process.
+CacheBlend is kept on its required FlashAttention/eager path and is not
+combined with ForkAttention. Formal numbers should use at least three
+repetitions with
 alternating variant order; report median paired speedups, actual prompt-token
 reduction, P50/P95 latency, valid tool-call and reducer completion rates,
 ForkAttention physical counters, CacheBlend hit/retrieval counters, and reducer

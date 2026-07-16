@@ -186,6 +186,11 @@ The current measured CacheBlend path has strict constraints:
 CacheBlend is therefore a separate serving variant, not a switch added to the
 same CUDA-Graph ForkAttention process.
 
+It is disabled by default because the current host experiment measured a
+performance and host-memory regression. Benchmark launchers require the
+explicit opt-in `ENABLE_CACHEBLEND=1`; without it they retain APC/CUDA Graphs
+and do not load the CacheBlend LMCache configuration or connector.
+
 ## Compatibility Matrix
 
 | Path | APC | CUDA Graph | ForkAttention | LMCache CPU/disk | CacheBlend |
@@ -194,8 +199,8 @@ same CUDA-Graph ForkAttention process.
 | Flash + compaction | On | On | No | No | No |
 | ForkAttention | On | On | Yes | No in current LangGraph run | No |
 | ForkAttention + compaction | On | On | Yes | No in current LangGraph run | No |
-| CacheBlend | Off | Eager | No | 8 GiB local CPU | Yes |
-| CacheBlend + compaction | Off | Eager | No | 8 GiB local CPU | Yes |
+| CacheBlend (opt-in) | Off | Eager | No | 8 GiB local CPU | Yes |
+| CacheBlend + compaction (opt-in) | Off | Eager | No | 8 GiB local CPU | Yes |
 
 The broader repository also supports ForkAttention with ordinary or
 fork-aware CPU/disk offload, but that is a different experiment matrix from

@@ -168,7 +168,8 @@ a claim to reproduce every production queue:
 Fair comparisons keep the task file, manifest, model, token budgets, case
 order, and warm-up fixed and restart the server per variant. Baseline and Fork
 match APC/graph settings. CacheBlend is reported as a separate deployment path
-because it requires eager execution and disabled APC.
+because it requires eager execution and disabled APC. It is disabled by
+default and requires `ENABLE_CACHEBLEND=1` in the benchmark launchers.
 
 Live execution is necessary to show Agent relevance, but it permits output
 drift to alter later requests. A complete evaluation therefore uses two
