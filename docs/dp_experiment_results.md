@@ -355,3 +355,223 @@ claims use measured timing rather than logical KV savings.
   backend, GPU-workspace, and prefix-router tests. LangGraph was outside this
   validation scope.
 - No offload connector was enabled in these runs.
+
+## H20 DP=4 Pressure32K/32 Validation
+
+An additional DP=4 validation was run on 2026-07-16 on a four-GPU H20
+(SM90) server. This run increases both the model size and the number of DP
+replicas relative to the preceding RTX 5090 DP=2 results. The raw server-side
+artifacts are retained at:
+
+```text
+/test__02/hwx/Agentrix/benchmark/results/
+  h20_dp4_pressure32k_b32_qwen3_32b_r1/dp/
+```
+
+### Environment and Workload
+
+The hardware inventory below was queried directly from the benchmark server
+after the run.
+
+#### Hardware Configuration
+
+| Hardware item | Observed configuration |
+|---|---|
+| GPU accelerators | 4 x NVIDIA H20-3e |
+| GPU memory | 143,771 MiB per GPU (approximately 140.4 GiB); approximately 561.6 GiB total |
+| GPU compute capability | 9.0 (SM90) |
+| GPU power limit | 500 W per GPU |
+| GPU interconnect | Every GPU pair reports `NV18` connectivity in `nvidia-smi topo -m` |
+| GPU PCI bus IDs | `04:00.0`, `23:00.0`, `44:00.0`, `63:00.0` |
+| Host CPU | 2 x AMD EPYC 9654 96-Core Processor; 192 physical cores, 384 logical CPUs, SMT2 |
+| CPU frequency range | 1.5 GHz minimum; approximately 3.708 GHz maximum |
+| NUMA topology | 2 NUMA nodes; all four GPUs report NUMA-node-0 CPU affinity (`0-95,192-287`) |
+| Host memory | 1.5 TiB RAM; no swap configured |
+| Workspace storage | GPFS mounted at `/test__02`; 563 TiB total and 539 TiB available when recorded |
+| Operating system | Ubuntu 22.04.5 LTS, Linux `5.15.0-60-generic`, x86-64 |
+
+#### Software and Benchmark Configuration
+
+| Item | Value |
+|---|---|
+| Validation date | 2026-07-16 |
+| NVIDIA driver | 550.144.03 |
+| CUDA toolkit | 12.9.86 |
+| PyTorch | 2.11.0+cu129 |
+| Agentrix commit | `5793805` |
+| vLLM submodule commit | `b5086c8b7` |
+| Model | Qwen3-32B, float16 |
+| Parallelism | vLLM internal DP=4, TP=1 |
+| Dataset / shape | AgencyBench, four cases, 32 branches per case |
+| Measured shared prefix | Approximately 32,835 tokens per case |
+| Requests | 4 common bootstrap + 128 branches = 132 total |
+| Branch output | 256 tokens per branch; 32,768 tokens total |
+| Arrival policy | All cases concurrent, shuffled with seed 2026 |
+| Maximum sequences | 64 per rank |
+| GPU KV capacity | 3,852 blocks per rank = 61,632 tokens per rank |
+| CUDA Graphs | Enabled for both variants; Prefix Forest graphs for ForkAttention |
+| Offloading | Disabled |
+| Reload rebalance | Disabled |
+
+Both variants used the same fixed physical KV capacity, request construction,
+branch order, output-token count, and freshly started service. The comparison
+contains only the requested primary arms: FlashAttention with native ordinary
+DP and ForkAttention with prefix-aware DP. It does not contain an H20
+ForkAttention ordinary-DP ablation, which limits attribution between backend
+and routing.
+
+The branch-phase timer surrounds the concurrent fanout requests and excludes
+the four common bootstrap requests. The case-level wall time starts before the
+common bootstrap stage and ends after fanout, but still excludes server launch
+and startup graph capture. Therefore the 12.21x result below is a fanout-stage
+systems result; 7.71x is the more conservative measured case-level result.
+
+### Performance Results
+
+All 132 requests completed in both variants with no request failure and no
+preemption.
+
+| Variant | Branch wall | Branch output tok/s | Case wall | Case output tok/s | TTFT P50 / P95 | TPOT P50 / P95 | Peak GPU KV |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| FlashAttention ordinary DP | 470.6866 s | 69.6174 | 497.1948 s | 65.9058 | 208.228 / 450.098 s | 36.701 / 63.856 ms | 55.97% |
+| ForkAttention prefix-aware DP | 38.5567 s | 849.8656 | 64.4482 s | 508.4397 | 6.3109 / 8.8839 s | 117.131 / 130.769 ms | 74.63% |
+
+This corresponds to:
+
+- 12.21x higher branch-only output throughput and 91.81% lower branch wall
+  time;
+- 7.71x higher case-level output throughput and 87.04% lower measured case
+  wall time; and
+- 33.00x lower branch TTFT P50, but 3.19x worse branch TPOT P50.
+
+The identical total prompt-token source counters make it possible to inspect
+where the wall-time difference comes from. The time columns below are sums of
+per-request scheduler durations across 132 concurrent requests, not elapsed
+experiment wall time.
+
+| Variant | Total prompt source | Local prompt compute | Local cache hit | Cache-hit share | Cumulative prefill | Cumulative queue | Cumulative decode |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| FlashAttention ordinary DP | 4,402,747 | 1,632,251 | 2,770,496 | 62.93% | 1,540.571 s | 26,643.441 s | 1,185.411 s |
+| ForkAttention prefix-aware DP | 4,402,747 | 153,467 | 4,249,280 | 96.51% | 338.468 s | 0.003621 s | 3,930.522 s |
+
+Prefix-aware placement therefore avoids 1,478,784 locally computed prompt
+tokens, reducing local prompt computation by 90.60% and cumulative prefill
+time by 78.02%. The higher cumulative decode time and worse TPOT show that the
+headline speedup comes from the DP mechanism measured here: prefix residency,
+admission, and the resulting removal of repeated prefill and queueing. This
+experiment does not make a claim that the ForkAttention decode kernel is
+faster than FlashAttention.
+
+The prefix-aware router recorded four bootstrap routes, 128 affinity routes,
+128 cohort locks, and a final route allocation of `[33, 33, 33, 33]`. Its
+average routing time was 12,570.9 microseconds per request. It observed 129
+arrival waves for 132 requests, so large arrival-wave batching was not the
+source of the throughput improvement. The final allocation demonstrates that
+prefix affinity did not sacrifice aggregate request-count balance in this
+four-cohort/four-rank shape.
+
+ForkAttention physical execution was also active rather than bypassed:
+
+| Physical execution metric | Value |
+|---|---:|
+| Observed steps | 1,520 |
+| Fork-active steps | 1,026 (67.50%) |
+| Shared CTAs | 56,901 |
+| Singleton CTAs | 32,290 |
+| Shared-CTA share | 63.80% |
+
+These counters prove that the shared-prefix kernel path executed, but they do
+not make kernel speed the basis of the 12.21x DP result. Backend-level kernel
+comparison is outside this experiment's attribution scope.
+
+### Why TPOT Gets Worse While Throughput Improves
+
+The H20 TPOT regression is not inconsistent with the throughput gain. The
+benchmark does not timestamp every generated token. For a streamed request it
+computes average post-first-token latency as
+`(request latency - TTFT) / (output tokens - 1)`. Consequently, TPOT excludes
+the queueing before the first token but includes scheduling gaps and batched
+decode time after the first token; it is not a decode-kernel-only measurement.
+
+Ordinary DP reaches the multi-root KV-capacity cliff and leaves many requests
+waiting before their first token. This produces very poor TTFT and aggregate
+throughput, but a request that has entered decode can share the GPU with a
+smaller active set and therefore observe a shorter interval between output
+tokens. Prefix-aware DP removes almost all of that queue and can admit many
+siblings from the resident cohort concurrently. Each larger decode step takes
+longer, so an individual request receives its next token less frequently, but
+the step produces tokens for many more requests. The increase in active
+sequences is larger than the increase in step time, yielding 12.21x higher
+aggregate branch throughput despite 3.19x worse median TPOT. This is a
+latency-throughput tradeoff caused primarily by admission and effective batch
+size, rather than a contradiction in the measurements.
+
+The cumulative decode durations above reinforce the concurrency change but do
+not isolate kernel speed: they sum per-request residence time across concurrent
+requests rather than measuring GPU decode wall time. The current DP comparison
+also changes the attention backend, so backend behavior remains a confounding
+variable rather than a claimed source of acceleration. If kernel attribution
+is needed later, it requires a separate fixed-resident-KV experiment with
+matched active sequence counts and batch shapes; it is not required for the
+present conclusion about DP placement and admission.
+
+### Why the Improvement Is So Large
+
+This experiment deliberately operates at a KV-capacity boundary. One measured
+root is approximately 32.8K tokens, while a rank has room for 61,632 tokens.
+Two roots require roughly 65.7K tokens before any branch suffix or generated
+KV is included, so one root fits comfortably but two do not.
+
+Ordinary DP balances request counts without preserving content ownership.
+With four shuffled cohorts, sibling branches can be distributed to ranks that
+do not retain their root, and a rank can alternate among multiple roots whose
+combined working set exceeds its KV capacity. Prefix-cache reuse is rank-local,
+so this placement causes repeated long-prefix prefill, cache displacement, and
+scheduler waiting even when the global request count is balanced.
+
+Prefix-aware DP instead keeps each 32-branch cohort with its resident root. In
+this symmetric case, four roots map naturally to four ranks. Each rank stores
+one root once and admits that root's short private suffixes and outputs. The
+result is a nonlinear effect:
+
+1. deep-prefix hits remove about 1.48 million repeated prompt-token computes;
+2. the smaller resident working set stays below the per-rank capacity cliff;
+3. the scheduler can admit many more sibling branches concurrently; and
+4. the ordinary-DP queue collapses rather than merely becoming proportionally
+   shorter.
+
+This also explains why prefix-aware DP reports higher peak KV usage: it is
+using the available cache for concurrently admitted, useful branch state.
+FlashAttention ordinary DP reports lower instantaneous occupancy while many
+requests remain queued behind repeated prefill work.
+
+The supported causal claim is therefore that prefix-aware residency and
+admission remove repeated prefill and queue amplification. ForkAttention's
+forest execution may reduce redundant shared-prefix reads during decode, but
+the present result does not quantify a positive kernel-level contribution.
+
+### Credibility and Scope
+
+The mechanism is internally consistent and credible for this controlled
+shape: both arms completed identical request and token counts, the
+scheduler-derived prompt sources reconcile exactly, no preemption or retry
+explains the difference, route ownership is balanced, and the cache-hit,
+prefill, queue, TTFT, and wall-time changes all point to the same capacity-cliff
+explanation.
+
+The exact 12.21x ratio is not yet a general performance claim:
+
+- this H20 comparison currently has one run per variant;
+- it changes both attention backend and DP routing, without the H20
+  ForkAttention ordinary-DP ablation;
+- four equally sized cohorts on four ranks are an ideal ownership mapping;
+- the fixed 61,632-token KV capacity intentionally makes one root fit while
+  two do not; and
+- the branch-only ratio excludes the required bootstrap stage, for which the
+  case-level result is the more conservative 7.71x.
+
+The next validation should add ForkAttention ordinary DP, repeat all arms at
+least three times with randomized variant order, sweep KV capacity across the
+one-root/two-root boundary, and test two, four, and eight uneven or staggered
+cohorts. A resident-KV decode-only Nsight/NCU sweep is separately required to
+isolate the H20 ForkAttention kernel from routing, prefill, and queueing.
