@@ -1,0 +1,78 @@
+{
+  "schema_version": 2,
+  "definition": "Logical prompt redundancy counts repeated frozen-parent and declared user/tool tokens across model requests. Runtime-generated assistant tokens are excluded. It is an upper bound on removable representation, not measured HBM traffic.",
+  "cases": [
+    {
+      "case_id": "django_non_atomic_view_copy",
+      "branches": 16,
+      "declared_model_requests": 32,
+      "shared_parent_tokens": 30073,
+      "declared_user_tokens": 1317,
+      "cumulative_user_tokens_materialized": 2002,
+      "materialized_prompt_tokens": 964338,
+      "unique_case_tokens": 31390,
+      "logical_redundant_tokens": 932948,
+      "logical_redundancy_ratio": 0.9674491723856158,
+      "ideal_shared_prefix_reduction_ratio": 0.9674491723856158
+    },
+    {
+      "case_id": "django_multipart_same_name",
+      "branches": 16,
+      "declared_model_requests": 32,
+      "shared_parent_tokens": 30071,
+      "declared_user_tokens": 1290,
+      "cumulative_user_tokens_materialized": 1952,
+      "materialized_prompt_tokens": 964224,
+      "unique_case_tokens": 31361,
+      "logical_redundant_tokens": 932863,
+      "logical_redundancy_ratio": 0.9674753999070755,
+      "ideal_shared_prefix_reduction_ratio": 0.9674753999070755
+    },
+    {
+      "case_id": "django_session_cache_delete",
+      "branches": 16,
+      "declared_model_requests": 32,
+      "shared_parent_tokens": 30073,
+      "declared_user_tokens": 1292,
+      "cumulative_user_tokens_materialized": 1940,
+      "materialized_prompt_tokens": 964276,
+      "unique_case_tokens": 31365,
+      "logical_redundant_tokens": 932911,
+      "logical_redundancy_ratio": 0.9674730056539829,
+      "ideal_shared_prefix_reduction_ratio": 0.9674730056539829
+    },
+    {
+      "case_id": "django_import_string_module",
+      "branches": 16,
+      "declared_model_requests": 32,
+      "shared_parent_tokens": 30071,
+      "declared_user_tokens": 1277,
+      "cumulative_user_tokens_materialized": 1922,
+      "materialized_prompt_tokens": 964194,
+      "unique_case_tokens": 31348,
+      "logical_redundant_tokens": 932846,
+      "logical_redundancy_ratio": 0.9674878706982205,
+      "ideal_shared_prefix_reduction_ratio": 0.9674878706982205
+    }
+  ],
+  "summary": {
+    "case_count": 4,
+    "branch_count": 64,
+    "declared_model_requests": 128,
+    "materialized_prompt_tokens": 3857032,
+    "unique_tokens_with_parent_once_per_case": 125464,
+    "logical_redundant_tokens": 3731568,
+    "logical_redundancy_ratio": 0.9674713613991276,
+    "source_segment_occurrences": 38,
+    "unique_source_segments": 38,
+    "cross_case_duplicate_segment_tokens": 0
+  },
+  "runtime_metrics_required": [
+    "token-exact shared-prefix depth per request",
+    "physical local KV blocks reused per rank",
+    "same case resident on multiple ranks",
+    "tool-result segment occurrences and exact duplicate bytes",
+    "context tokens retained after a branch terminates",
+    "KV occupancy over time and eviction/recompute events"
+  ]
+}

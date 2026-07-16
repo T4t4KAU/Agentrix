@@ -1,0 +1,13 @@
+{
+  "schema_version": 1, "task_id": "sqlite_length_text", "repository": "sqlite/sqlite",
+  "revision": "c744314bca7858d131577e0dbf8bb21aa3e3cbf7",
+  "issue": "The SQL length() function reports one extra character for text values. Restore correct character counts for empty, ASCII, and multi-byte text without changing non-text handling.",
+  "mutation_patch": "mutation.patch", "public_test": "public_test.py",
+  "hidden_test": "../../coding_oracles/hidden/sqlite_function_regressions.py",
+  "allowed_paths": ["src/func.c"],
+  "configure": [{"cwd": "build", "argv": ["../configure", "--disable-tcl"]}],
+  "build": [{"cwd": "build", "argv": ["make", "clean"]}, {"cwd": "build", "argv": ["make", "-j16", "sqlite3"]}],
+  "public_test_command": ["{python}", ".agentrix/public_test.py"],
+  "hidden_test_command": ["{python}", "{hidden_test}", "--workspace", "{workspace}", "--task-id", "sqlite_length_text"],
+  "timeout_seconds": 180
+}

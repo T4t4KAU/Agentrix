@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "task_id": "django_non_atomic_view_copy",
+  "repository": "django/django",
+  "revision": "cae38ec9b9bd394f630bdcbffa013c2761e831e9",
+  "provenance_commit": "bdbda29c3e",
+  "issue": "Applying non_atomic_requests() more than once mutates the original view's database metadata. Each decoration must return an independent callable, preserve wrapped-function metadata, and accumulate database aliases without altering earlier wrappers.",
+  "mutation_patch": "mutation.patch",
+  "public_test": "public_test.py",
+  "hidden_test": "../../coding_oracles/hidden/django_regressions.py",
+  "allowed_paths": ["django/db/transaction.py"],
+  "configure": [{"cwd": ".", "argv": ["{python}", "-c", "import django"]}],
+  "build": [{"cwd": ".", "argv": ["{python}", "-m", "compileall", "-q", "django/db/transaction.py"]}],
+  "public_test_command": ["{python}", ".agentrix/public_test.py"],
+  "hidden_test_command": ["{python}", "{hidden_test}", "--workspace", "{workspace}", "--task-id", "django_non_atomic_view_copy"],
+  "timeout_seconds": 120
+}

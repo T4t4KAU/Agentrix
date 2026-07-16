@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "task_id": "django_multipart_same_name",
+  "repository": "django/django",
+  "revision": "cae38ec9b9bd394f630bdcbffa013c2761e831e9",
+  "provenance_commit": "7ab2d80353",
+  "issue": "The test client multipart encoder drops values when a MultiValueDict contains a regular form field and uploaded file with the same key. Preserve every value for repeated keys without changing normal dict or list handling.",
+  "mutation_patch": "mutation.patch",
+  "public_test": "public_test.py",
+  "hidden_test": "../../coding_oracles/hidden/django_regressions.py",
+  "allowed_paths": ["django/test/client.py"],
+  "configure": [{"cwd": ".", "argv": ["{python}", "-c", "import django"]}],
+  "build": [{"cwd": ".", "argv": ["{python}", "-m", "compileall", "-q", "django/test/client.py"]}],
+  "public_test_command": ["{python}", ".agentrix/public_test.py"],
+  "hidden_test_command": ["{python}", "{hidden_test}", "--workspace", "{workspace}", "--task-id", "django_multipart_same_name"],
+  "timeout_seconds": 120
+}

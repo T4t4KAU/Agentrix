@@ -1,0 +1,13 @@
+{
+  "schema_version": 1, "task_id": "sqlite_unicode_first_character", "repository": "sqlite/sqlite",
+  "revision": "c744314bca7858d131577e0dbf8bb21aa3e3cbf7",
+  "issue": "unicode(X) returns a value one larger than the first character's code point. Restore exact first-character results for ASCII and multi-byte text while preserving empty and NULL behavior.",
+  "mutation_patch": "mutation.patch", "public_test": "public_test.py",
+  "hidden_test": "../../coding_oracles/hidden/sqlite_function_regressions.py",
+  "allowed_paths": ["src/func.c"],
+  "configure": [{"cwd": "build", "argv": ["../configure", "--disable-tcl"]}],
+  "build": [{"cwd": "build", "argv": ["make", "clean"]}, {"cwd": "build", "argv": ["make", "-j16", "sqlite3"]}],
+  "public_test_command": ["{python}", ".agentrix/public_test.py"],
+  "hidden_test_command": ["{python}", "{hidden_test}", "--workspace", "{workspace}", "--task-id", "sqlite_unicode_first_character"],
+  "timeout_seconds": 180
+}

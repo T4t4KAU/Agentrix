@@ -1,0 +1,13 @@
+{
+  "schema_version": 1, "task_id": "ffmpeg_dict_count", "repository": "FFmpeg/FFmpeg",
+  "revision": "7f0b6476b6ef2d07d163a7d3229f8c9e250112b5",
+  "issue": "Dictionary iteration drops the final entry. Restore complete ordered iteration without changing empty dictionaries or lookup behavior.",
+  "mutation_patch": "mutation.patch", "public_test": "public_test.py",
+  "hidden_test": "../../coding_oracles/hidden/ffmpeg_function_regressions.py",
+  "allowed_paths": ["libavutil/dict.c"],
+  "configure": [{"cwd": "build", "argv": ["../configure", "--disable-everything", "--disable-programs", "--disable-doc", "--disable-x86asm"]}],
+  "build": [{"cwd": "build", "argv": ["make", "clean"]}, {"cwd": "build", "argv": ["make", "-j16", "libavutil/tests/dict"]}],
+  "public_test_command": ["{python}", ".agentrix/public_test.py"],
+  "hidden_test_command": ["{python}", "{hidden_test}", "--workspace", "{workspace}", "--task-id", "ffmpeg_dict_count"],
+  "timeout_seconds": 180
+}

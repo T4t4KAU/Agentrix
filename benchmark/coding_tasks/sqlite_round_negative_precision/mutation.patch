@@ -1,0 +1,10 @@
+diff --git a/src/func.c b/src/func.c
+--- a/src/func.c
++++ b/src/func.c
+@@ -462,5 +462,5 @@ static void roundFunc(sqlite3_context *context, int argc, sqlite3_value **argv){
+     if( SQLITE_NULL==sqlite3_value_type(argv[1]) ) return;
+     n = sqlite3_value_int64(argv[1]);
+     if( n>30 ) n = 30;
+-    if( n<0 ) n = 0;
++    if( n<0 ) n = 1;
+   }

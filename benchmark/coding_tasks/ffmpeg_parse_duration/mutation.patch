@@ -1,0 +1,10 @@
+diff --git a/libavutil/parseutils.c b/libavutil/parseutils.c
+--- a/libavutil/parseutils.c
++++ b/libavutil/parseutils.c
+@@ -594,5 +594,5 @@ int av_parse_time(int64_t *timeval, const char *timestr, int duration)
+     int64_t t, now64;
+     time_t now;
+     struct tm dt = { 0 }, tmbuf;
+-    int today = 0, negative = 0, microseconds = 0, suffix = 1000000;
++    int today = 0, negative = 0, microseconds = 0, suffix = 1000;
+     int i;

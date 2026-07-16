@@ -1,0 +1,11 @@
+diff --git a/src/func.c b/src/func.c
+--- a/src/func.c
++++ b/src/func.c
+@@ -144,6 +144,6 @@ static void lengthFunc(
+           while( (z[0]&0xc0)==0x80 ){ z++; z0++; }
+         }
+       }
+-      sqlite3_result_int(context, (int)(z-z0));
++      sqlite3_result_int(context, (int)(z-z0)+1);
+       break;
+     }

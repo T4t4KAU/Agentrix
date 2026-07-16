@@ -1,0 +1,78 @@
+{
+  "schema_version": 2,
+  "definition": "Logical prompt redundancy counts repeated frozen-parent and declared user/tool tokens across model requests. Runtime-generated assistant tokens are excluded. It is an upper bound on removable representation, not measured HBM traffic.",
+  "cases": [
+    {
+      "case_id": "ffmpeg_bprint_growth",
+      "branches": 16,
+      "declared_model_requests": 32,
+      "shared_parent_tokens": 30072,
+      "declared_user_tokens": 1316,
+      "cumulative_user_tokens_materialized": 1998,
+      "materialized_prompt_tokens": 964302,
+      "unique_case_tokens": 31388,
+      "logical_redundant_tokens": 932914,
+      "logical_redundancy_ratio": 0.9674500312142876,
+      "ideal_shared_prefix_reduction_ratio": 0.9674500312142876
+    },
+    {
+      "case_id": "ffmpeg_dict_count",
+      "branches": 16,
+      "declared_model_requests": 32,
+      "shared_parent_tokens": 30072,
+      "declared_user_tokens": 1305,
+      "cumulative_user_tokens_materialized": 1974,
+      "materialized_prompt_tokens": 964278,
+      "unique_case_tokens": 31377,
+      "logical_redundant_tokens": 932901,
+      "logical_redundancy_ratio": 0.9674606285739175,
+      "ideal_shared_prefix_reduction_ratio": 0.9674606285739175
+    },
+    {
+      "case_id": "ffmpeg_fifo_readable",
+      "branches": 16,
+      "declared_model_requests": 32,
+      "shared_parent_tokens": 30067,
+      "declared_user_tokens": 1329,
+      "cumulative_user_tokens_materialized": 2028,
+      "materialized_prompt_tokens": 964172,
+      "unique_case_tokens": 31396,
+      "logical_redundant_tokens": 932776,
+      "logical_redundancy_ratio": 0.9674373452039677,
+      "ideal_shared_prefix_reduction_ratio": 0.9674373452039677
+    },
+    {
+      "case_id": "ffmpeg_parse_duration",
+      "branches": 16,
+      "declared_model_requests": 32,
+      "shared_parent_tokens": 30073,
+      "declared_user_tokens": 1310,
+      "cumulative_user_tokens_materialized": 1981,
+      "materialized_prompt_tokens": 964317,
+      "unique_case_tokens": 31383,
+      "logical_redundant_tokens": 932934,
+      "logical_redundancy_ratio": 0.9674557225476684,
+      "ideal_shared_prefix_reduction_ratio": 0.9674557225476684
+    }
+  ],
+  "summary": {
+    "case_count": 4,
+    "branch_count": 64,
+    "declared_model_requests": 128,
+    "materialized_prompt_tokens": 3857069,
+    "unique_tokens_with_parent_once_per_case": 125544,
+    "logical_redundant_tokens": 3731525,
+    "logical_redundancy_ratio": 0.9674509323011852,
+    "source_segment_occurrences": 42,
+    "unique_source_segments": 33,
+    "cross_case_duplicate_segment_tokens": 24313
+  },
+  "runtime_metrics_required": [
+    "token-exact shared-prefix depth per request",
+    "physical local KV blocks reused per rank",
+    "same case resident on multiple ranks",
+    "tool-result segment occurrences and exact duplicate bytes",
+    "context tokens retained after a branch terminates",
+    "KV occupancy over time and eviction/recompute events"
+  ]
+}

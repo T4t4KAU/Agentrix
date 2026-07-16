@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "task_id": "django_import_string_module",
+  "repository": "django/django",
+  "revision": "cae38ec9b9bd394f630bdcbffa013c2761e831e9",
+  "issue": "import_string() only accepts dotted attributes and cannot return a module or unloaded submodule. Support modules, submodules, and attributes while preserving clear ImportError behavior and resolving package attribute/submodule name collisions consistently.",
+  "mutation_patch": "mutation.patch",
+  "public_test": "public_test.py",
+  "hidden_test": "../../coding_oracles/hidden/django_regressions.py",
+  "allowed_paths": ["django/utils/module_loading.py"],
+  "configure": [{"cwd": ".", "argv": ["{python}", "-c", "import django"]}],
+  "build": [{"cwd": ".", "argv": ["{python}", "-m", "compileall", "-q", "django/utils/module_loading.py"]}],
+  "public_test_command": ["{python}", ".agentrix/public_test.py"],
+  "hidden_test_command": ["{python}", "{hidden_test}", "--workspace", "{workspace}", "--task-id", "django_import_string_module"],
+  "timeout_seconds": 120
+}

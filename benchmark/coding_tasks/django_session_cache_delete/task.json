@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "task_id": "django_session_cache_delete",
+  "repository": "django/django",
+  "revision": "cae38ec9b9bd394f630bdcbffa013c2761e831e9",
+  "issue": "The cached database session backend propagates cache deletion failures after the database session was deleted. Keep synchronous and asynchronous deletion usable when the cache backend fails, and log the cache failure consistently with cache save handling.",
+  "mutation_patch": "mutation.patch",
+  "public_test": "public_test.py",
+  "hidden_test": "../../coding_oracles/hidden/django_regressions.py",
+  "allowed_paths": ["django/contrib/sessions/backends/cached_db.py"],
+  "configure": [{"cwd": ".", "argv": ["{python}", "-c", "import django"]}],
+  "build": [{"cwd": ".", "argv": ["{python}", "-m", "compileall", "-q", "django/contrib/sessions/backends/cached_db.py"]}],
+  "public_test_command": ["{python}", ".agentrix/public_test.py"],
+  "hidden_test_command": ["{python}", "{hidden_test}", "--workspace", "{workspace}", "--task-id", "django_session_cache_delete"],
+  "timeout_seconds": 120
+}

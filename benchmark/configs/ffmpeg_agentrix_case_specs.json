@@ -1,0 +1,26 @@
+[
+  {
+    "case_id": "ffmpeg_bprint_growth", "oracle_task_id": "ffmpeg_bprint_growth",
+    "subsystem": "AVBPrint formatted output",
+    "task": "Formatted AVBPrint appends report one extra logical character. Restore exact length while preserving buffer growth and termination.",
+    "paths": ["libavutil/bprint.c", "libavutil/bprint.h", "libavutil/avstring.c", "libavutil/mem.c", "libavutil/buffer.c", "libavutil/buffer.h", "libavutil/log.c", "libavutil/common.h", "libavutil/tests/bprint.c", "libavutil/tests/avstring.c", "tests/fate/libavutil.mak", "tests/ref/fate/bprint"]
+  },
+  {
+    "case_id": "ffmpeg_dict_count", "oracle_task_id": "ffmpeg_dict_count",
+    "subsystem": "AVDictionary iteration",
+    "task": "Dictionary iteration drops the final entry. Restore complete ordered iteration without changing empty dictionaries or lookup behavior.",
+    "paths": ["libavutil/dict.c", "libavutil/dict.h", "libavutil/opt.c", "libavutil/avstring.c", "libavutil/tests/dict.c", "libavutil/tests/opt.c", "tests/fate/libavutil.mak", "tests/ref/fate/dict"]
+  },
+  {
+    "case_id": "ffmpeg_fifo_readable", "oracle_task_id": "ffmpeg_fifo_readable",
+    "subsystem": "AVFifo readable element accounting",
+    "task": "FIFO readable-element accounting drops one item in the non-wrapped state. Restore exact empty, partial, wrapped, and drained counts.",
+    "paths": ["libavutil/fifo.c", "libavutil/fifo.h", "libavutil/audio_fifo.c", "libavutil/audio_fifo.h", "libavutil/mem.c", "libavutil/buffer.c", "libavutil/buffer.h", "libavutil/frame.c", "libavutil/frame.h", "libavutil/common.h", "libavutil/tests/fifo.c", "libavutil/tests/audio_fifo.c", "tests/fate/libavutil.mak", "tests/ref/fate/fifo"]
+  },
+  {
+    "case_id": "ffmpeg_parse_duration", "oracle_task_id": "ffmpeg_parse_duration",
+    "subsystem": "Time and duration parsing",
+    "task": "Duration strings without an explicit suffix use the wrong time scale. Restore default microsecond parsing while preserving explicit suffixes and date parsing.",
+    "paths": ["libavutil/parseutils.c", "libavutil/parseutils.h", "libavutil/time.c", "libavutil/avstring.c", "libavutil/tests/parseutils.c", "libavutil/tests/eval.c", "tests/fate/libavutil.mak", "tests/ref/fate/parseutils"]
+  }
+]

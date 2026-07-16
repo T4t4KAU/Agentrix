@@ -1,0 +1,13 @@
+{
+  "schema_version": 1, "task_id": "sqlite_round_negative_precision", "repository": "sqlite/sqlite",
+  "revision": "c744314bca7858d131577e0dbf8bb21aa3e3cbf7",
+  "issue": "round(X,Y) treats negative precision as one decimal place instead of zero decimal places. Restore the documented precision clamp while preserving positive precision behavior.",
+  "mutation_patch": "mutation.patch", "public_test": "public_test.py",
+  "hidden_test": "../../coding_oracles/hidden/sqlite_function_regressions.py",
+  "allowed_paths": ["src/func.c"],
+  "configure": [{"cwd": "build", "argv": ["../configure", "--disable-tcl"]}],
+  "build": [{"cwd": "build", "argv": ["make", "clean"]}, {"cwd": "build", "argv": ["make", "-j16", "sqlite3"]}],
+  "public_test_command": ["{python}", ".agentrix/public_test.py"],
+  "hidden_test_command": ["{python}", "{hidden_test}", "--workspace", "{workspace}", "--task-id", "sqlite_round_negative_precision"],
+  "timeout_seconds": 180
+}

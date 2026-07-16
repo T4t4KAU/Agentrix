@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "tasks": [
+    {
+      "task_id": "django_non_atomic_view_copy",
+      "manifest": "django_non_atomic_view_copy/task.json",
+      "classification": "historical_regression",
+      "score_in_formal_accuracy": true
+    },
+    {
+      "task_id": "django_multipart_same_name",
+      "manifest": "django_multipart_same_name/task.json",
+      "classification": "historical_regression",
+      "score_in_formal_accuracy": true
+    },
+    {
+      "task_id": "django_session_cache_delete",
+      "manifest": "django_session_cache_delete/task.json",
+      "classification": "functional_regression",
+      "score_in_formal_accuracy": true
+    },
+    {
+      "task_id": "django_import_string_module",
+      "manifest": "django_import_string_module/task.json",
+      "classification": "functional_regression",
+      "score_in_formal_accuracy": true
+    },
+    {
+      "task_id": "sqlite_length_text", "manifest": "sqlite_length_text/task.json",
+      "classification": "functional_regression", "score_in_formal_accuracy": true
+    },
+    {
+      "task_id": "sqlite_typeof_text", "manifest": "sqlite_typeof_text/task.json",
+      "classification": "functional_regression", "score_in_formal_accuracy": true
+    },
+    {
+      "task_id": "sqlite_round_negative_precision", "manifest": "sqlite_round_negative_precision/task.json",
+      "classification": "functional_regression", "score_in_formal_accuracy": true
+    },
+    {
+      "task_id": "sqlite_unicode_first_character", "manifest": "sqlite_unicode_first_character/task.json",
+      "classification": "functional_regression", "score_in_formal_accuracy": true
+    },
+    {
+      "task_id": "ffmpeg_bprint_growth", "manifest": "ffmpeg_bprint_growth/task.json",
+      "classification": "functional_regression", "score_in_formal_accuracy": true
+    },
+    {
+      "task_id": "ffmpeg_dict_count", "manifest": "ffmpeg_dict_count/task.json",
+      "classification": "functional_regression", "score_in_formal_accuracy": true
+    },
+    {
+      "task_id": "ffmpeg_fifo_readable", "manifest": "ffmpeg_fifo_readable/task.json",
+      "classification": "functional_regression", "score_in_formal_accuracy": true
+    },
+    {
+      "task_id": "ffmpeg_parse_duration", "manifest": "ffmpeg_parse_duration/task.json",
+      "classification": "functional_regression", "score_in_formal_accuracy": true
+    }
+  ]
+}

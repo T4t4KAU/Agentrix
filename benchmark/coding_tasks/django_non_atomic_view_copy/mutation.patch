@@ -1,0 +1,30 @@
+diff --git a/django/db/transaction.py b/django/db/transaction.py
+--- a/django/db/transaction.py
++++ b/django/db/transaction.py
+@@ -1,6 +1,5 @@
+ import warnings
+ from contextlib import ContextDecorator, contextmanager
+-from functools import wraps
+ 
+ from django.db import (
+     DEFAULT_DB_ALIAS,
+@@ -338,16 +337,10 @@ def atomic(using=None, savepoint=True, durable=False):
+ 
+ def _non_atomic_requests(view, using):
+     try:
+-        databases = view._non_atomic_requests | {using}
++        view._non_atomic_requests.add(using)
+     except AttributeError:
+-        databases = {using}
+-
+-    @wraps(view)
+-    def wrapper(*args, **kwargs):
+-        return view(*args, **kwargs)
+-
+-    wrapper._non_atomic_requests = databases
+-    return wrapper
++        view._non_atomic_requests = {using}
++    return view
+ 
+ 
+ def non_atomic_requests(using=None):

@@ -1,0 +1,10 @@
+diff --git a/src/func.c b/src/func.c
+--- a/src/func.c
++++ b/src/func.c
+@@ -1291,5 +1291,5 @@ static void unicodeFunc(
+ ){
+   const unsigned char *z = sqlite3_value_text(argv[0]);
+   (void)argc;
+-  if( z && z[0] ) sqlite3_result_int(context, sqlite3Utf8Read(&z));
++  if( z && z[0] ) sqlite3_result_int(context, sqlite3Utf8Read(&z)+1);
+ }

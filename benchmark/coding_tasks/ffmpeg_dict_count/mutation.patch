@@ -1,0 +1,12 @@
+diff --git a/libavutil/dict.c b/libavutil/dict.c
+--- a/libavutil/dict.c
++++ b/libavutil/dict.c
+@@ -54,7 +54,7 @@ const AVDictionaryEntry *av_dict_iterate(const AVDictionary *m,
+         i = prev - m->elems + 1;
+ 
+     av_assert2(i >= 0);
+-    if (i >= m->count)
++    if (i >= m->count - 1)
+         return NULL;
+ 
+     return &m->elems[i];

@@ -1,0 +1,10 @@
+diff --git a/src/func.c b/src/func.c
+--- a/src/func.c
++++ b/src/func.c
+@@ -81,5 +81,5 @@ static void typeofFunc(
+   int NotUsed,
+   sqlite3_value **argv
+ ){
+-  static const char *azType[] = { "integer", "real", "text", "blob", "null" };
++  static const char *azType[] = { "integer", "real", "blob", "text", "null" };
+   int i = sqlite3_value_type(argv[0]) - 1;

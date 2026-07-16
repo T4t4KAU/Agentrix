@@ -1,0 +1,27 @@
+diff --git a/django/contrib/sessions/backends/cached_db.py b/django/contrib/sessions/backends/cached_db.py
+--- a/django/contrib/sessions/backends/cached_db.py
++++ b/django/contrib/sessions/backends/cached_db.py
+@@ -109,10 +109,7 @@ class SessionStore(DBStore):
+             if self.session_key is None:
+                 return
+             session_key = self.session_key
+-        try:
+-            self._cache.delete(self.cache_key_prefix + session_key)
+-        except Exception:
+-            logger.exception("Error deleting from cache (%s)", self._cache)
++        self._cache.delete(self.cache_key_prefix + session_key)
+ 
+     async def adelete(self, session_key=None):
+         await super().adelete(session_key)
+@@ -120,10 +117,7 @@ class SessionStore(DBStore):
+             if self.session_key is None:
+                 return
+             session_key = self.session_key
+-        try:
+-            await self._cache.adelete(self.cache_key_prefix + session_key)
+-        except Exception:
+-            logger.exception("Error deleting from cache (%s)", self._cache)
++        await self._cache.adelete(self.cache_key_prefix + session_key)
+ 
+     def flush(self):
+         """

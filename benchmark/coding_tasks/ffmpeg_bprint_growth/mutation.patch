@@ -1,0 +1,10 @@
+diff --git a/libavutil/bprint.c b/libavutil/bprint.c
+--- a/libavutil/bprint.c
++++ b/libavutil/bprint.c
+@@ -113,5 +113,5 @@ void av_vbprintf(AVBPrint *buf, const char *fmt, va_list vl_arg)
+         if (av_bprint_alloc(buf, extra_len))
+             break;
+     }
+-    av_bprint_grow(buf, extra_len);
++    av_bprint_grow(buf, extra_len + 1);
+ }

@@ -1,0 +1,30 @@
+[
+  {
+    "case_id": "sqlite_length_text",
+    "oracle_task_id": "sqlite_length_text",
+    "subsystem": "SQL text length semantics",
+    "task": "length() reports one extra character for text. Restore correct empty, ASCII, and multi-byte character counts without changing other value types.",
+    "paths": ["src/func.c", "src/utf.c", "src/vdbeapi.c", "src/vdbemem.c", "src/sqliteInt.h", "test/func.test", "test/e_expr.test", "test/utf16align.test"]
+  },
+  {
+    "case_id": "sqlite_typeof_text",
+    "oracle_task_id": "sqlite_typeof_text",
+    "subsystem": "SQLite dynamic type reporting",
+    "task": "typeof() swaps the labels for text and blob values. Restore the documented names while preserving integer, real, and NULL results.",
+    "paths": ["src/func.c", "src/vdbeapi.c", "src/vdbemem.c", "src/vdbe.c", "src/sqliteInt.h", "test/types.test", "test/e_expr.test", "test/cast.test"]
+  },
+  {
+    "case_id": "sqlite_round_negative_precision",
+    "oracle_task_id": "sqlite_round_negative_precision",
+    "subsystem": "Numeric SQL functions",
+    "task": "round(X,Y) treats negative precision as one decimal place instead of zero. Restore the precision clamp without changing positive precision behavior.",
+    "paths": ["src/func.c", "src/printf.c", "src/util.c", "src/vdbeapi.c", "src/sqliteInt.h", "test/func.test", "test/printf.test", "test/cast.test"]
+  },
+  {
+    "case_id": "sqlite_unicode_first_character",
+    "oracle_task_id": "sqlite_unicode_first_character",
+    "subsystem": "Unicode SQL functions",
+    "task": "unicode(X) returns a value one larger than the first character code point. Restore exact ASCII and multi-byte results while preserving empty and NULL behavior.",
+    "paths": ["src/func.c", "src/utf.c", "src/vdbeapi.c", "src/vdbemem.c", "src/sqliteInt.h", "test/func.test", "test/utf16align.test", "test/e_expr.test"]
+  }
+]

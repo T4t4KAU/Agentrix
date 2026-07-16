@@ -1,0 +1,72 @@
+[
+  {
+    "case_id": "django_non_atomic_view_copy",
+    "oracle_task_id": "django_non_atomic_view_copy",
+    "subsystem": "Transaction decorators and view state",
+    "task": "Applying non_atomic_requests() more than once mutates the original view metadata. Determine the ownership error, preserve wrapper metadata, and produce a focused fix with tests.",
+    "paths": [
+      "django/db/transaction.py",
+      "django/db/backends/base/base.py",
+      "django/db/backends/base/schema.py",
+      "django/utils/decorators.py",
+      "django/views/decorators/csrf.py",
+      "django/core/handlers/base.py",
+      "django/core/handlers/wsgi.py",
+      "tests/handlers/tests.py",
+      "tests/handlers/views.py",
+      "tests/transactions/tests.py"
+    ]
+  },
+  {
+    "case_id": "django_multipart_same_name",
+    "oracle_task_id": "django_multipart_same_name",
+    "subsystem": "Test-client multipart encoding",
+    "task": "The multipart encoder drops values when a regular form field and uploaded file share one MultiValueDict key. Preserve all values without changing normal dictionary or list behavior.",
+    "paths": [
+      "django/test/client.py",
+      "django/utils/datastructures.py",
+      "django/core/files/uploadedfile.py",
+      "django/http/multipartparser.py",
+      "django/http/request.py",
+      "tests/test_client/tests.py",
+      "tests/requests_tests/tests.py",
+      "tests/file_uploads/tests.py"
+    ]
+  },
+  {
+    "case_id": "django_session_cache_delete",
+    "oracle_task_id": "django_session_cache_delete",
+    "subsystem": "Cached database sessions",
+    "task": "A cache deletion failure escapes after the database session was deleted. Keep synchronous and asynchronous deletion usable and log the cache failure consistently.",
+    "paths": [
+      "django/contrib/sessions/backends/cached_db.py",
+      "django/contrib/sessions/backends/db.py",
+      "django/contrib/sessions/backends/cache.py",
+      "django/contrib/sessions/backends/base.py",
+      "django/core/cache/backends/base.py",
+      "tests/sessions_tests/tests.py",
+      "tests/cache/failing_cache.py",
+      "tests/cache/tests.py"
+    ]
+  },
+  {
+    "case_id": "django_import_string_module",
+    "oracle_task_id": "django_import_string_module",
+    "subsystem": "Dynamic module loading",
+    "task": "import_string() cannot return a module or unloaded submodule. Support modules, submodules, and attributes while preserving useful ImportError behavior and collision handling.",
+    "paths": [
+      "django/utils/module_loading.py",
+      "django/utils/autoreload.py",
+      "django/utils/functional.py",
+      "django/apps/config.py",
+      "django/apps/registry.py",
+      "django/core/checks/registry.py",
+      "django/core/management/__init__.py",
+      "django/core/management/base.py",
+      "tests/utils_tests/test_module_loading.py",
+      "tests/apps/tests.py",
+      "tests/apps/apps.py",
+      "tests/utils_tests/test_autoreload.py"
+    ]
+  }
+]
