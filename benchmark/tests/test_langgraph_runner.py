@@ -10,6 +10,7 @@ import pytest
 import langgraph_runner
 from langgraph_runner import (
     CACHEBLEND_SEPARATOR,
+    HotpotRAG,
     LocalRAG,
     build_graph,
     compact_rag_results,
@@ -17,6 +18,7 @@ from langgraph_runner import (
     format_rag_results,
     summarize_rag_reuse,
 )
+from hotpot import load_hotpot
 
 
 class FakeRuntime:
@@ -221,6 +223,7 @@ def test_langgraph_runs_parallel_rag_tool_branches() -> None:
         call["messages"][: len(planner["messages"])] == planner["messages"]
         for call in selections
     )
+    assert len({call["messages"][-1]["content"] for call in selections}) == 4
     assert all(
         call["messages"][len(planner["messages"])]["role"] == "assistant"
         for call in selections
@@ -264,6 +267,140 @@ def test_branch_roles_expand_to_a_full_verification_cohort() -> None:
     ]
 
 
+def test_hotpot_graph_builds_shared_dynamic_fanout(tmp_path: Path) -> None:
+    record = {
+        "_id": "hotpot-1",
+        "question": "Which candidate provides the bridge?",
+        "answer": "Alpha",
+        "supporting_facts": [["Title A", 0], ["Title B", 0]],
+        "context": [
+            [f"Title {letter}", [f"Sentence about candidate {letter}."]]
+            for letter in "ABCDE"
+        ],
+        "type": "bridge",
+        "level": "hard",
+    }
+    path = tmp_path / "hotpot.json"
+    path.write_text(json.dumps([record]), encoding="utf-8")
+    examples = load_hotpot(path)
+
+    class HotpotRuntime:
+        def __init__(self) -> None:
+            self.calls = []
+            self.rag = HotpotRAG(examples)
+            self.rag_format = "plain"
+            self.recorder = SimpleNamespace(started=0.0, add=self._record)
+
+        async def _record(self, event):
+            return None
+
+        async def complete(self, **kwargs):
+            self.calls.append(kwargs)
+            stage = kwargs["stage"]
+            if stage == "planner":
+                content = json.dumps(
+                    {
+                        "analysis": "verify candidates",
+                        "branch_specs": [
+                            {
+                                "kind": "bridge",
+                                "query": f"candidate query {index}",
+                                "goal": f"verify {index}",
+                            }
+                            for index in range(4)
+                        ],
+                    }
+                )
+                return SimpleNamespace(content=content, tool_calls=[])
+            if stage == "tool_select":
+                call = SimpleNamespace(
+                    id=f"tool-{kwargs['branch_id']}",
+                    function=SimpleNamespace(
+                        name="paragraph_search",
+                        arguments=json.dumps({"query": "ignored", "top_k": 2}),
+                    ),
+                )
+                return SimpleNamespace(content="", tool_calls=[call])
+            if stage == "branch_reflect":
+                return SimpleNamespace(
+                    content=json.dumps(
+                        {
+                            "claim": "candidate evidence",
+                            "evidence": [["Title A", 0]],
+                            "confidence": 0.8,
+                        }
+                    ),
+                    tool_calls=[],
+                )
+            return SimpleNamespace(
+                content=json.dumps(
+                    {
+                        "answer": "Alpha",
+                        "supporting_facts": [["Title A", 0], ["Title B", 0]],
+                    }
+                ),
+                tool_calls=[],
+            )
+
+        async def run_tool(
+            self,
+            case_id,
+            branch_id,
+            name,
+            arguments,
+            delay_ms=0,
+            known_results=None,
+        ):
+            assert name == "paragraph_search"
+            results = self.rag.search(
+                arguments["query"], arguments["top_k"], case_id=case_id
+            )
+            return format_rag_results(results, rag_format="plain")
+
+    runtime = HotpotRuntime()
+    graph = build_graph(
+        runtime,
+        branches=4,
+        workload="hotpot",
+        branch_min=4,
+        branch_max=8,
+        token_limits={"planner": 128, "tool_select": 32, "reflect": 64, "reduce": 64},
+    )
+    output = asyncio.run(
+        graph.ainvoke(
+            {
+                "case_id": "hotpot-1",
+                "task": "HotpotQA question: Which candidate provides the bridge?",
+                "context_query": "Which candidate provides the bridge?",
+                "branch_outputs": [],
+            }
+        )
+    )
+
+    assert len(output["branch_outputs"]) == 4
+    assert output["answer"] == {
+        "answer": "Alpha",
+        "supporting_facts": [["Title A", 0], ["Title B", 0]],
+    }
+    planner = next(call for call in runtime.calls if call["stage"] == "planner")
+    selections = [call for call in runtime.calls if call["stage"] == "tool_select"]
+    assert all(
+        call["messages"][: len(planner["messages"])] == planner["messages"]
+        for call in selections
+    )
+
+
+def test_hotpot_supporting_facts_accept_pairs_and_json_objects() -> None:
+    assert langgraph_runner._normalize_supporting_facts(
+        [
+            ["Alpha", 1],
+            {"title": "Beta", "sentence_id": 2},
+            {"title": "Beta", "sentence_id": 2},
+            {"title": "invalid", "sentence_id": True},
+        ]
+    ) == [["Alpha", 1], ["Beta", 2]]
+
+
 def test_dependency_replay_preserves_requests_and_stage_order(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -289,10 +426,16 @@ def test_dependency_replay_preserves_requests_and_stage_order(
                 "case_id": case_id,
                 "stage": stage,
                 "started_ms": index * 10,
+                "usage": {"completion_tokens": 3},
                 "request": {
                     "model": "captured-model",
                     "messages": [{"role": "user", "content": f"{case_id}:{stage}"}],
                     "temperature": 0,
+                    "max_tokens": 7,
+                    "tool_choice": {
+                        "type": "function",
+                        "function": {"name": "paragraph_search"},
+                    },
                 },
             }
             for index, (case_id, stage) in enumerate(
@@ -312,6 +455,8 @@ def test_dependency_replay_preserves_requests_and_stage_order(
         concurrency=4,
         model="qwen3",
         timing="dependency",
+        fixed_output_tokens=True,
+        fixed_output_length_source="captured",
     )
 
     payload = asyncio.run(langgraph_runner.replay_trace(args))
@@ -328,6 +473,13 @@ def test_dependency_replay_preserves_requests_and_stage_order(
         "case-0:tool_select"
     )
     assert {request["model"] for request in requests} == {"qwen3"}
+    assert {request["extra_body"]["min_tokens"] for request in requests} == {3}
+    assert {request["max_tokens"] for request in requests} == {3}
+    assert all(request["extra_body"]["ignore_eos"] is True for request in requests)
+    assert {request["tool_choice"] for request in requests} == {"auto"}
+    assert payload["metadata"]["fixed_output_tokens"] is True
+    assert payload["metadata"]["fixed_output_length_source"] == "captured"
+    assert payload["metadata"]["forced_tool_choice_normalized"] is True
     assert payload["metadata"]["requests"] == 8
 
 
@@ -412,6 +564,7 @@ def test_agent_replay_preserves_branch_dependencies_and_allows_disorder(
         concurrency=8,
         model="qwen3",
         timing="agent",
+        case_concurrency=0,
     )
 
     payload = asyncio.run(langgraph_runner.replay_trace(args))
@@ -424,3 +577,83 @@ def test_agent_replay_preserves_branch_dependencies_and_allows_disorder(
             reflect = completed.index(f"{case_id}:branch-{branch_id}:branch_reflect")
             assert planner < select < reflect < reducer
     assert payload["metadata"]["requests"] == 12
+
+
+def test_agent_replay_case_concurrency_is_closed_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    active_cases: set[str] = set()
+    max_active_cases = 0
+    planner_starts: list[str] = []
+
+    class FakeCompletions:
+        async def create(self, **request):
+            nonlocal max_active_cases
+            label = request["messages"][0]["content"]
+            case_id, stage = label.split(":")
+            if stage == "planner":
+                active_cases.add(case_id)
+                planner_starts.append(case_id)
+                max_active_cases = max(max_active_cases, len(active_cases))
+            await asyncio.sleep(0.001)
+            if stage == "reduce":
+                active_cases.remove(case_id)
+            usage = SimpleNamespace(model_dump=lambda: {"total_tokens": 1})
+            return SimpleNamespace(usage=usage)
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+    events = []
+    for index in range(5):
+        case_id = f"case-{index}"
+        # Large captured gaps must not rate-limit closed-loop replay.
+        for offset, stage in enumerate(
+            ("planner", "tool_select", "branch_reflect", "reduce")
+        ):
+            events.append(
+                {
+                    "kind": "llm",
+                    "case_id": case_id,
+                    "stage": stage,
+                    "branch_id": 0
+                    if stage in {"tool_select", "branch_reflect"}
+                    else None,
+                    "started_ms": index * 10_000 + offset,
+                    "request": {
+                        "model": "source",
+                        "messages": [{"content": f"{case_id}:{stage}"}],
+                    },
+                }
+            )
+        events.append(
+            {
+                "kind": "tool",
+                "case_id": case_id,
+                "stage": "tool",
+                "branch_id": 0,
+                "latency_ms": 0,
+            }
+        )
+    trace = tmp_path / "closed-loop-trace.json"
+    trace.write_text(json.dumps({"events": events}), encoding="utf-8")
+    monkeypatch.setattr(langgraph_runner, "AsyncOpenAI", FakeAsyncOpenAI)
+
+    payload = asyncio.run(
+        langgraph_runner.replay_trace(
+            SimpleNamespace(
+                trace=trace,
+                api_key="local",
+                base_url="http://localhost/v1",
+                concurrency=8,
+                model="qwen3",
+                timing="agent",
+                case_concurrency=2,
+            )
+        )
+    )
+
+    assert max_active_cases == 2
+    assert planner_starts == [f"case-{index}" for index in range(5)]
+    assert payload["metadata"]["case_concurrency"] == 2

@@ -16,4 +16,4 @@ if [[ -z "${VARIANTS+x}" ]]; then
 fi
 export OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/../results/langgraph_prompt_compaction_ablation}"
 
-exec "${SCRIPT_DIR}/run_langgraph_fork_cacheblend_20_e2e.sh"
+exec "${SCRIPT_DIR}/run_hotpot_agentrix_e2e.sh"

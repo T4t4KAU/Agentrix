@@ -228,7 +228,6 @@ Routing should follow the workload, not a global backend preference:
 - repeated application-owned sections already present in history -> exact
   compaction, subject to output-quality guardrails.
 
-Current end-to-end results and limitations are in
-[`langgraph_end_to_end_experiment.md`](langgraph_end_to_end_experiment.md).
-The 20-case construction is specified in
-[`langgraph_case_design.md`](langgraph_case_design.md).
+The current HotpotQA end-to-end positive control, including its performance,
+memory behavior, scope, and limitations, is recorded in
+[`hotpot_agentrix_experiment.md`](hotpot_agentrix_experiment.md).

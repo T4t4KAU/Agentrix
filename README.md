@@ -11,13 +11,13 @@ LMCache integration, and the end-to-end benchmark suite in one repository:
 ## Documentation
 
 - [Agentrix system overview](docs/agentrix_system_overview.md)
-- [LangGraph end-to-end and ablation experiment](docs/langgraph_end_to_end_experiment.md)
-- [LangGraph Agent case design](docs/langgraph_case_design.md)
 - [AutoDL CUDA 12.8 build and benchmark guide](docs/autodl_build_and_benchmark.md)
 - [llama.cpp CUDA/MUSA ForkAttention build and runtime guide](docs/llama_cpp_forkattention_usage.md)
 - [llama.cpp EulerOS and CentOS adaptation notes](docs/llama_cpp_forkattention_hce_centos_adaptation.md)
 - [Prefix-aware data parallel experiment results](docs/dp_experiment_results.md)
 - [Main shared-prefix experiment results](docs/main_experiment_results.md)
+- [HotpotQA Agentrix long-prefix experiment](docs/hotpot_agentrix_experiment.md)
+- [Current HotpotQA ForkAttention/offload restart experiment](docs/offload_restart_experiment.md)
 - [ForkAttention CUDA operator profile](docs/forkattention_operator_profile.md)
 - [Main experiment procedures](docs/main_experiment_matrix.md)
 - [ForkAttention TP model compatibility](docs/tp_model_compatibility.md)

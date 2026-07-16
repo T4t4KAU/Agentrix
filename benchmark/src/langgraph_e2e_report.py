@@ -22,7 +22,10 @@ def quality_summary(payload: dict[str, Any]) -> dict[str, Any]:
     valid_calls = 0
     for event in tool_events:
         calls = event.get("response", {}).get("tool_calls", [])
-        if len(calls) != 1 or calls[0].get("function", {}).get("name") != "rag_search":
+        if len(calls) != 1 or calls[0].get("function", {}).get("name") not in {
+            "rag_search",
+            "paragraph_search",
+        }:
             continue
         try:
             arguments = json.loads(calls[0]["function"].get("arguments", ""))
@@ -164,15 +167,11 @@ def memory_summary(directory: Path) -> dict[str, Any]:
         "server_tree_rss_peak_mib": max(server_tree_rss, default=0.0) / 2**20,
         "lmcache_local_metric_available": local_metric_available,
         "lmcache_local_peak_mib": (
-            max(local_cache, default=0.0) / 2**20
-            if local_metric_available
-            else None
+            max(local_cache, default=0.0) / 2**20 if local_metric_available else None
         ),
         "lmcache_remote_metric_available": remote_metric_available,
         "lmcache_remote_peak_mib": (
-            max(remote_cache, default=0.0) / 2**20
-            if remote_metric_available
-            else None
+            max(remote_cache, default=0.0) / 2**20 if remote_metric_available else None
         ),
         "memory_controller_peak_pct": max(memory_util, default=0.0),
     }
@@ -194,6 +193,27 @@ def build_report(root: Path) -> dict[str, Any]:
             payloads[variant] = _read(path)
     runs = {name: summarize_run(payload) for name, payload in payloads.items()}
     baseline = runs["baseline"]
+    metadata = baseline_payload.get("metadata", {})
+    events = baseline_payload.get("events", [])
+    inferred_cases = len(
+        {str(event["case_id"]) for event in events if event.get("case_id") is not None}
+    )
+    inferred_branches = len(
+        {
+            (str(event["case_id"]), int(event["branch_id"]))
+            for event in events
+            if event.get("case_id") is not None
+            and isinstance(event.get("branch_id"), int)
+        }
+    )
+    tasks = int(metadata.get("cases", inferred_cases))
+    branches_per_case = metadata.get("branches_per_case", [])
+    branches = sum(branches_per_case) if branches_per_case else inferred_branches
+    mode = "live end-to-end"
+    if metadata.get("mode") == "replay":
+        mode = "normalized replay"
+        if metadata.get("case_concurrency", 0):
+            mode = "normalized closed-loop replay"
 
     def comparison(candidate: dict[str, Any]) -> dict[str, float]:
         return {
@@ -210,26 +230,20 @@ def build_report(root: Path) -> dict[str, Any]:
     report = {
         "schema_version": 1,
         "experiment": {
-            "tasks": int(baseline_payload.get("metadata", {}).get("cases", 0)),
-            "branches": sum(
-                baseline_payload.get("metadata", {}).get("branches_per_case", [])
-            ),
+            "tasks": tasks,
+            "branches": branches,
             "baseline": "LangGraph + vLLM FLASH_ATTN",
             "forkattention": "LangGraph + Agentrix FORK_ATTN",
             "cacheblend": "LangGraph + vLLM FLASH_ATTN + LMCache CacheBlend",
-            "mode": "live end-to-end",
+            "mode": mode,
         },
         "runs": runs,
         "quality": {},
         "prompt_compaction": {
-            name: payload.get("metadata", {}).get(
-                "prompt_compaction_report", {}
-            )
+            name: payload.get("metadata", {}).get("prompt_compaction_report", {})
             for name, payload in payloads.items()
         },
-        "memory": {
-            name: memory_summary(root / name) for name in payloads
-        },
+        "memory": {name: memory_summary(root / name) for name in payloads},
         "rag_reuse": baseline_payload.get("metadata", {}).get("rag_reuse", {}),
         "comparison": {
             name: comparison(summary)
@@ -299,11 +313,16 @@ def render_markdown(report: dict[str, Any]) -> str:
         "cacheblend": "CacheBlend",
         "cacheblend_compact": "CacheBlend + compaction",
     }
+    result_kind = (
+        "Agent End-to-End Result"
+        if experiment["mode"] == "live end-to-end"
+        else "Agent Closed-Loop Replay Result"
+    )
     lines = [
-        f"# LangGraph {experiment['tasks']}-Case Agent End-to-End Result",
+        f"# LangGraph {experiment['tasks']}-Case {result_kind}",
         "",
         f"- Tasks: {experiment['tasks']} distinct tasks; {experiment['branches']} total branches",
-        "- Execution: live planner → local RAG tool → branch answer → reducer",
+        f"- Execution: {experiment['mode']}; planner → local RAG tool → branch answer → reducer",
         "",
         "| Variant | Wall time | Speedup | Prompt tokens | Saved chars | Reducer lexical F1 |",
         "|---|---:|---:|---:|---:|---:|",
@@ -314,9 +333,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         compact = report["prompt_compaction"].get(name, {})
         lexical = item_quality.get("reducer_lexical_f1_vs_baseline")
         if name in report.get("ablation", {}):
-            lexical = report["ablation"][name].get(
-                "reducer_lexical_f1_vs_uncompacted"
-            )
+            lexical = report["ablation"][name].get("reducer_lexical_f1_vs_uncompacted")
         row = (
             f"| {labels[name]} | {run['wall_ms'] / 1000:.3f} s "
             f"| {speedup:.2f}x | {run['prompt_tokens']} "
@@ -328,12 +345,13 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"| {compact.get('saved_chars', 0)} | n/a |"
         )
         lines.append(row)
-    lines.extend(
-        [
-            "",
-            f"RAG chunk reuse was {reuse.get('reuse_ratio', 0) * 100:.1f}% across task bootstraps.",
-        ]
-    )
+    lines.append("")
+    if reuse:
+        lines.append(
+            f"RAG chunk reuse was {reuse.get('reuse_ratio', 0) * 100:.1f}% across task bootstraps."
+        )
+    else:
+        lines.append("RAG reuse metadata is not embedded in this replay artifact.")
     lines.extend(
         [
             "",

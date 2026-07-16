@@ -608,115 +608,11 @@ token-level agreement guardrail but is not bitwise or text-exact equivalent.
 Because the bundled snapshots do not provide a common executable evaluator,
 this experiment does not establish environment-level task accuracy.
 
-## LangGraph RAG End-to-End Result
+## HotpotQA Agentrix Positive Control
 
-### Initial mixed-queue comparison
-
-On 2026-07-15, a local Qwen3-0.6B BF16 run compared the original vLLM
-FlashAttention path, Agentrix ForkAttention, and LMCache CacheBlend on one RTX
-5070 12 GiB GPU. The workload contains 20 distinct live LangGraph tasks across
-ForkAttention diagnosis, RAG/cache planning, DP scheduling, deployment review,
-and portability. Every task executes a planner, eight parallel role-specific
-RAG tool calls, eight grounded branch answers, and one reducer. This produces
-540 measured LLM requests and 160 branches per variant.
-
-Each task retrieves 16 local documentation chunks capped at about 20,000
-characters. The 20 task bootstraps contain 320 chunk occurrences but only 77
-unique chunks: 76.4% of bootstrap characters are reusable and 136 task pairs
-contain shared chunks in a different order. Cases arrive over a 1.52-second
-window and run at client concurrency 32, so the workload combines long
-within-case shared prefixes with cross-case reordered RAG evidence.
-
-All variants use the same task file, LocalRAG corpus, BF16 model, output
-budgets, chunked prefill, disabled APC, and disabled async scheduling. Each
-starts a fresh server and receives the same unrelated long-prompt warmup before
-measurement. The baseline and ForkAttention use CUDA Graphs; CacheBlend uses
-eager execution because its current layerwise blender requires that path. The
-run is live end to end rather than trace replay, so model outputs and subsequent
-RAG queries are allowed to propagate through each graph.
-
-| Variant | Wall time | Speedup vs original vLLM | Prompt tok/s | RAG tool validity | Reducer completion |
-|---|---:|---:|---:|---:|---:|
-| Original vLLM FlashAttention | 138.278 s | 1.00x | 16,491.3 | 100% | 100% |
-| Agentrix ForkAttention | 139.714 s | 0.99x | 16,367.1 | 100% | 100% |
-| vLLM FlashAttention + CacheBlend | 99.512 s | 1.39x | 22,942.8 | 100% | 100% |
-
-CacheBlend reports an 86.9% LMCache token lookup hit ratio and restores
-1,966,065 tokens without pin-count warnings. It reduces median request latency
-from 19.448 seconds to 11.503 seconds and P95 from 64.073 seconds to 39.009
-seconds. ForkAttention is effectively neutral on this multi-case mixed queue;
-the result does not support a ForkAttention speedup claim for this workload,
-despite its long per-case shared prefixes.
-
-ForkAttention and CacheBlend are reported separately. The current LMCache
-layerwise blender rejects `ForkAttentionImpl`, so no combined result or
-multiplied speedup is claimed. This is one end-to-end run per variant; valid
-tool calls and non-empty reducers are execution guardrails, not semantic answer
-quality. Its mixed admission parameters are retained here as a negative-control
-record; the current benchmark script and 20-task configuration implement the
-case-major follow-up below.
-
-### ForkAttention-aligned case-major comparison
-
-The follow-up reshapes the same 20 distinct tasks according to the validated
-single-GPU ForkAttention boundary instead of changing their subject matter.
-Every case now retrieves 24 RAG chunks capped at 32,000 characters, creates 16
-role-specific branches, and requests up to 256 tokens from each grounded branch
-answer. Measured tool-selection prompts are 8,810-10,202 tokens with a median
-near 9.36K, so the shared root is inside the documented 8K/16 strong-benefit
-region.
-
-The graph also changes how that work reaches vLLM:
-
-- the planner request is now the exact message-prefix parent inherited by all
-  branch requests, so the normal planner stage naturally warms the final
-  branch root;
-- vLLM prefix caching and CUDA Graphs are enabled for both backends;
-- at most one LangGraph case is active at a time, while all 16 siblings within
-  that case are admitted together;
-- artificial per-branch tool delay is removed, preventing the second branch
-  wave from being staggered by the harness.
-
-This remains a live end-to-end workflow: planner output, generated tool calls,
-LocalRAG results, branch answers, and reducer inputs propagate normally. It is
-not a fixed trace replay. Across 20 cases it records 1,020 measured events:
-680 LLM requests, 340 retrieval/tool events, and 320 branches.
-
-| Variant | Wall time | Speedup | Prompt tok/s | Request latency P50 | Request latency P95 | RAG tool validity | Reducer completion |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| Original vLLM FlashAttention | 253.010 s | 1.00x | 26,249.9 | 1,393.5 ms | 8,605.8 ms | 99.4% | 100% |
-| Agentrix ForkAttention | 144.415 s | 1.75x | 46,000.1 | 790.0 ms | 3,805.5 ms | 100% | 100% |
-
-The two variants process nearly identical prompt volume: 6,641,489 baseline
-tokens versus 6,643,078 ForkAttention tokens, a 0.024% difference. Completion
-volume differs by 1.67%, which is far smaller than the 42.9% wall-time
-reduction. End-of-process Prometheus counters confirm physical execution:
-ForkAttention has 5,704 active steps among 12,263 observed steps (46.5%), with
-18,826 shared and 87,553 singleton CTA-plan entries. These counters include the
-unrelated 31-request, one-token warmup; the updated runner now snapshots the
-counters after warmup so future reports subtract it automatically.
-
-This result supports the intended scoped claim: ForkAttention accelerates a
-long-lived Agent fanout when one resident 8K-or-longer root spawns a synchronized
-16-branch decode cohort. The initial mixed-queue result remains the negative
-control showing that long text and logical similarity alone are insufficient.
-The case-major comparison has one run per backend and uses tool-call validity
-and reducer completion as execution guardrails rather than semantic task-score
-evaluation.
-
-The current comparison is reproducible from `benchmark/` with:
-
-```bash
-CASES=20 VARIANTS='forkattention baseline' \
-OUTPUT_ROOT=results/langgraph_fork_case_major_20 \
-./scripts/run_langgraph_fork_cacheblend_20_e2e.sh
-```
-
-The latest six-variant run adds application compaction, CacheBlend, physical
-memory sampling, and the content-versioned RAG manifest. Its results and
-limitations are recorded in
-[`langgraph_end_to_end_experiment.md`](langgraph_end_to_end_experiment.md),
-with case construction in [`langgraph_case_design.md`](langgraph_case_design.md).
+The standalone configuration, live-pipeline scope, results, limitations, and
+reproduction commands are recorded in
+[`hotpot_agentrix_experiment.md`](hotpot_agentrix_experiment.md).
 
 ## Artifacts
 

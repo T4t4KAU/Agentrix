@@ -26,7 +26,7 @@ def run_script(name: str, **environment: str) -> subprocess.CompletedProcess[str
     [
         ("run_cacheblend_langgraph_rag.sh", {}),
         (
-            "run_langgraph_fork_cacheblend_20_e2e.sh",
+            "run_hotpot_agentrix_e2e.sh",
             {"VARIANTS": "cacheblend"},
         ),
     ],
@@ -42,7 +42,7 @@ def test_cacheblend_requires_explicit_opt_in(
 
 def test_cacheblend_rejects_plain_rag_format() -> None:
     result = run_script(
-        "run_langgraph_fork_cacheblend_20_e2e.sh",
+        "run_hotpot_agentrix_e2e.sh",
         ENABLE_CACHEBLEND="1",
         VARIANTS="cacheblend",
         RAG_FORMAT="plain",

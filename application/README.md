@@ -35,15 +35,15 @@ token count.
 The executable ablation is:
 
 ```bash
-CASES=20 CASE_CONCURRENCY=1 \
+CASES=100 CASE_CONCURRENCY=2 \
   benchmark/scripts/run_langgraph_prompt_compaction_ablation.sh
 ```
 
-By default it runs the four Flash/Fork fresh-server variants over the same 20
-tasks. CacheBlend is opt-in:
+By default it runs the four Flash/Fork fresh-server variants over the same 100
+frozen HotpotQA cases. CacheBlend is opt-in:
 
 ```bash
-ENABLE_CACHEBLEND=1 CASES=20 CASE_CONCURRENCY=1 \
+ENABLE_CACHEBLEND=1 CASES=100 CASE_CONCURRENCY=2 \
   benchmark/scripts/run_langgraph_prompt_compaction_ablation.sh
 ```
 
@@ -55,8 +55,8 @@ The opt-in run adds the final CacheBlend pair:
 | ForkAttention | `forkattention` | `forkattention_compact` | compaction/Fork interaction |
 | CacheBlend | `cacheblend` | `cacheblend_compact` | compaction/CacheBlend interaction |
 
-All selected variants use the same task file, RAG corpus, token limits,
-case-major admission, unrelated backend warm-up, and one fresh vLLM process.
+All selected variants use the same HotpotQA manifest, donor contexts, token
+limits, case admission, unrelated backend warm-up, and one fresh vLLM process.
 CacheBlend is kept on its required FlashAttention/eager path and is not
 combined with ForkAttention. Formal numbers should use at least three
 repetitions with

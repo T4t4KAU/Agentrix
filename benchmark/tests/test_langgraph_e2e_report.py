@@ -63,17 +63,71 @@ def test_build_live_e2e_report(tmp_path: Path) -> None:
 
     assert report["comparison"]["forkattention"]["wall_speedup"] == 2
     assert report["comparison"]["cacheblend"]["wall_speedup"] == 4
-    assert report["ablation"]["baseline_compact"][
-        "wall_speedup_vs_uncompacted"
-    ] == 4 / 3
-    assert report["ablation"]["baseline_compact"][
-        "reducer_lexical_f1_vs_uncompacted"
-    ] == 1
-    assert report["quality"]["baseline_compact"][
-        "reducer_lexical_f1_vs_baseline"
-    ] == 1
+    assert (
+        report["ablation"]["baseline_compact"]["wall_speedup_vs_uncompacted"] == 4 / 3
+    )
+    assert (
+        report["ablation"]["baseline_compact"]["reducer_lexical_f1_vs_uncompacted"] == 1
+    )
+    assert report["quality"]["baseline_compact"]["reducer_lexical_f1_vs_baseline"] == 1
     assert report["quality"]["cacheblend"]["valid_tool_call_rate"] == 1
     assert "1-Case Agent End-to-End" in render_markdown(report)
+
+
+def test_report_accepts_hotpot_paragraph_search(tmp_path: Path) -> None:
+    payload = _run(1000)
+    payload["events"][0]["response"]["tool_calls"][0]["function"]["name"] = (
+        "paragraph_search"
+    )
+    for variant in ("baseline", "forkattention"):
+        directory = tmp_path / variant
+        directory.mkdir()
+        (directory / "run.json").write_text(json.dumps(payload), encoding="utf-8")
+        (directory / "measured_server.log").write_text("", encoding="utf-8")
+
+    report = build_report(tmp_path)
+
+    assert report["quality"]["baseline"]["valid_tool_call_rate"] == 1
+
+
+def test_report_infers_replay_cases_and_branches(tmp_path: Path) -> None:
+    payload = _run(1000)
+    payload["metadata"] = {
+        "mode": "replay",
+        "case_concurrency": 2,
+        "wall_ms": 1000,
+    }
+    payload["events"] = [
+        {
+            "case_id": case_id,
+            "branch_id": branch_id,
+            "stage": "tool_select",
+            "latency_ms": 1,
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            "response": {},
+        }
+        for case_id in ("case-0", "case-1")
+        for branch_id in (0, 1, 2)
+    ]
+    for variant in ("baseline", "forkattention"):
+        directory = tmp_path / variant
+        directory.mkdir()
+        (directory / "run.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    report = build_report(tmp_path)
+
+    assert report["experiment"] == {
+        "tasks": 2,
+        "branches": 6,
+        "baseline": "LangGraph + vLLM FLASH_ATTN",
+        "forkattention": "LangGraph + Agentrix FORK_ATTN",
+        "cacheblend": "LangGraph + vLLM FLASH_ATTN + LMCache CacheBlend",
+        "mode": "normalized closed-loop replay",
+    }
+    markdown = render_markdown(report)
+    assert "2-Case Agent Closed-Loop Replay" in markdown
+    assert "normalized closed-loop replay" in markdown
+    assert "RAG reuse metadata is not embedded" in markdown
 
 
 def test_fork_prometheus_metrics(tmp_path: Path) -> None:

@@ -189,6 +189,18 @@ OUTPUT_ROOT=results/main_experiment_full32 \
 ./scripts/run_main_experiment.sh
 ```
 
+## HotpotQA Agentrix Positive Control
+
+The frozen 100-case matrix, manifest generation, and executed settings are
+maintained separately in
+[`hotpot_agentrix_experiment.md`](hotpot_agentrix_experiment.md).
+
+The corrected closed-loop Qwen3-0.6B 100-case comparison, including the
+7 GiB GPU-only Flash/Fork pair and the 4 GiB two-level Flash-original versus
+Fork-optimized offload pair, is recorded in
+[`offload_restart_experiment.md`](offload_restart_experiment.md). Three-level
+storage scheduling is excluded from that formal matrix.
+
 ## Detached Runs
 
 Long runs should be detached from the SSH or IDE session by wrapping the exact
