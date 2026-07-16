@@ -759,6 +759,46 @@ check:
 | 64K | 8,760,560 | 285,472 | 8,475,088 | 96.74% | 0.00114 s |
 | 96K | 13,117,980 | 417,532 | 12,700,448 | 96.82% | 0.00155 s |
 
+### Why Cumulative Queue Time Collapses
+
+The queue-time improvement is an indirect consequence of DP placement and KV
+admission, not a faster queue data structure. vLLM defines a request's queue
+interval as the time from its first engine `QUEUED` event to its first
+`SCHEDULED` event. The Prometheus `_sum` is the sum of this interval over all
+finished requests and ranks. It can therefore be much larger than experiment
+wall time when many concurrent requests wait at the same time. Later
+preemptions are not added to this initial queue interval.
+
+Ordinary DP balances load without preserving content ownership. At 64K, two
+measured roots already require approximately 131,190 tokens before branch
+state, slightly more than the 131,072-token rank capacity. At 96K, two roots
+require approximately 196,704 tokens. A branch sent to a rank that does not
+own its root must allocate and compute a new 64K/96K prefix, but that rank may
+already hold another root. The request remains capacity-waiting while the
+running long prefill occupies both GPU time and KV space. Mixing and replacing
+roots then causes a nonlinear cycle of repeated prefill, long resource holding
+time, and head-of-line queue amplification. The formal Flash runs observed up
+to 120 and 123 waiting requests at 64K and 96K respectively.
+
+Prefix-aware DP instead sends all siblings to the rank holding their resident
+root. Cached root blocks are shared by reference across the cohort; each branch
+needs only its short group/private suffix and generated-token KV. The 96.74%
+and 96.82% prompt-cache-hit shares show that almost all root work is skipped.
+One rank can consequently admit its complete 32-branch cohort without hitting
+the `max_num_seqs=64` limit or the physical KV limit. Both Fork runs reached
+128 active requests globally and zero waiting, so requests were scheduled
+almost immediately after entering their rank's engine. This is why cumulative
+queue fell to 0.00114 and 0.00155 seconds rather than merely improving in
+proportion to prefill speed.
+
+This metric does not cover every delay visible to the client. DP coordinator
+routing, the prefix-aware arrival wave, HTTP handling, and any time before the
+engine emits the first `QUEUED` event can still contribute to TTFT. Near-zero
+scheduler queue therefore means immediate rank-local admission, not zero
+end-to-end latency. It also explains the TPOT tradeoff: requests that formerly
+waited are now active together, increasing effective decode batch size and
+aggregate throughput while lengthening the per-request output-token interval.
+
 ForkAttention physical execution was active in both arms: fork-active steps
 were 73.53% and 74.23% at 64K and 96K, and shared CTAs were 63.63% and 63.66%.
 These counters verify the selected backend path but are not used to claim that
