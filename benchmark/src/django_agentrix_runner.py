@@ -297,19 +297,33 @@ def percentile(values: list[float], fraction: float) -> float | None:
     return ordered[lower] * (1 - weight) + ordered[upper] * weight
 
 
-def load_cases(paths: list[Path]) -> list[dict[str, Any]]:
-    if not paths:
-        raise ValueError("at least one case file is required")
+def load_cases(path: Path) -> list[dict[str, Any]]:
     cases = [
         json.loads(line)
-        for path in paths
         for line in path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
     case_ids = [str(case["case_id"]) for case in cases]
     if len(case_ids) != len(set(case_ids)):
-        raise ValueError("case IDs must be unique across all case files")
+        raise ValueError("case IDs must be unique within the case file")
     return cases
+
+
+def select_cases(
+    cases: list[dict[str, Any]],
+    *,
+    offset: int,
+    limit: int,
+    required_count: int,
+) -> list[dict[str, Any]]:
+    if offset < 0 or limit < 0 or required_count < 0:
+        raise ValueError("case selection values must be non-negative")
+    selected = cases[offset:]
+    if limit:
+        selected = selected[:limit]
+    if required_count and len(selected) != required_count:
+        raise ValueError(f"selected {len(selected)} cases, expected {required_count}")
+    return selected
 
 
 def summarize_repository_metrics(
@@ -345,9 +359,12 @@ def summarize_repository_metrics(
 
 
 async def run(args: argparse.Namespace) -> dict[str, Any]:
-    cases = load_cases(args.cases)
-    if args.case_limit:
-        cases = cases[: args.case_limit]
+    cases = select_cases(
+        load_cases(args.cases),
+        offset=args.case_offset,
+        limit=args.case_limit,
+        required_count=args.required_case_count,
+    )
     client = AsyncOpenAI(api_key="local", base_url=args.base_url, timeout=900)
     total_branches = sum(len(case["branches"]) for case in cases)
     round_parties = {
@@ -413,6 +430,8 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "experiment_variant": args.experiment_variant,
         "attention_backend": args.attention_backend,
         "dp_policy": args.dp_policy,
+        "case_file": str(args.cases),
+        "case_offset": args.case_offset,
         "trajectory_mode": args.trajectory_mode,
         "prompt_compaction": args.prompt_compaction,
         "round_count": args.rounds,
@@ -470,11 +489,13 @@ def main() -> None:
     )
     parser.add_argument("--base-url", default="http://127.0.0.1:9000/v1")
     parser.add_argument("--model", required=True)
-    parser.add_argument("--cases", type=Path, nargs="+", required=True)
+    parser.add_argument("--cases", type=Path, required=True)
     parser.add_argument("--experiment-variant", default="unspecified")
     parser.add_argument("--attention-backend", default="unspecified")
     parser.add_argument("--dp-policy", default="unspecified")
+    parser.add_argument("--case-offset", type=int, default=0)
     parser.add_argument("--case-limit", type=int, default=0)
+    parser.add_argument("--required-case-count", type=int, default=0)
     parser.add_argument("--branch-output-tokens", type=int, default=256)
     parser.add_argument("--rounds", type=int, default=1)
     parser.add_argument("--trajectory-mode", choices=("live", "replay"), default="live")

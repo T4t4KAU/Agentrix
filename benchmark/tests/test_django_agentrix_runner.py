@@ -9,6 +9,7 @@ from django_agentrix_runner import (
     WaveBarrier,
     load_cases,
     percentile,
+    select_cases,
     summarize_repository_metrics,
 )
 
@@ -31,17 +32,17 @@ def test_wave_barrier_releases_all_parties() -> None:
     assert asyncio.run(exercise()) == [0, 1, 2]
 
 
-def test_load_cases_combines_unique_repository_files(tmp_path: Path) -> None:
-    paths = []
-    for index, repository in enumerate(("django/django", "sqlite/sqlite")):
-        path = tmp_path / f"cases-{index}.jsonl"
-        path.write_text(
-            json.dumps({"case_id": f"case-{index}", "repo": repository}) + "\n",
-            encoding="utf-8",
-        )
-        paths.append(path)
+def test_load_cases_reads_one_repository_file(tmp_path: Path) -> None:
+    path = tmp_path / "cases.jsonl"
+    path.write_text(
+        "\n".join(
+            json.dumps({"case_id": f"case-{index}", "repo": "django/django"})
+            for index in range(2)
+        ),
+        encoding="utf-8",
+    )
 
-    assert [case["case_id"] for case in load_cases(paths)] == ["case-0", "case-1"]
+    assert [case["case_id"] for case in load_cases(path)] == ["case-0", "case-1"]
 
 
 def test_load_cases_rejects_duplicate_ids(tmp_path: Path) -> None:
@@ -57,7 +58,21 @@ def test_load_cases_rejects_duplicate_ids(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValueError, match="case IDs must be unique"):
-        load_cases([path])
+        load_cases(path)
+
+
+def test_select_cases_partitions_24_cases_into_three_dp8_batches() -> None:
+    cases = [{"case_id": f"case-{index}"} for index in range(24)]
+
+    batches = [
+        select_cases(cases, offset=offset, limit=8, required_count=8)
+        for offset in (0, 8, 16)
+    ]
+
+    assert [len(batch) for batch in batches] == [8, 8, 8]
+    assert {case["case_id"] for batch in batches for case in batch} == {
+        f"case-{index}" for index in range(24)
+    }
 
 
 def test_summarize_repository_metrics_keeps_repository_breakdown() -> None:

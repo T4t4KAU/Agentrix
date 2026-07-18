@@ -295,12 +295,29 @@ three-repository result.
 ## DP=8 Full-System Comparison
 
 The next comparison extends the coding-agent workload to eight internal-DP
-replicas and loads all 12 existing cases from Django, SQLite, and FFmpeg in one
-run. The combined workload contains 12 independent approximately 30K parent
-contexts and 192 subagents. Its deterministic three-round replay produces the
-request waves `192 -> 144 -> 48`, or 384 branch model requests in total. The
-runner records both aggregate metrics and a repository-level breakdown so the
-combined result does not hide a regression on one repository.
+replicas and uses exactly eight independent approximately 30K parent contexts,
+preserving the original one-case-per-replica pressure shape. Django, SQLite,
+and FFmpeg remain separate experiments; repository cases are never mixed in
+one run.
+
+Each repository provides 24 deterministic cases divided into three fixed
+eight-case batches at offsets 0, 8, and 16. Each batch contains 128 subagents.
+Its three-round replay produces the request waves `128 -> 96 -> 32`, or 256
+branch model requests. Thus the 24 cases provide three within-repository
+repeats without changing the per-rank workload.
+
+The additional cases come from ordinary functional commits reachable from the
+pinned revision. The generator excludes commits whose subjects or paths match
+security, credential, crash, malformed-input, fuzzing, bounds, or unsafe-memory
+topics. Every selected case asks for read-only behavior and test analysis; it
+does not request a code modification. Each generated record stores the source
+commit and subject for audit.
+
+Every eight-case batch contains 96 byte-identical tool/source segments that
+are already present in its parent contexts. Across all three batches,
+application compaction can omit 288 sections: 1,057,489 characters for Django,
+1,003,179 for SQLite, and 861,577 for FFmpeg. The baseline retains those bytes;
+the optimized arm removes them through stable application-owned segment IDs.
 
 The default DP=8 matrix intentionally compares two complete configurations:
 
@@ -316,48 +333,52 @@ the same case files, replay history, branch order, output limit, model, and
 physical KV capacity. The output records the attention backend, DP policy, and
 compaction state to make accidental configuration mixing visible.
 
+Memory sampling records per-GPU and aggregate HBM use, the delta above the
+post-load warm minimum, memory-controller utilization, per-engine and aggregate
+KV occupancy, estimated live KV tokens, vLLM process-tree RSS, and application
+process-tree RSS. Raw 0.5-second samples remain available alongside the summary.
+
 This two-arm result measures the complete optimized system against the stated
 vLLM baseline. It does not by itself attribute an improvement separately to
 prompt compaction, prefix-aware routing, or ForkAttention. A later attribution
 matrix should add FlashAttention with compaction and ForkAttention with
 prefix-aware DP but without compaction while holding all other controls fixed.
 
-Run the default DP=8 comparison with:
+Run all three batches for one repository with:
 
 ```bash
 MODEL_PATH=/test__02/hwx/Qwen3-32B \
-OUTPUT_ROOT=benchmark/results/coding_agentrix_dp8_r1 \
+REPOSITORY=sqlite \
+OUTPUT_ROOT=benchmark/results/coding_agentrix_dp8/sqlite \
 bash benchmark/scripts/run_django_agentrix_dp.sh
 ```
 
-The launcher defaults to GPUs `0,1,2,3,4,5,6,7`, DP=8, three replay rounds,
-64 generated tokens per branch request, and all three repository case files.
-`CASES_PATHS` accepts a colon-separated list when a narrower workload is
-required. The historical launcher name is retained for compatibility even
-though the DP=8 default is a combined repository suite.
+Repeat with `REPOSITORY=django` and `REPOSITORY=ffmpeg`. The launcher defaults
+to GPUs `0,1,2,3,4,5,6,7`, DP=8, the three batch offsets `0 8 16`, three replay
+rounds, and 64 generated tokens per branch request. `CASES_PATH` and
+`BATCH_OFFSETS` can select a specific generated file or one batch. The
+historical launcher name is retained for compatibility even though the runner
+and schema are repository-generic.
 
 ## Reproduction
 
-Regenerate a repository dataset with:
+Regenerate one repository's deterministic commit specifications and cases with:
 
 ```bash
+PYTHONPATH=benchmark/src benchmark/.venv/bin/python -m commit_case_specs \
+  --repo benchmark/repos/sqlite --repository-slug sqlite/sqlite \
+  --output benchmark/configs/sqlite_agentrix_commit24_specs.json \
+  --count 24 --allowed-suffixes .c,.h --max-context-paths 32
+
 benchmark/.venv/bin/python benchmark/scripts/build_django_agentrix_cases.py \
   --repo benchmark/repos/sqlite \
-  --specs benchmark/configs/sqlite_agentrix_case_specs.json \
-  --output benchmark/data/sqlite_agentrix/cases_30k_b16.jsonl \
+  --specs benchmark/configs/sqlite_agentrix_commit24_specs.json \
+  --output benchmark/data/sqlite_agentrix/cases_30k_b16_commit24.jsonl \
   --target-tokens 30000 --repo-id sqlite/sqlite \
   --repository-name SQLite --manifest-file manifest.uuid
 ```
 
-Run the heterogeneous three-stage live workload by adding these settings to
-the existing DP launcher:
-
-```bash
-ROUNDS=3 TRAJECTORY_MODE=replay BRANCH_OUTPUT_TOKENS=64 \
-CASES_PATH=benchmark/data/sqlite_agentrix/cases_30k_b16.jsonl \
-bash benchmark/scripts/run_django_agentrix_dp.sh
-```
-
-The launcher enables application compaction for both variants. Use `live` only
-for a later quality-aware experiment. The current launcher name is retained
-for compatibility even though the runner and schema are repository-generic.
+Use `--allowed-suffixes .py --max-context-paths 64` for Django and
+`--allowed-suffixes .c,.h --max-context-paths 32` for FFmpeg. The baseline
+keeps application compaction disabled; only the optimized variant enables it.
+Use `live` only for a later quality-aware experiment.

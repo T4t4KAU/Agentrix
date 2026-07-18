@@ -30,6 +30,26 @@ BRANCH_TASKS = (
     "Synthesize an independent diagnosis with file and symbol evidence suitable for the parent coding agent.",
 )
 
+COMMIT_ANALYSIS_BRANCH_TASKS = (
+    "Trace the affected execution path and summarize the observable behavior.",
+    "Explain the ownership and state-transition invariants touched by the change.",
+    "Describe the public API contract and compatibility considerations.",
+    "Inspect related tests and explain which behavior they establish.",
+    "Find analogous implementations that clarify the intended design pattern.",
+    "Analyze error handling and cleanup behavior without proposing code changes.",
+    "Compare synchronous and asynchronous paths where both exist.",
+    "Identify platform or backend assumptions visible in the supplied context.",
+    "Summarize the data flow across the affected functions and modules.",
+    "Explain how the change interacts with cached or derived state.",
+    "List ordinary functional edge cases relevant to understanding the behavior.",
+    "Assess likely performance implications along the affected hot paths.",
+    "Explain serialization or persistence implications where relevant.",
+    "Identify neighboring subsystems whose behavior should remain unchanged.",
+    "Act as a skeptical reviewer and separate confirmed evidence from inference.",
+    "Synthesize a read-only design analysis with file and symbol evidence.",
+)
+
+
 def build_trajectory(
     *,
     index: int,
@@ -37,12 +57,14 @@ def build_trajectory(
     task: str,
     paths: list[str],
     source_sections: list[dict[str, Any]],
+    branch_tasks: tuple[str, ...],
+    analysis_only: bool,
 ) -> list[dict[str, Any]]:
     trajectory = [
         {
             "stage": "triage",
             "instruction": (
-                f"Private investigation {index + 1}/{len(BRANCH_TASKS)} "
+                f"Private investigation {index + 1}/{len(branch_tasks)} "
                 f"for {subsystem}:\n{task}"
             ),
         }
@@ -78,23 +100,31 @@ def build_trajectory(
                     "from inference and all ownership and cleanup risks resolved."
                 ),
                 "instruction": (
-                    "Return the final implementation recommendation and an "
+                    "Return the final read-only behavior analysis and evidence "
+                    "summary while preserving the required JSON schema."
+                    if analysis_only
+                    else "Return the final implementation recommendation and an "
                     "ordered test plan while preserving the required JSON schema."
                 ),
             }
         )
     return trajectory
 
+
 SYSTEM_PROMPT = """You are a read-only repository coding subagent working for a parent coding agent.
 Analyze the frozen repository snapshot and the assigned private investigation. Do not invent files or symbols.
 Return a detailed JSON report with keys hypothesis, evidence, affected_symbols, recommended_change, tests, and risks.
 Evidence entries must cite repository-relative paths and symbol names. Do not emit a patch."""
 
+COMMIT_ANALYSIS_SYSTEM_PROMPT = """You are a read-only repository analysis subagent working for a parent coding agent.
+Analyze the frozen repository snapshot and the assigned ordinary functional commit-analysis question.
+Do not suggest or perform code modifications.
+Return a detailed JSON report with keys hypothesis, evidence, affected_symbols, behavior, tests, and risks.
+Evidence entries must cite repository-relative paths and symbol names."""
+
 
 def git_output(repo: Path, *args: str) -> str:
-    return subprocess.check_output(
-        ("git", "-C", str(repo), *args), text=True
-    ).strip()
+    return subprocess.check_output(("git", "-C", str(repo), *args), text=True).strip()
 
 
 def repository_map(repo: Path, paths: list[str]) -> str:
@@ -108,15 +138,16 @@ def repository_map(repo: Path, paths: list[str]) -> str:
             str(path.relative_to(repo))
             for path in root.iterdir()
             if path.is_file()
-            and path.suffix
-            in {".c", ".h", ".mak", ".py", ".rst", ".txt", ".y"}
+            and path.suffix in {".c", ".h", ".mak", ".py", ".rst", ".txt", ".y"}
         )
         lines.extend(entries)
     return "\n".join(lines)
 
 
 def render_section(path: str, content: str) -> str:
-    return f"\n\n===== BEGIN FILE: {path} =====\n{content}\n===== END FILE: {path} ====="
+    return (
+        f"\n\n===== BEGIN FILE: {path} =====\n{content}\n===== END FILE: {path} ====="
+    )
 
 
 def fit_parent(
@@ -128,22 +159,30 @@ def fit_parent(
     repository_name: str,
 ) -> tuple[str, list[dict[str, Any]]]:
     commit = git_output(repo, "rev-parse", "HEAD")
+    analysis_only = spec.get("case_kind") == "commit_analysis"
+    constraints = (
+        "- Treat this checkout as a frozen read-only snapshot.\n"
+        "- Explain ordinary functional behavior using supplied source and tests.\n"
+        "- Do not suggest or perform code modifications."
+        if analysis_only
+        else "- Treat this checkout as a frozen read-only snapshot.\n"
+        "- Base every claim on the supplied source or tests.\n"
+        "- Preserve documented behavior and backwards compatibility.\n"
+        "- Prefer focused SQLite-compatible regression tests."
+    )
     prefix = f"""{repository_name.upper()} CODING CASE
-Case: {spec['case_id']}
-Subsystem: {spec['subsystem']}
+Case: {spec["case_id"]}
+Subsystem: {spec["subsystem"]}
 Repository commit: {commit}
 
 Parent task:
-{spec['task']}
+{spec["task"]}
 
 Constraints:
-- Treat this checkout as a frozen read-only snapshot.
-- Base every claim on the supplied source or tests.
-- Preserve documented behavior and backwards compatibility.
-- Prefer focused SQLite-compatible regression tests.
+{constraints}
 
 REPOSITORY MAP
-{repository_map(repo, spec['paths'])}
+{repository_map(repo, spec["paths"])}
 
 FROZEN SOURCE CONTEXT"""
     text = prefix
@@ -208,6 +247,8 @@ def build(args: argparse.Namespace) -> list[dict[str, Any]]:
     encoding = tiktoken.get_encoding(args.encoding)
     cases = []
     for spec in specs:
+        analysis_only = spec.get("case_kind") == "commit_analysis"
+        branch_tasks = COMMIT_ANALYSIS_BRANCH_TASKS if analysis_only else BRANCH_TASKS
         parent, segments = fit_parent(
             repo=repo,
             spec=spec,
@@ -216,7 +257,12 @@ def build(args: argparse.Namespace) -> list[dict[str, Any]]:
             repository_name=getattr(args, "repository_name", "Django"),
         )
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "system",
+                "content": (
+                    COMMIT_ANALYSIS_SYSTEM_PROMPT if analysis_only else SYSTEM_PROMPT
+                ),
+            },
             {"role": "user", "content": parent},
         ]
         cases.append(
@@ -224,6 +270,9 @@ def build(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "schema_version": 2,
                 "case_id": spec["case_id"],
                 "oracle_task_id": spec.get("oracle_task_id"),
+                "case_kind": spec.get("case_kind", "functional_task"),
+                "source_commit": spec.get("source_commit"),
+                "source_subject": spec.get("source_subject"),
                 "subsystem": spec["subsystem"],
                 "repo": getattr(args, "repo_id", "django/django"),
                 "repo_commit": git_output(repo, "rev-parse", "HEAD"),
@@ -248,7 +297,7 @@ def build(args: argparse.Namespace) -> list[dict[str, Any]]:
                     {
                         "branch_id": index,
                         "private_instruction": (
-                            f"Private investigation {index + 1}/{len(BRANCH_TASKS)} "
+                            f"Private investigation {index + 1}/{len(branch_tasks)} "
                             f"for {spec['subsystem']}:\n{task}"
                         ),
                         "trajectory": build_trajectory(
@@ -259,9 +308,11 @@ def build(args: argparse.Namespace) -> list[dict[str, Any]]:
                             source_sections=[
                                 segment["prompt_section"] for segment in segments
                             ],
+                            branch_tasks=branch_tasks,
+                            analysis_only=analysis_only,
                         ),
                     }
-                    for index, task in enumerate(BRANCH_TASKS)
+                    for index, task in enumerate(branch_tasks)
                 ],
             }
         )

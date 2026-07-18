@@ -3,10 +3,13 @@
 ## Scope
 
 Agentrix's `application` layer performs exact deduplication and optional
-recoverable tool-result paging before a prompt is sent to vLLM. The existing
-coding-agent benchmark enables exact deduplication for both comparison arms:
-FlashAttention with ordinary DP and ForkAttention with prefix-aware DP. These
-transformations are not attention optimizations and do not alter DP routing.
+recoverable tool-result paging before a prompt is sent to vLLM. The completed
+DP=4 coding-agent benchmark enabled exact deduplication for both comparison
+arms: FlashAttention with ordinary DP and ForkAttention with prefix-aware DP.
+The planned DP=8 full-system comparison instead keeps the vLLM/FlashAttention
+baseline uncompressed and enables exact deduplication only in the optimized
+ForkAttention arm. These transformations are not attention optimizations and
+do not alter DP routing.
 
 The current implementation targets a common coding-agent redundancy pattern:
 a repository source section is already present in the frozen parent context,
@@ -168,11 +171,12 @@ receive a tool observation containing a source section that is already in the
 metadata but omits that repeated payload. Both DP variants receive the same
 compacted request stream.
 
-The formal H20 experiment uses compaction unconditionally; it does not add a
-raw/compact performance arm. This keeps the primary comparison focused on
-Flash ordinary DP versus Fork prefix-aware DP. The runner still records the
-counterfactual duplicate bytes, removed-section count, and actual input-token
-total so that compaction is auditable.
+The completed DP=4 H20 experiment used compaction unconditionally; it did not
+add a raw/compact performance arm. The DP=8 experiment changes that policy:
+its baseline retains the repeated tool sections, while its optimized arm omits
+them. Both arms still record the counterfactual duplicate bytes,
+removed-section count, and actual input-token total so that compaction is
+auditable.
 
 ## Static Compaction Opportunity
 
