@@ -217,12 +217,16 @@ def build_graph(
                     compaction_totals["before_chars"] += report.before_chars
                     compaction_totals["after_chars"] += report.after_chars
                 else:
-                    section_text = "\n\n".join(section.render() for section in tool_sections)
+                    section_text = "\n\n".join(
+                        section.render() for section in tool_sections
+                    )
                     compaction_totals["input_sections"] += len(tool_sections)
                     compaction_totals["output_sections"] += len(tool_sections)
                     compaction_totals["before_chars"] += len(section_text)
                     compaction_totals["after_chars"] += len(section_text)
-                observation = f"{observation}\n\n{section_text}" if section_text else observation
+                observation = (
+                    f"{observation}\n\n{section_text}" if section_text else observation
+                )
             if observation:
                 messages.append(
                     {
@@ -293,12 +297,55 @@ def percentile(values: list[float], fraction: float) -> float | None:
     return ordered[lower] * (1 - weight) + ordered[upper] * weight
 
 
-async def run(args: argparse.Namespace) -> dict[str, Any]:
+def load_cases(paths: list[Path]) -> list[dict[str, Any]]:
+    if not paths:
+        raise ValueError("at least one case file is required")
     cases = [
         json.loads(line)
-        for line in args.cases.read_text(encoding="utf-8").splitlines()
+        for path in paths
+        for line in path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+    case_ids = [str(case["case_id"]) for case in cases]
+    if len(case_ids) != len(set(case_ids)):
+        raise ValueError("case IDs must be unique across all case files")
+    return cases
+
+
+def summarize_repository_metrics(
+    branches: list[RequestMetric], case_repositories: dict[str, str]
+) -> dict[str, dict[str, Any]]:
+    summaries = {}
+    for repository in sorted(set(case_repositories.values())):
+        current = [
+            metric
+            for metric in branches
+            if case_repositories[metric.case_id] == repository
+        ]
+        started_ms = min((metric.started_ms for metric in current), default=0.0)
+        ended_ms = max(
+            (metric.started_ms + metric.latency_ms for metric in current),
+            default=started_ms,
+        )
+        wall_ms = ended_ms - started_ms
+        output_tokens = sum(metric.output_tokens for metric in current)
+        ttfts = [metric.ttft_ms for metric in current if metric.ttft_ms is not None]
+        tpots = [metric.tpot_ms for metric in current if metric.tpot_ms is not None]
+        summaries[repository] = {
+            "request_count": len(current),
+            "wall_time_ms": wall_ms,
+            "input_tokens": sum(metric.input_tokens for metric in current),
+            "output_tokens": output_tokens,
+            "output_tokens_per_s": (output_tokens * 1000 / wall_ms if wall_ms else 0.0),
+            "ttft_p50_ms": percentile(ttfts, 0.50),
+            "ttft_p95_ms": percentile(ttfts, 0.95),
+            "tpot_p50_ms": percentile(tpots, 0.50),
+        }
+    return summaries
+
+
+async def run(args: argparse.Namespace) -> dict[str, Any]:
+    cases = load_cases(args.cases)
     if args.case_limit:
         cases = cases[: args.case_limit]
     client = AsyncOpenAI(api_key="local", base_url=args.base_url, timeout=900)
@@ -332,9 +379,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     ]
     if branches:
         branch_start = min(metric.started_ms for metric in branches)
-        branch_end = max(
-            metric.started_ms + metric.latency_ms for metric in branches
-        )
+        branch_end = max(metric.started_ms + metric.latency_ms for metric in branches)
         branch_wall_ms = branch_end - branch_start
     else:
         branch_wall_ms = 0.0
@@ -342,6 +387,9 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     ttfts = [metric.ttft_ms for metric in branches if metric.ttft_ms is not None]
     tpots = [metric.tpot_ms for metric in branches if metric.tpot_ms is not None]
     repositories = sorted({case.get("repo", "unknown") for case in cases})
+    case_repositories = {
+        str(case["case_id"]): str(case.get("repo", "unknown")) for case in cases
+    }
     round_metrics = {}
     for round_index in range(1, args.rounds + 1):
         current = [x for x in branches if x.round_index == round_index]
@@ -362,6 +410,9 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "schema_version": 2,
         "workload": "repository_agentrix_long_prefix_fanout",
+        "experiment_variant": args.experiment_variant,
+        "attention_backend": args.attention_backend,
+        "dp_policy": args.dp_policy,
         "trajectory_mode": args.trajectory_mode,
         "prompt_compaction": args.prompt_compaction,
         "round_count": args.rounds,
@@ -391,11 +442,10 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             "mean": statistics.fmean(tpots) if tpots else None,
         },
         "round_metrics": round_metrics,
+        "repository_metrics": summarize_repository_metrics(branches, case_repositories),
         "requests": [asdict(metric) for metric in metrics],
         "branch_results": [
-            result
-            for state in states
-            for result in state.get("branch_results", [])
+            result for state in states for result in state.get("branch_results", [])
         ],
         "compaction": {
             key: sum(
@@ -415,16 +465,19 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run repository Agentrix LangGraph cases")
+    parser = argparse.ArgumentParser(
+        description="Run repository Agentrix LangGraph cases"
+    )
     parser.add_argument("--base-url", default="http://127.0.0.1:9000/v1")
     parser.add_argument("--model", required=True)
-    parser.add_argument("--cases", type=Path, required=True)
+    parser.add_argument("--cases", type=Path, nargs="+", required=True)
+    parser.add_argument("--experiment-variant", default="unspecified")
+    parser.add_argument("--attention-backend", default="unspecified")
+    parser.add_argument("--dp-policy", default="unspecified")
     parser.add_argument("--case-limit", type=int, default=0)
     parser.add_argument("--branch-output-tokens", type=int, default=256)
     parser.add_argument("--rounds", type=int, default=1)
-    parser.add_argument(
-        "--trajectory-mode", choices=("live", "replay"), default="live"
-    )
+    parser.add_argument("--trajectory-mode", choices=("live", "replay"), default="live")
     parser.add_argument("--prompt-compaction", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -436,7 +489,11 @@ def main() -> None:
     )
     print(
         json.dumps(
-            {key: value for key, value in payload.items() if key not in {"requests", "branch_results"}},
+            {
+                key: value
+                for key, value in payload.items()
+                if key not in {"requests", "branch_results"}
+            },
             indent=2,
         )
     )

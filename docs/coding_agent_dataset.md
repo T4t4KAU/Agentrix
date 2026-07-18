@@ -292,6 +292,50 @@ This pilot validated the service mechanism before the multi-round replay above.
 It has no executable coding-accuracy oracle and should not replace the formal
 three-repository result.
 
+## DP=8 Full-System Comparison
+
+The next comparison extends the coding-agent workload to eight internal-DP
+replicas and loads all 12 existing cases from Django, SQLite, and FFmpeg in one
+run. The combined workload contains 12 independent approximately 30K parent
+contexts and 192 subagents. Its deterministic three-round replay produces the
+request waves `192 -> 144 -> 48`, or 384 branch model requests in total. The
+runner records both aggregate metrics and a repository-level breakdown so the
+combined result does not hide a regression on one repository.
+
+The default DP=8 matrix intentionally compares two complete configurations:
+
+- `flash_uncompressed_dp`: vLLM with FlashAttention, ordinary internal-DP
+  placement, and application prompt compaction disabled;
+- `fork_prefix_aware_compact_dp`: ForkAttention with prefix-aware internal-DP
+  placement and application prompt compaction enabled.
+
+The baseline therefore contains neither application compression nor
+prefix-aware placement. Tool-KV trimming and predicted TTL are explicitly
+disabled for both variants and are outside this experiment. Both variants use
+the same case files, replay history, branch order, output limit, model, and
+physical KV capacity. The output records the attention backend, DP policy, and
+compaction state to make accidental configuration mixing visible.
+
+This two-arm result measures the complete optimized system against the stated
+vLLM baseline. It does not by itself attribute an improvement separately to
+prompt compaction, prefix-aware routing, or ForkAttention. A later attribution
+matrix should add FlashAttention with compaction and ForkAttention with
+prefix-aware DP but without compaction while holding all other controls fixed.
+
+Run the default DP=8 comparison with:
+
+```bash
+MODEL_PATH=/test__02/hwx/Qwen3-32B \
+OUTPUT_ROOT=benchmark/results/coding_agentrix_dp8_r1 \
+bash benchmark/scripts/run_django_agentrix_dp.sh
+```
+
+The launcher defaults to GPUs `0,1,2,3,4,5,6,7`, DP=8, three replay rounds,
+64 generated tokens per branch request, and all three repository case files.
+`CASES_PATHS` accepts a colon-separated list when a narrower workload is
+required. The historical launcher name is retained for compatibility even
+though the DP=8 default is a combined repository suite.
+
 ## Reproduction
 
 Regenerate a repository dataset with:
