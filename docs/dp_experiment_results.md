@@ -828,3 +828,110 @@ effective decode batch described in the preceding H20 section.
 - YaRN was configured identically for both variants, but long-context task
   quality was not measured. These results only establish systems behavior for
   the constructed shape.
+
+## H20 DP=6/8 Pressure32K/32 Weak Scaling
+
+The H20 weak-scaling experiment extends Pressure32K/32 to six and eight data-
+parallel replicas. Each rank receives one independent AgencyBench-derived
+shared-prefix cohort, and every cohort contains 32 branches. The per-rank
+workload therefore remains fixed while aggregate request count grows with DP
+size.
+
+### Workload and Configuration
+
+| Item | DP=6 | DP=8 |
+|---|---:|---:|
+| H20-3e GPUs / internal DP replicas | 6 | 8 |
+| Independent 32K prefix cohorts | 6 | 8 |
+| Branches per cohort | 32 | 32 |
+| Bootstrap + branch requests | 6 + 192 = 198 | 8 + 256 = 264 |
+| Branch output tokens | 49,152 | 65,536 |
+| KV blocks per rank | 3,852 | 3,852 |
+| Aggregate KV capacity | 90.281 GiB | 120.375 GiB |
+
+Both DP sizes use Qwen3-32B in float16 with TP=1, a measured shared prefix of
+approximately 32,835 tokens per cohort, 256 output tokens per branch,
+`max_num_seqs=64`, shuffled arrival order with seed 2026, CUDA Graphs, and no
+offload or reload rebalance. FlashAttention ordinary DP and ForkAttention
+prefix-aware DP consume the same records and request order within each DP-size
+comparison. All requests completed with zero preemptions.
+
+### End-to-End Performance
+
+| DP | Variant | Branch wall | Branch output tok/s | Case wall | Case output tok/s | TTFT P50 / P95 / P99 | TPOT P50 / P95 / P99 |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 6 | FlashAttention ordinary DP | 803.758 s | 61.153 | 829.766 s | 59.236 | 378.805 / 732.541 / 777.858 s | 25.050 / 36.854 / 37.186 ms |
+| 6 | ForkAttention prefix-aware DP | 38.821 s | 1,266.113 | 64.725 s | 759.401 | 5.452 / 9.043 / 9.798 s | 120.725 / 129.407 / 130.766 ms |
+| 8 | FlashAttention ordinary DP | 800.667 s | 81.852 | 826.460 s | 79.297 | 356.454 / 724.689 / 782.939 s | 25.042 / 36.975 / 49.094 ms |
+| 8 | ForkAttention prefix-aware DP | 43.565 s | 1,504.320 | 69.507 s | 942.864 | 7.192 / 14.090 / 14.501 s | 117.273 / 126.909 / 130.434 ms |
+
+At DP=6, prefix-aware execution improves branch-only throughput by 20.70x and
+case-level throughput by 12.82x; TTFT P50 falls by 98.56%. At DP=8, the
+corresponding improvements are 18.38x, 11.89x, and 97.98%. TPOT is higher for
+Fork because prefix-aware admission makes the full branch population active
+quickly, increasing effective decode batch size instead of leaving most
+requests waiting behind repeated prefill.
+
+The nearly constant case wall within each backend is the principal weak-
+scaling result. Increasing the workload from six to eight cohorts raises Flash
+case throughput by 33.87% and Fork case throughput by 24.16%, while case wall
+changes from 829.766 to 826.460 seconds for Flash and from 64.725 to 69.507
+seconds for Fork.
+
+### Prompt Compute, Prefill, and Queueing
+
+The time columns below are final Prometheus sums across all requests and ranks.
+They are cumulative scheduler durations and can exceed wall time when requests
+wait or execute concurrently.
+
+| DP | Variant | Total prompt source | Local prompt compute | Local cache hit | Cache-hit share | Cumulative prefill | Cumulative queue | Cumulative decode |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| 6 | FlashAttention ordinary DP | 6,587,988 | 5,034,612 | 1,553,376 | 23.58% | 3,744.388 s | 69,166.848 s | 1,372.405 s |
+| 6 | ForkAttention prefix-aware DP | 6,587,988 | 230,052 | 6,357,936 | 96.51% | 238.839 s | 0.001712 s | 5,934.553 s |
+| 8 | FlashAttention ordinary DP | 8,799,064 | 6,606,008 | 2,193,056 | 24.92% | 4,971.992 s | 86,715.488 s | 1,866.970 s |
+| 8 | ForkAttention prefix-aware DP | 8,799,064 | 306,824 | 8,492,240 | 96.51% | 333.508 s | 0.002229 s | 7,662.811 s |
+
+Prefix-aware placement reduces local prompt computation by 95.43% at DP=6
+and 95.36% at DP=8. Cumulative prefill falls by 93.62% and 93.29%,
+respectively, and cumulative initial scheduler queue falls from tens of
+thousands of request-seconds to approximately two milliseconds. No external
+KV transfer contributes to either result. The increase in cumulative decode
+time reflects concurrency: Fork admits almost all branches together, whereas
+ordinary DP serializes long-prefix work and leaves most branches waiting.
+
+### KV Residency and ForkAttention Activity
+
+| DP | Variant | Peak physical KV | Peak capacity usage | Logical repeated KV avoided | Logical KV-read reduction |
+|---:|---|---:|---:|---:|---:|
+| 6 | FlashAttention ordinary DP | 49.462 GiB | 54.79% | - | - |
+| 6 | ForkAttention prefix-aware DP | 66.857 GiB | 74.05% | 6,266,137 tokens / 1,529.819 GiB | 98.06% |
+| 8 | FlashAttention ordinary DP | 65.732 GiB | 54.61% | - | - |
+| 8 | ForkAttention prefix-aware DP | 87.945 GiB | 73.06% | 8,368,080 tokens / 2,042.988 GiB | 98.04% |
+
+Fork's sampled physical KV peak is 35.17% higher at DP=6 and 33.79% higher at
+DP=8. This is not a loss of prefix sharing: ordinary DP has lower sampled
+occupancy because most requests remain queued, while prefix-aware DP admits
+the complete branch population and stores more private decode state
+concurrently. Logical KV-read reduction measures avoided repeated prefix reads
+and is distinct from allocated physical cache capacity.
+
+| DP | Observed steps | Fork-active steps | Active-step share | Shared / singleton CTA entries | Shared CTA share | Final rank routes |
+|---:|---:|---:|---:|---:|---:|---|
+| 6 | 2,226 | 1,671 | 75.07% | 84,102 / 47,760 | 63.78% | `[33, 33, 33, 33, 33, 33]` |
+| 8 | 3,361 | 2,421 | 72.03% | 113,296 / 63,782 | 63.98% | `[33, 33, 33, 33, 33, 33, 33, 33]` |
+
+The final allocations include one bootstrap and 32 branches per rank, proving
+that every configured replica owns and serves one independent prefix cohort.
+The physical counters also verify that the ForkAttention path is active. The
+reported speedups remain system-level placement, residency, prefill, and
+admission results rather than isolated attention-kernel speedups.
+
+### Limitations
+
+- Each DP/backend cell currently has one formal repeat.
+- This is weak scaling: total cohorts and total branch count increase with DP
+  size. It should not be interpreted as strong scaling of a fixed request set.
+- The comparison changes the attention backend and DP routing policy together;
+  it does not isolate an ordinary-DP ForkAttention arm.
+- Task quality is not evaluated. The dataset supplies real Agent prompts, but
+  the measured outcome is systems performance for the controlled fanout shape.
