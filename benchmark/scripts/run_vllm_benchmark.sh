@@ -271,6 +271,27 @@ def prometheus_counter(path: Path, metric: str) -> float:
     return sum(float(value) for value in pattern.findall(text))
 
 
+def prometheus_counter_with_labels(
+    path: Path, metric: str, **required_labels: str
+) -> float:
+    if not path.exists():
+        return 0.0
+    pattern = re.compile(
+        rf"^{re.escape(metric)}(?:_total)?\{{([^}}]*)\}}\s+([0-9.eE+-]+)$",
+        re.MULTILINE,
+    )
+    total = 0.0
+    for labels, value in pattern.findall(
+        path.read_text(encoding="utf-8", errors="ignore")
+    ):
+        if all(
+            f'{name}="{expected}"' in labels
+            for name, expected in required_labels.items()
+        ):
+            total += float(value)
+    return total
+
+
 def parse_log(path: Path) -> dict[str, object]:
     text = path.read_text(encoding="utf-8", errors="ignore")
     lines = text.splitlines()
@@ -372,6 +393,42 @@ def parse_log(path: Path) -> dict[str, object]:
                 values,
             )
         )
+    secondary_metrics: dict[str, float] = {}
+    for direction in ("load", "store"):
+        for suffix in (
+            "submitted_jobs",
+            "submitted_blocks",
+            "submitted_bytes",
+            "transferred_blocks",
+            "transferred_bytes",
+            "dedup_skipped_blocks",
+            "dedup_skipped_bytes",
+            "completed_jobs",
+            "failed_jobs",
+        ):
+            secondary_metrics[f"secondary_{direction}_{suffix}"] = (
+                prometheus_counter_with_labels(
+                    metrics_path,
+                    f"vllm:kv_offload_secondary_{suffix}",
+                    direction=direction,
+                )
+            )
+        for suffix in ("count", "sum"):
+            secondary_metrics[f"secondary_{direction}_latency_{suffix}"] = (
+                prometheus_counter_with_labels(
+                    metrics_path,
+                    f"vllm:kv_offload_secondary_job_latency_seconds_{suffix}",
+                    direction=direction,
+                )
+            )
+    for result in ("hit", "miss", "retry"):
+        secondary_metrics[f"secondary_lookup_{result}"] = (
+            prometheus_counter_with_labels(
+                metrics_path,
+                "vllm:kv_offload_secondary_lookups",
+                result=result,
+            )
+        )
     return {
         "log": str(path),
         "gpu_kv_cache_tokens": sum(
@@ -426,6 +483,7 @@ def parse_log(path: Path) -> dict[str, object]:
         "fork_metadata_avg_ms": metadata_averages,
         "fork_dp_prefix_routing": routing_stats,
         "fork_dp_reload": reload_stats,
+        **secondary_metrics,
         **profile,
     }
 
@@ -520,6 +578,24 @@ def main() -> int:
         "kv_offload_store_bytes",
         "kv_offload_store_operations",
         "num_preemptions",
+        *(
+            f"secondary_{direction}_{suffix}"
+            for direction in ("load", "store")
+            for suffix in (
+                "submitted_jobs",
+                "submitted_blocks",
+                "submitted_bytes",
+                "transferred_blocks",
+                "transferred_bytes",
+                "dedup_skipped_blocks",
+                "dedup_skipped_bytes",
+                "completed_jobs",
+                "failed_jobs",
+                "latency_count",
+                "latency_sum",
+            )
+        ),
+        *(f"secondary_lookup_{result}" for result in ("hit", "miss", "retry")),
     ):
         aggregate[key] = sum(float(rank.get(key, 0.0)) for rank in ranks)
     for direction in ("load", "store"):
@@ -528,6 +604,18 @@ def main() -> int:
         aggregate[f"kv_offload_{direction}_average_mib"] = (
             total_bytes / operations / 1024**2 if operations else 0.0
         )
+        latency_count = float(
+            aggregate[f"secondary_{direction}_latency_count"]
+        )
+        latency_sum = float(aggregate[f"secondary_{direction}_latency_sum"])
+        aggregate[f"secondary_{direction}_average_latency_ms"] = (
+            1000 * latency_sum / latency_count if latency_count else 0.0
+        )
+    logical_store = float(aggregate["secondary_store_submitted_bytes"])
+    dedup_store = float(aggregate["secondary_store_dedup_skipped_bytes"])
+    aggregate["secondary_store_dedup_percent"] = (
+        100 * dedup_store / logical_store if logical_store else 0.0
+    )
     reload_totals = {
         key: sum(
             int(rank.get("fork_dp_reload", {}).get(key, 0))
