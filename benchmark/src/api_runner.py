@@ -235,9 +235,16 @@ async def run_api_case(
         raise ValueError(f"unsupported DP routing: {dp_routing}")
 
     case_started = time.perf_counter()
+    openai_timeout_seconds = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "600"))
+    if openai_timeout_seconds <= 0:
+        raise ValueError("OPENAI_TIMEOUT_SECONDS must be positive")
     client_base_urls = list(base_urls or [base_url])
     clients = [
-        AsyncOpenAI(api_key=os.getenv(api_key_env), base_url=url)
+        AsyncOpenAI(
+            api_key=os.getenv(api_key_env),
+            base_url=url,
+            timeout=openai_timeout_seconds,
+        )
         for url in client_base_urls
     ]
     dp_size = internal_dp_size or len(clients)
