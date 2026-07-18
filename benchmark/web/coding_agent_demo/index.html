@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agentrix · Live Coding Agents</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <div class="ambient ambient-left"></div>
+    <div class="ambient ambient-right"></div>
+    <main class="shell">
+      <header class="topbar">
+        <div class="brand">
+          <div class="mark"><span></span><span></span><span></span></div>
+          <div>
+            <h1>Live Coding Agents</h1>
+            <p>Identical work · Eight GPUs · One synchronized start</p>
+          </div>
+        </div>
+        <div class="run-control">
+          <div id="connection" class="connection"><i></i><span>Connecting</span></div>
+          <div id="speedup" class="speedup hidden"><strong>—</strong><span>live throughput</span></div>
+          <button id="start" type="button"><span>Start fair run</span><b>→</b></button>
+        </div>
+      </header>
+
+      <section class="comparison">
+        <article class="side agentrix" data-side="left">
+          <header class="side-header">
+            <div>
+              <p class="eyebrow">Optimized</p>
+              <h2>Agentrix</h2>
+            </div>
+            <div class="gpu-label" id="left-title">GPU 0,1,2,3</div>
+          </header>
+          <div class="metric-strip">
+            <div class="hero-metric"><span>Generated</span><strong id="left-tokens">0</strong><em id="left-estimate"></em></div>
+            <div><span>Finished</span><strong id="left-done">0</strong></div>
+            <div><span>Prefill / Gen / Queue</span><strong><i id="left-prefill">0</i><small> / </small><i id="left-generating">0</i><small> / </small><i id="left-waiting">0</i></strong></div>
+            <div><span>Rate</span><strong id="left-rate">0 tok/s</strong></div>
+          </div>
+          <div class="telemetry">
+            <div class="memory-line">
+              <span>HBM average / GPU <b id="left-hbm">waiting</b></span>
+              <span>Active KV cache <b id="left-kv">—</b></span>
+              <span>Prefill compute <b id="left-prefill-compute">0</b></span>
+              <div class="meter"><i id="left-memory-bar"></i></div>
+            </div>
+            <div class="routing-line">
+              <span class="route-mode prefix">◆ PREFIX-AWARE DP</span>
+              <div class="ranks" id="left-ranks"><span>waiting for telemetry</span></div>
+            </div>
+          </div>
+          <div class="route-map">
+            <div class="route-map-head"><span>Live sequence routing · color = shared-prefix affinity</span><b>Queued <i id="left-queue-depth">0</i></b><b>Avg wait <i id="left-queue-time">—</i></b></div>
+            <div class="route-groups" id="left-route-groups"><span>Waiting for routing decisions…</span></div>
+          </div>
+          <div class="stream-stage" id="left-streams">
+            <div class="empty-state"><i></i><p>Agents are ready.</p><span>Start the synchronized workload to watch them investigate the repository.</span></div>
+          </div>
+        </article>
+
+        <div class="divider"><span>VS</span></div>
+
+        <article class="side baseline" data-side="right">
+          <header class="side-header">
+            <div>
+              <p class="eyebrow">Traditional</p>
+              <h2>vLLM baseline</h2>
+            </div>
+            <div class="gpu-label" id="right-title">GPU 4,5,6,7</div>
+          </header>
+          <div class="metric-strip">
+            <div class="hero-metric"><span>Generated</span><strong id="right-tokens">0</strong><em id="right-estimate"></em></div>
+            <div><span>Finished</span><strong id="right-done">0</strong></div>
+            <div><span>Prefill / Gen / Queue</span><strong><i id="right-prefill">0</i><small> / </small><i id="right-generating">0</i><small> / </small><i id="right-waiting">0</i></strong></div>
+            <div><span>Rate</span><strong id="right-rate">0 tok/s</strong></div>
+          </div>
+          <div class="telemetry">
+            <div class="memory-line">
+              <span>HBM average / GPU <b id="right-hbm">waiting</b></span>
+              <span>Active KV cache <b id="right-kv">—</b></span>
+              <span>Prefill compute <b id="right-prefill-compute">0</b></span>
+              <div class="meter"><i id="right-memory-bar"></i></div>
+            </div>
+            <div class="routing-line">
+              <span class="route-mode ordinary">↻ ORDINARY DP</span>
+              <div class="ranks" id="right-ranks"><span>waiting for telemetry</span></div>
+            </div>
+          </div>
+          <div class="route-map">
+            <div class="route-map-head"><span>Live sequence routing · color = shared-prefix affinity</span><b>Queued <i id="right-queue-depth">0</i></b><b>Avg wait <i id="right-queue-time">—</i></b></div>
+            <div class="route-groups" id="right-route-groups"><span>Waiting for routing decisions…</span></div>
+          </div>
+          <div class="stream-stage" id="right-streams">
+            <div class="empty-state"><i></i><p>Agents are ready.</p><span>Both systems receive the same cases and generation limits.</span></div>
+          </div>
+        </article>
+      </section>
+
+      <footer class="footer">
+        <span><i class="legend queued"></i>Queued</span>
+        <span><i class="legend prefill"></i>Prefill</span>
+        <span><i class="legend generating"></i>Generating</span>
+        <span><i class="legend complete"></i>Complete</span>
+        <p id="phase-copy">Waiting to start</p>
+      </footer>
+    </main>
+    <script src="/assets/app.js"></script>
+  </body>
+</html>

@@ -23,6 +23,7 @@ data = [
   "huggingface_hub>=0.23",
   "Pillow>=10.0",
 ]
+demo = ["aiohttp>=3.9,<4", "textual>=0.80,<2"]
 test = ["pytest>=8.0", "langgraph>=1.2,<2"]
 
 [project.scripts]
@@ -30,6 +31,8 @@ agentrix-bench = "cli:main"
 agentrix-langgraph = "langgraph_runner:main"
 agentrix-cacheblend-report = "cacheblend_rag_report:main"
 agentrix-langgraph-e2e-report = "langgraph_e2e_report:main"
+agentrix-coding-demo = "coding_agent_demo_tui:main"
+agentrix-coding-demo-web = "coding_agent_demo_web:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -46,6 +49,10 @@ py-modules = [
   "agent_context_redundancy",
   "coding_agent_e2e_runner",
   "coding_agent_memory",
+  "coding_agent_demo",
+  "coding_agent_demo_tui",
+  "coding_agent_demo_web",
+  "coding_agent_gpu_telemetry",
   "coding_agent_tools",
   "coding_task_oracle",
   "commit_case_specs",
