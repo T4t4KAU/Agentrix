@@ -332,6 +332,19 @@ placement. Generation uses `ignore_eos` so all variants produce the same
 number of output tokens. The runner retains a different-image cache-identity
 mode for diagnostics, but it is not part of the primary DP matrix.
 
+Unlike the text-only Pressure32K/32 workload, which constructs each shared
+root by repeating or truncating textual Agent task content, the WebLINX
+workload derives every root from a real browser interaction state. Its shared
+causal prefix contains a webpage screenshot together with the DOM,
+conversation, action history, and generated common analysis. Eight ranked
+action candidates are selected from each WebLINX turn, and every candidate is
+expanded into four evaluation rollouts to preserve the same 32-branch fanout
+shape. Prefix identity and reuse consequently depend on both textual KV state
+and visual-input identity, including multimodal processor caching. The text
+portion is fitted to approximately 28K tokens rather than 32,768 tokens so
+that image tokens, chat-template framing, branch suffixes, and generated output
+remain within the 32K context limit.
+
 ### 9.3 Reproduction
 
 ```bash
