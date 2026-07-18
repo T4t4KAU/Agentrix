@@ -1,16 +1,16 @@
 [submodule "vllm"]
 	path = vllm
-	url = https://github.com/T4t4KAU/vllm.git
+	url = https://gitlink.org.cn/I1Dsk46hji/vllm.git
 	branch = fork-attn
 [submodule "LMCache"]
 	path = LMCache
-	url = https://github.com/T4t4KAU/LMCache.git
+	url = https://gitlink.org.cn/I1Dsk46hji/LMCache.git
 	branch = fork-attn
 [submodule "llama.cpp"]
 	path = llama.cpp
-	url = https://github.com/T4t4KAU/llama.cpp.git
+	url = https://gitlink.org.cn/I1Dsk46hji/llama.git
 	branch = fork-attn
 [submodule "sglang"]
 	path = sglang
-	url = https://github.com/oyyyyy61/sglang.git
+	url = https://gitlink.org.cn/I1Dsk46hji/sglang.git
 	branch = fork-attn
