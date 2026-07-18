@@ -1,0 +1,17 @@
+{
+  "attention_backend": "FLASH_ATTN",
+  "dram_read_bytes": 9682944.0,
+  "dram_read_bytes_per_output_token": 4841472.0,
+  "dram_read_sectors": 302592.0,
+  "fma_pipe_warp_instructions": 299288.0,
+  "kernel_launches": 2,
+  "kernel_specializations": 2,
+  "kernel_time_ns": 44224.0,
+  "l2_read_bytes": 18431328.0,
+  "l2_read_hit_rate_percent": 47.62643192047033,
+  "l2_read_hit_sectors": 273651.0,
+  "l2_read_miss_sectors": 300927.0,
+  "l2_read_sectors": 575979.0,
+  "output_token_count": 2,
+  "tensor_pipe_warp_instructions": 278528.0
+}

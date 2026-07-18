@@ -348,6 +348,84 @@ why 8K/16 is 8.49x faster at the operator level despite Fork reading 1.7% more
 DRAM in that single capture. Flash's cache hits avoid external memory but do
 not eliminate its repeated attention math or on-chip data movement.
 
+## Negative-Benefit Boundary
+
+The main matrix intentionally starts at 4K and two queries. A separate boundary
+test forced Fork on smaller or weakly shared shapes to determine when saved KV
+work no longer offsets launch, split, gather, and occupancy costs. This is
+important because a reduction in bytes or instructions does not by itself
+guarantee lower latency.
+
+The first sweep used the same Qwen3-0.6B operator geometry and correctness
+check, but varied prefix from 16 to 2,048 tokens and query count from 1 to 32.
+Each reported eager time is the median of 15 alternating Flash/Fork repetitions
+with 400 operator invocations per repetition after 50 warm-ups. The confirmed
+low-query boundary around a 2K prefix is:
+
+| Prefix | Queries | Private suffix | Flash | Fork | Flash/Fork | Fork overhead |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2K | 1 | 128 | 54.95 us | 74.21 us | 0.740x | +35.0% |
+| 2K | 2 | 128 | 65.18 us | 74.54 us | 0.874x | +14.4% |
+| 2K | 4 | 128 | 88.41 us | 74.46 us | 1.187x | -15.8% |
+
+The transition is not monotonic in prefix length because the production
+adaptive splitter activates at 4K. At 4K it creates additional prefix CTAs and
+restores parallelism; the forced q=1/2/4 points measured 3.05x/4.03x/5.22x.
+
+The 2K/q=2 negative point was then captured with the same five-pass NCU method
+as the main matrix:
+
+| Metric | Flash | Fork | Fork change |
+|---|---:|---:|---:|
+| Total attention-kernel time | 44.224 us | 88.512 us | 2.00x slower |
+| DRAM read bytes | 9,682,944 | 9,530,624 | 1.6% lower |
+| L2 read bytes | 18,431,328 | 9,829,504 | 46.7% lower |
+| Tensor-pipe warp instructions | 278,528 | 36,864 | 86.8% lower |
+| FMA-pipe warp instructions | 299,288 | 75,160 | 74.9% lower |
+
+The apparent paradox is occupancy. Flash's split kernel launches 96 blocks,
+or two waves on this 48-SM GPU, and takes 37.760 us; its combine kernel takes
+6.464 us. Fork's main kernel launches only 24 blocks, or 0.25 reported waves,
+and takes 85.280 us; gather adds 3.232 us. Fork performs substantially less
+logical work but does not expose enough parallelism to use the GPU efficiently.
+
+The current production cascade heuristic rejects fewer than eight queries and
+prefixes shorter than 256 tokens. Therefore the clear q=1/2 forced-operator
+regressions above do not enter the Fork path in normal serving.
+
+### Low Shared-Fraction Risk
+
+A second sweep kept q=8/16/32 but enlarged the per-query private suffix. With a
+256-512-token shared prefix and a 16K-32K private suffix, q=16 repeatedly sat at
+the break-even boundary:
+
+| Prefix | Queries | Private suffix | Event Flash/Fork | Fork overhead |
+|---:|---:|---:|---:|---:|
+| 256 | 16 | 16K | 0.993x | +0.75% |
+| 512 | 16 | 16K | 0.994x | +0.60% |
+| 256 | 16 | 32K | 0.986x | +1.41% |
+| 512 | 16 | 32K | 0.992x | +0.83% |
+
+These small differences must be classified as neutral rather than confirmed
+regressions. In a base-clock NCU capture of 256-prefix/q=16/32K-suffix, Flash
+took 3,860.512 us and Fork took 3,843.040 us, a 1.005x Fork speedup. The sign
+therefore changes across measurement conditions while the magnitude stays
+within approximately 1.5% of parity. Neighboring q=8 points were within 0.9%-
+4.0% of parity, while q=32 retained a repeatable 7.6%-10.2% advantage.
+
+The practical conclusions are:
+
+1. Keep the current minimum-query guard; lowering it would expose the verified
+   low-occupancy regression.
+2. Treat a very small shared-prefix fraction as a neutral-risk region, not as
+   guaranteed benefit, even when prefix and query-count thresholds pass.
+3. A future routing score should include estimated shared work, private work,
+   and CTA waves. Prefix length or DRAM bytes alone cannot capture the q=16
+   tile/occupancy boundary.
+4. No robust negative point was observed for q>=8 under NCU base clocks in this
+   limited sweep, but the near-zero margin justifies a conservative fallback
+   band if end-to-end tests show additional metadata or scheduling overhead.
+
 ## Reliability and Repeatability
 
 All 25 cells passed output validation and all five counter groups captured
@@ -431,6 +509,33 @@ Important artifacts:
 - `p<P>_b<Q>/fork_attn_summary.json`: exact Fork totals;
 - per-metric raw CSV and `.ncu-rep` files in every cell;
 - `dram_repeats/` under the three repeated sentinel cells.
+
+Committed negative-boundary aggregates are under
+`benchmark/results/investigation_20260718/forkattention_negative/`:
+
+- `short_prefix.csv` and `private_suffix.csv`: the two exploratory sweeps;
+- `low_query_confirm.csv` and `long_private_suffix_confirm.csv`: increased-
+  repetition confirmation sweeps;
+- the Flash/Fork summary JSON files under `ncu_p2048_q2_s128/` and
+  `ncu_p256_q16_s32768/`: exact NCU totals for the negative and neutral points.
+
+Raw NCU CSV and `.ncu-rep` files remain local because of their size.
+
+The negative-boundary CUDA Event sweep can be reproduced with:
+
+```bash
+vllm/.venv/bin/python \
+  benchmark/scripts/benchmark_fork_attention_negative.py \
+  --prefixes 1024,2048,4096 \
+  --queries 1,2,4 \
+  --suffixes 128 \
+  --iterations 400 \
+  --repeats 15 \
+  --output benchmark/results/forkattention_negative.csv
+```
+
+The script alternates backend order on every repetition, reports range/median
+for both backends, and validates every Fork output against Flash before timing.
 
 Regenerate the committed figures from the exact aggregate without rerunning
 NCU:

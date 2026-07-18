@@ -1,0 +1,17 @@
+{
+  "attention_backend": "FORK_ATTN",
+  "dram_read_bytes": 2159548928.0,
+  "dram_read_bytes_per_output_token": 134971808.0,
+  "dram_read_sectors": 67485904.0,
+  "fma_pipe_warp_instructions": 15279796.0,
+  "kernel_launches": 3,
+  "kernel_specializations": 3,
+  "kernel_time_ns": 3843040.0,
+  "l2_read_bytes": 2154756224.0,
+  "l2_read_hit_rate_percent": 0.04428719172235695,
+  "l2_read_hit_sectors": 29777.0,
+  "l2_read_miss_sectors": 67206367.0,
+  "l2_read_sectors": 67336132.0,
+  "output_token_count": 16,
+  "tensor_pipe_warp_instructions": 8396800.0
+}
