@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agentrix-application"
 version = "0.1.0"
-description = "Lossless application-owned prompt compaction for Agentrix"
+description = "Application-owned prompt and KV-cache optimizations for Agentrix"
 readme = "README.md"
 requires-python = ">=3.10"
 
