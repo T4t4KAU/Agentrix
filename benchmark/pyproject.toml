@@ -18,7 +18,11 @@ dependencies = [
 agent = [
   "langgraph>=1.2,<2",
 ]
-data = ["datasets>=2.19", "huggingface_hub>=0.23"]
+data = [
+  "datasets>=2.19",
+  "huggingface_hub>=0.23",
+  "Pillow>=10.0",
+]
 test = ["pytest>=8.0", "langgraph>=1.2,<2"]
 
 [project.scripts]
@@ -49,6 +53,8 @@ py-modules = [
   "synthetic",
   "telemetry",
   "tokens",
+  "weblinx_data",
+  "weblinx_runner",
 ]
 
 [tool.pytest.ini_options]

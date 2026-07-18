@@ -289,10 +289,11 @@ Both models should satisfy all of the following:
 5. Output contains no CUDA error, NaN, or truncation at head coordinate 128.
 6. GPU memory is released normally after service shutdown.
 
-Criterion 3's real-image portion remains part of the WebLINX validation; the
-completed end-to-end smoke tests used a synthetic shared text prefix.
+The WebLINX validation below supplies the real-image coverage required by
+criterion 3; the earlier single-GPU smoke tests used a synthetic shared text
+prefix.
 
-## 9. WebLINX and 6/8-replica DP experiment design
+## 9. WebLINX 8-DP workload and validation
 
 WebLINX fits this workload because several candidate actions from the same
 interaction turn can share:
@@ -301,23 +302,95 @@ interaction turn can share:
 - DOM and action-history text;
 - the system prompt and tool definitions.
 
-Hold total request count, output-token count, image resolution, and 32K context
-scale constant, changing only the backend and DP replica count. The minimum
-matrix should include:
+### 9.1 Deterministic subset
 
-| Variable | Values |
-|---|---|
-| Model | Qwen3.5-27B, Qwen3.6-27B |
-| Backend | FlashAttention baseline, ForkAttention |
-| DP | 6, 8 |
-| Context | 32K |
-| Branches per shared state | 2, 4, 8, 16 |
-| Screenshot reuse | same-image, different-image control |
+`benchmark/src/weblinx_data.py` builds a small manifest from the WebLINX
+validation split. It selects eight distinct demonstrations that have a
+supported element action, at least eight ranked candidates, the ground-truth
+UID in the top eight, and a replay turn with a good screenshot. It excludes
+contexts containing password fields, downloads only the selected replay and
+screenshot files, normalizes each image to 1280x720, and records the image
+SHA-256 in `manifest.json`.
 
-The `same-image` group measures real visual-prefix reuse. The
-`different-image control` should keep visual-token counts similar while using a
-different `mm_hash`; this separates genuine visual-prefix reuse from apparent
-speedups caused only by prompt length or batching.
+The current seed-2026 subset contains eight turns and eight candidate branches
+per turn, for 64 total requests. Each case is pinned to one DP rank through
+`X-data-parallel-rank`, so FlashAttention and ForkAttention see exactly the same
+rank assignment.
+
+### 9.2 Multimodal request layout
+
+`benchmark/src/weblinx_runner.py` sends native OpenAI multimodal chat messages.
+The shared portion contains the system prompt, screenshot, DOM, conversation,
+and action history, followed by a deterministic assistant acknowledgement. The
+final user message contains only one candidate action. This makes the large
+visual/text state a causal shared prefix and the candidate a short private
+suffix.
+
+The runner supports two image modes:
+
+- `same`: all eight branches on a rank reuse the case screenshot and are warmed
+  with the same prefix;
+- `different`: every branch gets a distinct image hash while retaining the same
+  1280x720 dimensions and visual-token shape. The base screenshots are rotated
+  across cases and one corner pixel is changed per request.
+
+The second mode is a cache-identity control, not a semantic-accuracy workload.
+Generation uses `ignore_eos` so all backend variants produce the requested
+number of output tokens. At a 28,000-token fitted text target, observed prompt
+lengths are 29,344 to 30,663 tokens after image tokens, chat framing, and the
+candidate suffix, leaving decode headroom inside the 32K limit.
+
+### 9.3 Reproduction
+
+```bash
+cd benchmark
+.venv/bin/python -m weblinx_data \
+  --output-dir results/weblinx_subset \
+  --split validation --case-count 8 --branch-count 8 --seed 2026
+
+MODEL_PATH=/test__02/hwx/Qwen3.6-27B \
+OUTPUT_TOKENS=256 \
+VARIANTS="flash_same fork_same fork_different" \
+./scripts/run_weblinx_8dp.sh
+```
+
+The script fixes DP to eight replicas, TP to one, one API frontend, 64
+concurrent requests, prefix caching, and a 32K model limit. It writes raw
+request traces, CSV/Markdown summaries, server logs, and Prometheus metrics for
+each variant.
+
+### 9.4 Qwen3.6-27B result on eight H20 GPUs
+
+The formal eager-mode run used 64 requests, 256 forced output tokens per
+request, and identical observed prompt lengths of 29,344 to 30,663 tokens in
+all variants. All three variants completed 64 requests and exactly 16,384
+output tokens.
+
+| Variant | Shared-state warmup | Branch wall | Total wall | Total output tok/s | Mean request latency |
+|---|---:|---:|---:|---:|---:|
+| FlashAttention, same image | 13.916 s | 18.663 s | 32.578 s | 502.91 | 16.805 s |
+| ForkAttention, same image | 13.923 s | 18.730 s | 32.652 s | 501.77 | 17.063 s |
+| ForkAttention, different images | 0.000 s | 120.848 s | 120.848 s | 135.58 | 117.117 s |
+
+The warmup is the explicit common-state phase of the agent workflow: one
+request per DP rank ingests the webpage state before its eight action branches.
+It is included in total wall time. The different-image control has no reusable
+common visual state and therefore no warmup request.
+
+Within ForkAttention, reusing the visual prefix reduced total wall time by
+72.98% and raised end-to-end output throughput by 3.70x relative to the
+different-image control. The branch phase alone was 84.50% shorter. Same-image
+ranks reported 86.4%-88.3% prefix-cache hits and up to 100% multimodal-cache
+hits; the different-image control reported 0% for both. The ForkAttention log
+recorded 51 `eager_forest:enabled` dispatches for the shared-image workload and
+none for the control.
+
+FlashAttention and ForkAttention were effectively tied on the same-image
+workload; ForkAttention's total wall time was 0.23% higher in this single run.
+The supported conclusion is therefore the intended system-level one: Qwen3.6
+successfully executes real-image WebLINX branches, and shared multimodal agent
+state produces a large end-to-end benefit. This run does not establish a
+standalone ForkAttention-kernel speedup over FlashAttention.
 
 ## 10. Current limitations
 
@@ -327,7 +400,5 @@ speedups caused only by prompt length or batching.
 - ForkAttention does not accelerate GDN layers; their reuse depends on the
   align-mode state cache.
 - vLLM still marks hybrid prefix caching as experimental.
-- The completed shared-prefix smoke tests used a synthetic text prefix. A final
-  claim requires real WebLINX screenshots.
-- Correctness and performance at 32K with 6/8 DP replicas require a separate
-  experiment.
+- The current WebLINX workload validates eight DP replicas only; six-DP scaling
+  and larger branch-count sweeps remain separate experiments.

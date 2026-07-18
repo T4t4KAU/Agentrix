@@ -77,6 +77,46 @@ the Git-ignored `results/` directory. The vLLM script writes one subdirectory
 per backend plus `backend_comparison.csv` and `backend_comparison.md` with the
 end-to-end latency and throughput deltas.
 
+## WebLINX Multimodal 8-DP Benchmark
+
+Build a deterministic eight-case subset from the WebLINX validation split:
+
+```bash
+.venv/bin/python -m weblinx_data \
+  --output-dir results/weblinx_subset \
+  --split validation \
+  --case-count 8 \
+  --branch-count 8 \
+  --seed 2026
+```
+
+The builder selects distinct demonstrations with good screenshots and eight
+ranked candidates, downloads only the selected replay files and PNGs, resizes
+the screenshots to 1280x720, and writes a reproducible `manifest.json`. The
+downloaded data remains under the Git-ignored `results/` directory.
+
+Run the fixed 64-request workload on eight DP replicas:
+
+```bash
+MODEL_PATH=/path/to/Qwen3.6-27B \
+GPU_IDS=0,1,2,3,4,5,6,7 \
+MANIFEST="$PWD/results/weblinx_subset/manifest.json" \
+./scripts/run_weblinx_8dp.sh
+```
+
+Each DP rank receives one WebLINX state and its eight candidate branches. The
+same-image FlashAttention and ForkAttention variants use identical rank
+pinning, prefix warmup, inputs, and forced output length. The optional
+`fork_different` control changes one corner pixel per branch, preserving image
+dimensions and visual-token count while giving every request a unique
+multimodal hash. Override `VARIANTS="flash_same fork_same"` to run only the
+primary backend comparison.
+
+`TEXT_PREFIX_TOKENS` defaults to 28,000, leaving room for the image tokens,
+chat-template framing, candidate suffix, and 64 generated tokens within a 32K
+context. The result directory contains per-variant CSV/JSON summaries, server
+logs, Prometheus metrics, and `comparison.md`.
+
 ## SGLang Local Benchmark
 
 After adding and installing the `sglang` submodule, run the same Agentrix
