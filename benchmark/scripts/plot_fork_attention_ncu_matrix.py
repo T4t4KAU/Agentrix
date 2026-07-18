@@ -9,6 +9,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.image import AxesImage
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,18 +45,21 @@ def grid(
     )
 
 
-def annotate_heatmap(axis: plt.Axes, values: np.ndarray, fmt: str) -> None:
-    midpoint = (float(np.nanmin(values)) + float(np.nanmax(values))) / 2
+def annotate_heatmap(
+    axis: plt.Axes, image: AxesImage, values: np.ndarray, fmt: str
+) -> None:
     for row in range(values.shape[0]):
         for column in range(values.shape[1]):
             value = values[row, column]
+            red, green, blue, _ = image.cmap(image.norm(value))
+            luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
             axis.text(
                 column,
                 row,
                 format(value, fmt),
                 ha="center",
                 va="center",
-                color="white" if value > midpoint else "black",
+                color="black" if luminance > 0.55 else "white",
                 fontsize=8,
             )
 
@@ -64,13 +68,13 @@ def plot_heatmaps(
     rows: list[dict[str, float]], prefixes: list[int], queries: list[int], output: Path
 ) -> None:
     panels = [
-        ("kernel_speedup", "Kernel speedup (Flash / Fork)", "viridis", ".2f", "x"),
-        ("dram_reduction_percent", "DRAM read reduction", "RdYlGn", ".1f", "%"),
-        ("l2_reduction_percent", "L2 read reduction", "viridis", ".1f", "%"),
+        ("kernel_speedup", "Kernel speedup (Flash / Fork)", "RdBu_r", ".2f", "x"),
+        ("dram_reduction_percent", "DRAM read reduction", "RdBu_r", ".1f", "%"),
+        ("l2_reduction_percent", "L2 read reduction", "RdBu_r", ".1f", "%"),
         (
             "fma_instruction_reduction_percent",
             "FMA-pipe instruction reduction",
-            "viridis",
+            "RdBu_r",
             ".1f",
             "%",
         ),
@@ -90,7 +94,7 @@ def plot_heatmaps(
             vmin=-limit if limit is not None else None,
             vmax=limit if limit is not None else None,
         )
-        annotate_heatmap(axis, values, fmt)
+        annotate_heatmap(axis, image, values, fmt)
         axis.set_title(title)
         axis.set_xticks(range(len(queries)), queries)
         axis.set_yticks(
