@@ -1,11 +1,18 @@
 from .prompt_compactor import (
     CompactedPrompt,
+    CompactedMessages,
     CompactionReport,
+    PagedToolResult,
     PromptSection,
+    ToolResultBackingStore,
+    ToolResultCompactionConfig,
+    ToolResultCompactionReport,
     compact_json,
     compact_prompt_delta,
     compact_prompt_sections,
+    compact_tool_results,
     deduplicate_tools,
+    restore_tool_results,
 )
 from .tool_kv_trimmer import (
     ToolKVTrimmer,
@@ -22,8 +29,13 @@ from .tool_ttl_predictor import (
 
 __all__ = [
     "CompactedPrompt",
+    "CompactedMessages",
     "CompactionReport",
+    "PagedToolResult",
     "PromptSection",
+    "ToolResultBackingStore",
+    "ToolResultCompactionConfig",
+    "ToolResultCompactionReport",
     "ToolKVTrimmer",
     "ToolKVTrimmerConfig",
     "ToolKVTrimmerStats",
@@ -35,5 +47,7 @@ __all__ = [
     "compact_json",
     "compact_prompt_delta",
     "compact_prompt_sections",
+    "compact_tool_results",
     "deduplicate_tools",
+    "restore_tool_results",
 ]

@@ -22,6 +22,40 @@ result = compact_prompt_delta(private, known_sections=shared)
 assert result.text == "Document doc-2\nnew body"
 ```
 
+Old, large file-read results can also be replaced conservatively with stable
+retrieval handles. This mode is disabled by default and never rewrites user or
+assistant text, tool calls, errors, recent results, or non-read tools. Exact
+historical bodies remain in an application-owned content-addressed store.
+
+```python
+from agentrix_application import (
+    ToolResultBackingStore,
+    ToolResultCompactionConfig,
+    compact_tool_results,
+    restore_tool_results,
+)
+
+store = ToolResultBackingStore()
+result = compact_tool_results(
+    messages,
+    config=ToolResultCompactionConfig(enabled=True),
+    backing_store=store,
+)
+assert restore_tool_results(result.messages, store) == messages
+```
+
+The default policy considers only successful `read` and `read_file` results
+of at least 4,096 characters after four later user turns. A tool call must
+contain a stable `path`, `file_path`, or `filename`; otherwise its result is
+left untouched. The environment switch is:
+
+```bash
+export AGENTRIX_PROMPT_TOOL_RESULT_COMPACTION_ENABLED=1
+export AGENTRIX_PROMPT_COMPACTION_MIN_RESULT_CHARS=4096
+export AGENTRIX_PROMPT_COMPACTION_MIN_AGE_TURNS=4
+export AGENTRIX_PROMPT_COMPACTION_RECOVERABLE_TOOLS=read,read_file
+```
+
 ## LangGraph integration and ablation
 
 `benchmark/src/langgraph_runner.py --prompt-compaction` applies the incremental
