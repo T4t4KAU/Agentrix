@@ -95,27 +95,39 @@ ranked candidates, downloads only the selected replay files and PNGs, resizes
 the screenshots to 1280x720, and writes a reproducible `manifest.json`. The
 downloaded data remains under the Git-ignored `results/` directory.
 
-Run the fixed 64-request workload on eight DP replicas:
+Run the Pressure32K/32-shaped workload on eight DP replicas:
 
 ```bash
 MODEL_PATH=/path/to/Qwen3.6-27B \
 GPU_IDS=0,1,2,3,4,5,6,7 \
 MANIFEST="$PWD/results/weblinx_subset/manifest.json" \
+NUM_GPU_BLOCKS_OVERRIDE=84 \
 ./scripts/run_weblinx_8dp.sh
 ```
 
-Each DP rank receives one WebLINX state and its eight candidate branches. The
-same-image FlashAttention and ForkAttention variants use identical rank
-pinning, prefix warmup, inputs, and forced output length. The optional
-`fork_different` control changes one corner pixel per branch, preserving image
-dimensions and visual-token count while giving every request a unique
-multimodal hash. Override `VARIANTS="flash_same fork_same"` to run only the
-primary backend comparison.
+Each of the eight WebLINX states first issues one natural multimodal bootstrap
+request. Its eight candidates are then expanded into four independent rollout
+strategies each, giving 32 branches per state and 256 globally shuffled branch
+requests. The client sends no DP-rank header: placement is entirely controlled
+by the internal-DP server.
+
+The default matrix contains the three ablations needed to reproduce the text
+Pressure32K/32 design: `flash_ordinary`, `fork_ordinary`, and
+`fork_prefix_aware`. Only the last arm enables prefix-aware DP routing and
+fanout scheduling. All arms use the same 256-token output limit, seeded
+lognormal 256-token suffix distribution, KV capacity, and request order.
 
 `TEXT_PREFIX_TOKENS` defaults to 28,000, leaving room for the image tokens,
-chat-template framing, candidate suffix, and 64 generated tokens within a 32K
-context. The result directory contains per-variant CSV/JSON summaries, server
-logs, Prometheus metrics, and `comparison.md`.
+64-token common analysis, candidate/rollout suffix, and 256 generated tokens
+within a 32K context. `MAX_NUM_SEQS` defaults to 64 and Forest CUDA Graphs are
+enabled. Calibrate `NUM_GPU_BLOCKS_OVERRIDE` so one root cohort fits per rank
+but two independent roots do not; `84` produces 57,344 KV tokens per rank for
+the validated Qwen3.6/H20 build. At that deliberately tight boundary, the
+validated optimized run still recorded 27 preemptions because Qwen3.6 uses
+coarse 784-token hybrid cache pages. The result directory contains per-variant
+CSV/JSON summaries, server logs, Prometheus metrics, and `comparison.md`. See
+`docs/qwen35_qwen36_forkattention_design.md` for the validated result and its
+limitations.
 
 ## SGLang Local Benchmark
 

@@ -7,6 +7,7 @@ import io
 import json
 import mimetypes
 import os
+import random
 import statistics
 import time
 from dataclasses import asdict, dataclass
@@ -19,15 +20,22 @@ from api_runner import APIRequestResult, _time_per_output_token
 from metrics import compare_trace
 from models import BenchmarkTrace, BranchTrace
 from reporting import write_results
+from synthetic import sample_suffixes
 from tokens import count_tokens, fit_text_to_tokens
 
 
 SYSTEM_PROMPT = (
     "You are a web-navigation agent. Inspect the screenshot, conversation, "
-    "browser history, and pruned DOM. Evaluate the candidate supplied in the "
-    "final message and return exactly one WebLINX browser action."
+    "browser history, and pruned DOM. First build a shared analysis of the "
+    "webpage state. When a candidate is later supplied, evaluate it and return "
+    "exactly one WebLINX browser action."
 )
-SHARED_ACK = "The shared webpage state is loaded and ready for candidate evaluation."
+ROLLOUT_STRATEGIES = (
+    "Prioritize semantic agreement with the user's request.",
+    "Prioritize geometric and visual evidence from the screenshot.",
+    "Prioritize DOM attributes and interaction affordances.",
+    "Look for failure modes before selecting the action.",
+)
 
 
 @dataclass(frozen=True)
@@ -37,6 +45,10 @@ class WebLINXBranchResult:
     case_id: str
     candidate_uid: str
     is_ground_truth: bool
+    candidate_index: int
+    rollout_index: int
+    strategy: str
+    suffix_budget: int
     image_case_index: int
     image_variant_id: int | None
     input_tokens: int
@@ -97,6 +109,29 @@ def branch_image_case_index(
     raise ValueError(f"unsupported image mode: {image_mode}")
 
 
+def expanded_branch_specs(
+    *,
+    case_count: int,
+    candidates_per_case: int,
+    rollouts_per_candidate: int,
+    branch_order: str,
+    seed: int,
+) -> list[tuple[int, int, int]]:
+    if case_count <= 0 or candidates_per_case <= 0 or rollouts_per_candidate <= 0:
+        raise ValueError("case, candidate, and rollout counts must be positive")
+    if branch_order not in {"case_major", "shuffle"}:
+        raise ValueError(f"unsupported branch order: {branch_order}")
+    specs = [
+        (case_index, candidate_index, rollout_index)
+        for case_index in range(case_count)
+        for candidate_index in range(candidates_per_case)
+        for rollout_index in range(rollouts_per_candidate)
+    ]
+    if branch_order == "shuffle":
+        random.Random(seed ^ 0x5F3759DF).shuffle(specs)
+    return specs
+
+
 def shared_messages(shared_text: str, data_url: str) -> list[dict[str, Any]]:
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -108,10 +143,16 @@ def shared_messages(shared_text: str, data_url: str) -> list[dict[str, Any]]:
                     "text": "Observe this webpage screenshot before reading its state.",
                 },
                 {"type": "image_url", "image_url": {"url": data_url}},
-                {"type": "text", "text": shared_text},
+                {
+                    "type": "text",
+                    "text": (
+                        shared_text
+                        + "\n\nAnalyze this shared webpage state for downstream "
+                        "candidate evaluation. Do not choose an action yet."
+                    ),
+                },
             ],
         },
-        {"role": "assistant", "content": SHARED_ACK},
     ]
 
 
@@ -121,16 +162,15 @@ async def _request(
     model: str,
     messages: list[dict[str, Any]],
     output_tokens: int,
-    rank: int,
     stream: bool,
+    priority: int = 0,
 ) -> APIRequestResult:
     kwargs: dict[str, Any] = {
         "model": model,
         "messages": messages,
         "max_tokens": output_tokens,
         "temperature": 0,
-        "extra_headers": {"X-data-parallel-rank": str(rank)},
-        "extra_body": {"ignore_eos": True},
+        "extra_body": {"ignore_eos": True, "priority": priority},
     }
     if stream:
         started = time.perf_counter()
@@ -147,7 +187,10 @@ async def _request(
                 usage = chunk.usage
             if not chunk.choices:
                 continue
-            text = chunk.choices[0].delta.content or ""
+            delta = chunk.choices[0].delta
+            text = delta.content or ""
+            if not text:
+                text = str((delta.model_extra or {}).get("reasoning_content") or "")
             if text:
                 first_token_at = first_token_at or time.perf_counter()
                 text_parts.append(text)
@@ -174,8 +217,12 @@ async def _request(
     latency_ms = (time.perf_counter() - started) * 1000
     if response.usage is None:
         raise RuntimeError("response omitted token usage")
+    message = response.choices[0].message
+    text = message.content or ""
+    if not text:
+        text = str((message.model_extra or {}).get("reasoning_content") or "")
     return APIRequestResult(
-        text=response.choices[0].message.content or "",
+        text=text,
         input_tokens=response.usage.prompt_tokens,
         output_tokens=response.usage.completion_tokens,
         latency_ms=latency_ms,
@@ -191,14 +238,29 @@ async def run_benchmark(
     dp_size: int,
     text_prefix_tokens: int,
     output_tokens: int,
+    common_analysis_tokens: int,
     concurrency: int,
+    rollouts_per_candidate: int,
+    suffix_mean: int,
+    seed: int,
+    branch_order: str,
     image_mode: str,
-    warm_prefix: bool,
     stream: bool,
     kv_bytes_per_token: int,
 ) -> tuple[BenchmarkTrace, dict[str, Any]]:
-    if dp_size <= 0 or concurrency <= 0 or output_tokens <= 0:
-        raise ValueError("DP size, concurrency, and output tokens must be positive")
+    if (
+        dp_size <= 0
+        or concurrency <= 0
+        or output_tokens <= 0
+        or common_analysis_tokens <= 0
+        or rollouts_per_candidate <= 0
+        or suffix_mean <= 0
+    ):
+        raise ValueError(
+            "DP, request, rollout, suffix, and token limits must be positive"
+        )
+    if branch_order not in {"case_major", "shuffle"}:
+        raise ValueError(f"unsupported branch order: {branch_order}")
     manifest = load_manifest(manifest_path)
     cases = manifest["cases"]
     if len(cases) != dp_size:
@@ -211,6 +273,8 @@ async def run_benchmark(
     root = manifest_path.parent
     image_paths = [root / case["screenshot"] for case in cases]
     image_urls = [image_data_url(path) for path in image_paths]
+    candidates_per_case = manifest["branch_count"]
+    branches_per_case = candidates_per_case * rollouts_per_candidate
     control_image_urls = None
     if image_mode == "different":
         control_image_urls = [
@@ -224,9 +288,9 @@ async def run_benchmark(
                             image_mode,
                         )
                     ],
-                    marker=case_index * manifest["branch_count"] + branch_index + 1,
+                    marker=case_index * branches_per_case + branch_index + 1,
                 )
-                for branch_index in range(manifest["branch_count"])
+                for branch_index in range(branches_per_case)
             ]
             for case_index in range(len(cases))
         ]
@@ -241,35 +305,64 @@ async def run_benchmark(
         timeout=float(os.getenv("OPENAI_TIMEOUT_SECONDS", "900")),
     )
 
-    warmup_results: list[APIRequestResult] = []
-    warmup_started = time.perf_counter()
-    if warm_prefix and image_mode == "same":
-        warmup_results = await asyncio.gather(
-            *(
-                _request(
-                    client,
-                    model=model,
-                    messages=shared_messages(fitted_texts[index], image_urls[index])
-                    + [
-                        {
-                            "role": "user",
-                            "content": "Confirm that this webpage state is ready.",
-                        }
-                    ],
-                    output_tokens=1,
-                    rank=index,
-                    stream=False,
-                )
-                for index in range(len(cases))
+    common_started = time.perf_counter()
+    common_results = await asyncio.gather(
+        *(
+            _request(
+                client,
+                model=model,
+                messages=shared_messages(fitted_texts[index], image_urls[index]),
+                output_tokens=common_analysis_tokens,
+                stream=False,
             )
+            for index in range(len(cases))
         )
-    warmup_latency_ms = (time.perf_counter() - warmup_started) * 1000
+    )
+    common_latency_ms = (time.perf_counter() - common_started) * 1000
+    shared_case_messages = [
+        shared_messages(fitted_texts[index], image_urls[index])
+        + [{"role": "assistant", "content": common_results[index].text}]
+        for index in range(len(cases))
+    ]
 
     semaphore = asyncio.Semaphore(concurrency)
+    desired_suffixes = sample_suffixes(
+        len(cases) * branches_per_case,
+        "lognormal",
+        suffix_mean,
+        random.Random(seed),
+    )
+    branch_specs = expanded_branch_specs(
+        case_count=len(cases),
+        candidates_per_case=candidates_per_case,
+        rollouts_per_candidate=rollouts_per_candidate,
+        branch_order=branch_order,
+        seed=seed,
+    )
 
-    async def run_branch(case_index: int, branch_index: int) -> WebLINXBranchResult:
+    async def run_branch(
+        case_index: int, candidate_index: int, rollout_index: int
+    ) -> WebLINXBranchResult:
         case = cases[case_index]
-        branch = case["branches"][branch_index]
+        branch = case["branches"][candidate_index]
+        branch_index = candidate_index * rollouts_per_candidate + rollout_index
+        global_index = case_index * branches_per_case + branch_index
+        suffix_budget = max(desired_suffixes[global_index], 2)
+        group_budget = max(1, suffix_budget // 2)
+        private_budget = max(1, suffix_budget - group_budget)
+        candidate_context = fit_text_to_tokens(
+            branch["private_text"]
+            + "\nAll rollouts in this group evaluate the same candidate.",
+            group_budget,
+            model,
+        )
+        strategy = ROLLOUT_STRATEGIES[rollout_index % len(ROLLOUT_STRATEGIES)]
+        private_context = fit_text_to_tokens(
+            f"Evaluation strategy: {strategy}\nRollout ID: {rollout_index}\n"
+            "Apply this strategy independently, then return one action.",
+            private_budget,
+            model,
+        )
         image_index = branch_image_case_index(
             case_index, branch_index, len(cases), image_mode
         )
@@ -277,25 +370,40 @@ async def run_benchmark(
         data_url = image_urls[image_index]
         if image_mode == "different":
             assert control_image_urls is not None
-            image_variant_id = case_index * manifest["branch_count"] + branch_index + 1
+            image_variant_id = global_index + 1
             data_url = control_image_urls[case_index][branch_index]
-        messages = shared_messages(fitted_texts[case_index], data_url)
-        messages.append({"role": "user", "content": branch["private_text"]})
+        if image_mode == "same":
+            messages = list(shared_case_messages[case_index])
+        else:
+            messages = shared_messages(fitted_texts[case_index], data_url)
+            messages.append(
+                {"role": "assistant", "content": common_results[case_index].text}
+            )
+        messages.extend(
+            (
+                {"role": "user", "content": candidate_context},
+                {"role": "user", "content": private_context},
+            )
+        )
         async with semaphore:
             result = await _request(
                 client,
                 model=model,
                 messages=messages,
                 output_tokens=output_tokens,
-                rank=case_index % dp_size,
                 stream=stream,
+                priority=10,
             )
         return WebLINXBranchResult(
-            branch_id=case_index * manifest["branch_count"] + branch_index,
+            branch_id=global_index,
             case_index=case_index,
             case_id=case["case_id"],
             candidate_uid=branch["uid"],
             is_ground_truth=bool(branch["is_ground_truth"]),
+            candidate_index=candidate_index,
+            rollout_index=rollout_index,
+            strategy=strategy,
+            suffix_budget=suffix_budget,
             image_case_index=image_index,
             image_variant_id=image_variant_id,
             input_tokens=result.input_tokens,
@@ -309,9 +417,8 @@ async def run_benchmark(
     started = time.perf_counter()
     branch_results = await asyncio.gather(
         *(
-            run_branch(case_index, branch_index)
-            for case_index in range(len(cases))
-            for branch_index in range(manifest["branch_count"])
+            run_branch(case_index, candidate_index, rollout_index)
+            for case_index, candidate_index, rollout_index in branch_specs
         )
     )
     branch_latency_ms = (time.perf_counter() - started) * 1000
@@ -327,7 +434,7 @@ async def run_benchmark(
     ]
     mean_prefix_tokens = int(statistics.fmean(actual_prefix_tokens))
     trace = BenchmarkTrace(
-        case_id=f"weblinx_8dp_{image_mode}_p{mean_prefix_tokens}",
+        case_id=f"weblinx_8dp_pressure32k_{image_mode}_p{mean_prefix_tokens}",
         prefix_tokens=mean_prefix_tokens,
         branches=[
             BranchTrace(
@@ -341,7 +448,9 @@ async def run_benchmark(
                 latency_ms=result.latency_ms,
                 ttft_ms=result.ttft_ms,
                 tpot_ms=result.tpot_ms,
-                strategy=f"candidate:{result.candidate_uid}",
+                strategy=(
+                    f"candidate:{result.candidate_uid}:rollout:{result.rollout_index}"
+                ),
             )
             for result in branch_results
         ],
@@ -351,13 +460,17 @@ async def run_benchmark(
             "manifest": str(manifest_path),
             "dp_size": dp_size,
             "image_mode": image_mode,
-            "warm_prefix": warm_prefix,
+            "common_analysis_tokens": common_analysis_tokens,
+            "candidates_per_case": candidates_per_case,
+            "rollouts_per_candidate": rollouts_per_candidate,
+            "branches_per_case": branches_per_case,
+            "suffix_mean": suffix_mean,
+            "seed": seed,
+            "branch_order": branch_order,
             "text_prefix_tokens": text_prefix_tokens,
             "estimated_prefix_tokens": estimated_prefix_tokens,
             "actual_prefix_tokens": actual_prefix_tokens,
-            "case_rank_map": {
-                case["case_id"]: index for index, case in enumerate(cases)
-            },
+            "routing_source": "server",
         },
     )
     raw = {
@@ -365,16 +478,23 @@ async def run_benchmark(
         "manifest": str(manifest_path),
         "dp_size": dp_size,
         "image_mode": image_mode,
-        "warm_prefix": warm_prefix,
+        "candidates_per_case": candidates_per_case,
+        "rollouts_per_candidate": rollouts_per_candidate,
+        "branches_per_case": branches_per_case,
+        "suffix_mean": suffix_mean,
+        "seed": seed,
+        "branch_order": branch_order,
+        "routing_source": "server",
         "common": {
-            "latency_ms": warmup_latency_ms,
-            "input_tokens": sum(item.input_tokens for item in warmup_results),
-            "output_tokens": sum(item.output_tokens for item in warmup_results),
+            "latency_ms": common_latency_ms,
+            "input_tokens": sum(item.input_tokens for item in common_results),
+            "output_tokens": sum(item.output_tokens for item in common_results),
+            "cases": [asdict(item) for item in common_results],
         },
-        "warmup_latency_ms": warmup_latency_ms,
-        "warmup_input_tokens": sum(item.input_tokens for item in warmup_results),
+        "warmup_latency_ms": 0.0,
+        "warmup_input_tokens": 0,
         "branch_phase_latency_ms": branch_latency_ms,
-        "total_latency_ms": warmup_latency_ms + branch_latency_ms,
+        "total_latency_ms": common_latency_ms + branch_latency_ms,
         "branch_total_output_tokens": sum(
             item.output_tokens for item in branch_results
         ),
@@ -394,12 +514,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--dp-size", type=int, default=8)
     parser.add_argument("--text-prefix-tokens", type=int, default=28000)
-    parser.add_argument("--output-tokens", type=int, default=64)
-    parser.add_argument("--concurrency", type=int, default=64)
-    parser.add_argument("--image-mode", choices=["same", "different"], default="same")
+    parser.add_argument("--output-tokens", type=int, default=256)
+    parser.add_argument("--common-analysis-tokens", type=int, default=64)
+    parser.add_argument("--concurrency", type=int, default=256)
+    parser.add_argument("--rollouts-per-candidate", type=int, default=4)
+    parser.add_argument("--suffix-mean", type=int, default=256)
+    parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument(
-        "--warm-prefix", action=argparse.BooleanOptionalAction, default=True
+        "--branch-order", choices=["case_major", "shuffle"], default="shuffle"
     )
+    parser.add_argument("--image-mode", choices=["same", "different"], default="same")
     parser.add_argument("--stream", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--kv-bytes-per-token", type=int, default=0)
     return parser
@@ -416,9 +540,13 @@ def main(argv: list[str] | None = None) -> int:
             dp_size=args.dp_size,
             text_prefix_tokens=args.text_prefix_tokens,
             output_tokens=args.output_tokens,
+            common_analysis_tokens=args.common_analysis_tokens,
             concurrency=args.concurrency,
+            rollouts_per_candidate=args.rollouts_per_candidate,
+            suffix_mean=args.suffix_mean,
+            seed=args.seed,
+            branch_order=args.branch_order,
             image_mode=args.image_mode,
-            warm_prefix=args.warm_prefix,
             stream=args.stream,
             kv_bytes_per_token=args.kv_bytes_per_token,
         )

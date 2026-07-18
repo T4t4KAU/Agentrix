@@ -312,33 +312,25 @@ contexts containing password fields, downloads only the selected replay and
 screenshot files, normalizes each image to 1280x720, and records the image
 SHA-256 in `manifest.json`.
 
-The current seed-2026 subset contains eight turns and eight candidate branches
-per turn, for 64 total requests. Each case is pinned to one DP rank through
-`X-data-parallel-rank`, so FlashAttention and ForkAttention see exactly the same
-rank assignment.
+The current seed-2026 subset contains eight turns and eight candidates per
+turn. The pressure workload expands every candidate into four independent
+evaluation rollouts, producing 32 branches per root and 256 branch requests.
 
 ### 9.2 Multimodal request layout
 
 `benchmark/src/weblinx_runner.py` sends native OpenAI multimodal chat messages.
-The shared portion contains the system prompt, screenshot, DOM, conversation,
-and action history, followed by a deterministic assistant acknowledgement. The
-final user message contains only one candidate action. This makes the large
-visual/text state a causal shared prefix and the candidate a short private
-suffix.
+Each root first issues one 64-token common-analysis request over its screenshot,
+DOM, conversation, and action history. That generated assistant analysis is
+then part of the shared causal context for all 32 branches. Every candidate
+forms a four-rollout subgroup with a candidate-shared suffix and one of four
+private evaluation strategies. Seeded lognormal suffix budgets are rescaled to
+a mean of 256 tokens, matching the text Pressure32K/32 construction.
 
-The runner supports two image modes:
-
-- `same`: all eight branches on a rank reuse the case screenshot and are warmed
-  with the same prefix;
-- `different`: every branch gets a distinct image hash while retaining the same
-  1280x720 dimensions and visual-token shape. The base screenshots are rotated
-  across cases and one corner pixel is changed per request.
-
-The second mode is a cache-identity control, not a semantic-accuracy workload.
-Generation uses `ignore_eos` so all backend variants produce the requested
-number of output tokens. At a 28,000-token fitted text target, observed prompt
-lengths are 29,344 to 30,663 tokens after image tokens, chat framing, and the
-candidate suffix, leaving decode headroom inside the 32K limit.
+All 256 branches are deterministically shuffled and submitted together. The
+client sends no `X-data-parallel-rank` header, so the internal-DP server owns
+placement. Generation uses `ignore_eos` so all variants produce the same
+number of output tokens. The runner retains a different-image cache-identity
+mode for diagnostics, but it is not part of the primary DP matrix.
 
 ### 9.3 Reproduction
 
@@ -350,16 +342,84 @@ cd benchmark
 
 MODEL_PATH=/test__02/hwx/Qwen3.6-27B \
 OUTPUT_TOKENS=256 \
-VARIANTS="flash_same fork_same fork_different" \
+NUM_GPU_BLOCKS_OVERRIDE=84 \
+VARIANTS="flash_ordinary fork_ordinary fork_prefix_aware" \
 ./scripts/run_weblinx_8dp.sh
 ```
 
-The script fixes DP to eight replicas, TP to one, one API frontend, 64
-concurrent requests, prefix caching, and a 32K model limit. It writes raw
-request traces, CSV/Markdown summaries, server logs, and Prometheus metrics for
-each variant.
+The script fixes DP to eight replicas, TP to one, one API frontend, 256
+concurrent branch requests, `max_num_seqs=64`, prefix caching, Forest CUDA
+Graphs, and a 32K model limit. Flash and ordinary Fork use native internal-DP
+placement. Only `fork_prefix_aware` enables the prefix router, the 10 ms arrival
+wave, and fanout scheduling. All arms receive identical roots, suffix budgets,
+shuffle order, output limits, and physical KV capacity.
 
-### 9.4 Qwen3.6-27B result on eight H20 GPUs
+For the validated Qwen3.6/H20 build, 84 hybrid KV blocks expose 57,344 tokens
+per rank. This deliberately admits one approximately 31K root plus its 32
+branches while preventing two independent roots from residing together. The
+script writes raw request traces, CSV/Markdown summaries, server logs, and
+Prometheus metrics for each variant.
+
+### 9.4 Corrected Pressure32K/32 result
+
+The corrected experiment completed all eight multimodal bootstrap requests and
+all 256 branch requests in every arm. Each arm generated exactly 512 bootstrap
+tokens and 65,536 branch tokens. Branch prompt lengths were 29,391 to 32,124
+tokens for FlashAttention and 29,391 to 32,076 tokens for both ForkAttention
+arms, so every request remained below the 32K model limit. No arm reported an
+OOM, request failure, or server error.
+
+| Variant | Bootstrap | Branch wall | Total wall | Branch output tok/s | Total output tok/s | Mean branch latency | P50 TTFT | P95 TTFT |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| FlashAttention, ordinary DP | 14.831 s | 528.169 s | 542.999 s | 124.08 | 120.69 | 247.141 s | 231.231 s | 457.414 s |
+| ForkAttention, ordinary DP | 14.396 s | 546.274 s | 560.670 s | 119.97 | 116.89 | 256.673 s | 251.341 s | 476.821 s |
+| ForkAttention, prefix-aware DP | 14.853 s | 148.652 s | 163.505 s | 440.87 | 400.82 | 49.989 s | 37.214 s | 105.461 s |
+
+Relative to FlashAttention with ordinary DP placement, prefix-aware
+ForkAttention increased branch throughput by 3.55x, shortened the branch phase
+by 71.86%, and increased end-to-end throughput by 3.32x. Mean branch latency,
+P50 TTFT, and P95 TTFT fell by 79.77%, 83.91%, and 76.94%, respectively.
+Relative to ordinary ForkAttention placement, the branch-throughput increase
+was 3.67x. Ordinary ForkAttention was 3.31% slower than FlashAttention in
+branch throughput, confirming that the large result comes from combining
+shared-prefix execution with DP placement and residency rather than from an
+uncontrolled backend-only comparison.
+
+The server-side counters support that interpretation:
+
+| Counter | FlashAttention, ordinary DP | ForkAttention, ordinary DP | ForkAttention, prefix-aware DP |
+|---|---:|---:|---:|
+| Prompt tokens observed | 8,006,279 | 8,004,679 | 8,004,679 |
+| Prompt tokens computed locally | 5,812,647 | 5,696,583 | 869,495 |
+| Prefix-cache hit share | 27.40% | 28.83% | 89.14% |
+| Cumulative prefill time | 3,042.403 s | 3,102.548 s | 797.192 s |
+| Cumulative queue time | 55,977.823 s | 58,237.952 s | 7,530.646 s |
+| Preemptions | 57 | 64 | 27 |
+
+Against FlashAttention, the optimized arm therefore reduced locally computed
+prompt tokens by 85.04%, cumulative prefill time by 73.80%, and cumulative
+queue time by 86.55%. Its multimodal processor cache recorded 256 hits from
+264 queries; the eight misses correspond to the first bootstrap for each
+independent image. The prefix router recorded 256 affinity routes and eight
+long-prefix bootstrap routes, with exactly 33 total requests routed to every
+rank. The client supplied no rank headers.
+
+This is a single-run systems result, not a claim about model quality or pure
+attention-kernel speed. Its tight 84-block hybrid KV configuration still
+caused 27 preemptions in the optimized arm, although that was fewer than both
+ordinary-DP arms. Qwen3.6's 784-token hybrid cache pages make the capacity
+boundary coarser than in the earlier text-only experiment. The optimized
+arm's P50 time per output token also rose from 18.256 ms to 32.181 ms because
+many more branches reached decode concurrently; the much lower queue and
+prefill times dominate the end-to-end result. A capacity sweep and repeated
+runs are required for confidence intervals and a zero-preemption operating
+point.
+
+The validated artifacts are stored on the experiment server under
+`benchmark/results/weblinx_pressure32k_8dp_v1`; generated datasets and result
+files remain Git-ignored.
+
+### 9.5 Initial pinned-rank diagnostic
 
 The formal eager-mode run used 64 requests, 256 forced output tokens per
 request, and identical observed prompt lengths of 29,344 to 30,663 tokens in
@@ -382,15 +442,18 @@ Within ForkAttention, reusing the visual prefix reduced total wall time by
 different-image control. The branch phase alone was 84.50% shorter. Same-image
 ranks reported 86.4%-88.3% prefix-cache hits and up to 100% multimodal-cache
 hits; the different-image control reported 0% for both. The ForkAttention log
-recorded 51 `eager_forest:enabled` dispatches for the shared-image workload and
-none for the control.
+contained 51 profile records reporting `eager_forest:enabled` for the
+shared-image workload and none for the control.
 
 FlashAttention and ForkAttention were effectively tied on the same-image
 workload; ForkAttention's total wall time was 0.23% higher in this single run.
-The supported conclusion is therefore the intended system-level one: Qwen3.6
-successfully executes real-image WebLINX branches, and shared multimodal agent
-state produces a large end-to-end benefit. This run does not establish a
-standalone ForkAttention-kernel speedup over FlashAttention.
+This was a useful multimodal cache diagnostic, but not a reproduction of the
+text DP result: the client pinned both backends to the correct rank, explicitly
+disabled prefix-aware routing, warmed the exact final prefix, used only eight
+branches per rank, limited each rank to 16 sequences, and ran eager mode. Those
+controls removed the routing, residency, and admission effects that dominate
+the Pressure32K/32 DP result. The corrected three-arm experiment above replaces
+that setup for DP performance claims.
 
 ## 10. Current limitations
 
@@ -402,3 +465,6 @@ standalone ForkAttention-kernel speedup over FlashAttention.
 - vLLM still marks hybrid prefix caching as experimental.
 - The current WebLINX workload validates eight DP replicas only; six-DP scaling
   and larger branch-count sweeps remain separate experiments.
+- The reported WebLINX comparison is one run per arm. Capacity sweeps and
+  repeated trials are still needed to quantify variance and remove the
+  remaining optimized-arm preemptions.

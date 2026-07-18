@@ -12,14 +12,20 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-${BENCHMARK_DIR}/results/weblinx_8dp_$(date +%Y%m%d_
 GPU_IDS="${GPU_IDS:-0,1,2,3,4,5,6,7}"
 PORT="${PORT:-8010}"
 TEXT_PREFIX_TOKENS="${TEXT_PREFIX_TOKENS:-28000}"
-OUTPUT_TOKENS="${OUTPUT_TOKENS:-64}"
+OUTPUT_TOKENS="${OUTPUT_TOKENS:-256}"
+COMMON_ANALYSIS_TOKENS="${COMMON_ANALYSIS_TOKENS:-64}"
+ROLLOUTS_PER_CANDIDATE="${ROLLOUTS_PER_CANDIDATE:-4}"
+SUFFIX_MEAN="${SUFFIX_MEAN:-256}"
+CONCURRENCY="${CONCURRENCY:-256}"
+SEED="${SEED:-2026}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.65}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-64}"
+NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE:-}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-600}"
-ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
+ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
 PROFILE_FORK="${PROFILE_FORK:-1}"
-VARIANTS="${VARIANTS:-flash_same fork_same fork_different}"
+VARIANTS="${VARIANTS:-flash_ordinary fork_ordinary fork_prefix_aware}"
 
 SERVER_PID=""
 
@@ -49,14 +55,14 @@ cd "${BENCHMARK_DIR}"
 run_variant() {
   local variant="$1"
   local backend="FORK_ATTN"
-  local image_mode="same"
-  local warm_prefix="--warm-prefix"
-  if [[ "${variant}" == "flash_same" ]]; then
+  local prefix_routing=0
+  local fanout_scheduling=0
+  if [[ "${variant}" == "flash_ordinary" ]]; then
     backend="FLASH_ATTN"
-  elif [[ "${variant}" == "fork_different" ]]; then
-    image_mode="different"
-    warm_prefix="--no-warm-prefix"
-  elif [[ "${variant}" != "fork_same" ]]; then
+  elif [[ "${variant}" == "fork_prefix_aware" ]]; then
+    prefix_routing=1
+    fanout_scheduling=1
+  elif [[ "${variant}" != "fork_ordinary" ]]; then
     echo "Unknown WebLINX variant: ${variant}" >&2
     exit 1
   fi
@@ -83,10 +89,20 @@ run_variant() {
   if [[ "${ENFORCE_EAGER}" == "1" ]]; then
     args+=(--enforce-eager)
   fi
+  if [[ -n "${NUM_GPU_BLOCKS_OVERRIDE}" ]]; then
+    args+=(--num-gpu-blocks-override "${NUM_GPU_BLOCKS_OVERRIDE}")
+  fi
 
-  echo "Starting ${variant}: backend=${backend}, image_mode=${image_mode}"
+  echo "Starting ${variant}: backend=${backend}, prefix_routing=${prefix_routing}"
   PROFILE_FORK="${PROFILE_FORK}" \
-  VLLM_FORK_ATTN_DP_PREFIX_ROUTING=0 \
+  VLLM_FORK_ATTN_ENABLE_FOREST=1 \
+  VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH=1 \
+  VLLM_FORK_ATTN_FANOUT_SCHEDULING_ENABLED="${fanout_scheduling}" \
+  VLLM_FORK_ATTN_FANOUT_ADMISSION_WINDOW=0 \
+  VLLM_FORK_ATTN_DP_PREFIX_ROUTING="${prefix_routing}" \
+  VLLM_FORK_ATTN_DP_PREFIX_LOAD_SLACK=32 \
+  VLLM_FORK_ATTN_DP_ARRIVAL_WAVE_MS=10 \
+  VLLM_FORK_ATTN_DP_GRAPH_SLACK_BUCKETS=0 \
   CUDA_VISIBLE_DEVICES="${GPU_IDS}" \
     "${VLLM_BIN}" "${args[@]}" >"${server_log}" 2>&1 &
   SERVER_PID="$!"
@@ -114,9 +130,13 @@ run_variant() {
       --dp-size 8 \
       --text-prefix-tokens "${TEXT_PREFIX_TOKENS}" \
       --output-tokens "${OUTPUT_TOKENS}" \
-      --concurrency 64 \
-      --image-mode "${image_mode}" \
-      "${warm_prefix}"
+      --common-analysis-tokens "${COMMON_ANALYSIS_TOKENS}" \
+      --rollouts-per-candidate "${ROLLOUTS_PER_CANDIDATE}" \
+      --suffix-mean "${SUFFIX_MEAN}" \
+      --concurrency "${CONCURRENCY}" \
+      --seed "${SEED}" \
+      --branch-order shuffle \
+      --image-mode same
 
   curl --silent --fail --max-time 10 \
     "http://127.0.0.1:${PORT}/metrics" >"${output_dir}/prometheus_metrics.prom" \
@@ -136,7 +156,7 @@ from pathlib import Path
 
 root = Path(sys.argv[1])
 rows = []
-for variant in ("flash_same", "fork_same", "fork_different"):
+for variant in ("flash_ordinary", "fork_ordinary", "fork_prefix_aware"):
     path = root / variant / "benchmark_results.csv"
     if not path.exists():
         continue
@@ -150,20 +170,20 @@ report = root / "comparison.md"
 with report.open("w", encoding="utf-8") as handle:
     handle.write("# WebLINX 8-DP Comparison\n\n")
     handle.write(
-        "| Variant | Prefix tokens | Warmup ms | Branch wall ms | Total wall ms "
+        "| Variant | Prefix tokens | Bootstrap ms | Branch wall ms | Total wall ms "
         "| Branch output tok/s | Total output tok/s | Mean latency ms |\n"
     )
     handle.write("|---|---:|---:|---:|---:|---:|---:|---:|\n")
     for variant, row, raw in rows:
-        warmup_ms = float(raw["warmup_latency_ms"])
+        common_ms = float(raw["common"]["latency_ms"])
         branch_ms = float(raw["branch_phase_latency_ms"])
         output_tokens = int(raw["branch_total_output_tokens"])
         handle.write(
             f"| {variant} | {float(row['prefix_tokens']):.0f} | "
-            f"{warmup_ms:.2f} | {branch_ms:.2f} | "
-            f"{warmup_ms + branch_ms:.2f} | "
+            f"{common_ms:.2f} | {branch_ms:.2f} | "
+            f"{common_ms + branch_ms:.2f} | "
             f"{float(row['branch_output_tokens_per_s']):.2f} | "
-            f"{1000 * output_tokens / (warmup_ms + branch_ms):.2f} | "
+            f"{1000 * output_tokens / (common_ms + branch_ms):.2f} | "
             f"{float(row['branch_mean_latency_ms']):.2f} |\n"
         )
 PY
