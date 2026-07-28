@@ -8,6 +8,19 @@ LMCache integration, and the end-to-end benchmark suite in one repository:
 - `llama.cpp/` is a Git submodule pinned to the CUDA/MUSA ForkAttention implementation.
 - `benchmark/` contains simulation, API, and local vLLM benchmarks.
 
+## Validated Compatibility
+
+| Category | Validated environment |
+| --- | --- |
+| GPU / accelerator | NVIDIA Tesla T4, RTX 5070, RTX 5090, and H20 (CUDA); Moore Threads MTT S4000 / QY2 (MUSA); Apple M2 Max (Metal) |
+| Operating system | Ubuntu 22.04 / 22.04.5 LTS, Huawei Cloud EulerOS (HCE) 2.0, CentOS Linux 7.9, and macOS on the Apple Metal path |
+| vLLM source version | `fork-attn` at `3588b8ba36`, based on upstream `main` commit `0ca39c4f1f` dated 2026-06-29 |
+| vLLM runtime stack | Python 3.10–3.14 and PyTorch 2.11.0; source builds validated with CUDA 12.8, 12.9, and 13.0 |
+
+The NVIDIA path supports Turing and newer architectures; BF16 requires Ampere
+or newer. Backend-specific ForkAttention constraints fall back to the native
+attention path when they are not satisfied.
+
 ## Documentation
 
 - [Agentrix system overview](docs/agentrix_system_overview.md)
