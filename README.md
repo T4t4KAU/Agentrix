@@ -590,3 +590,10 @@ docker run --rm \
 For another GPU architecture, override `TORCH_CUDA_ARCH_LIST` at build time.
 The default value `12.0` targets NVIDIA Blackwell consumer GPUs. Keep
 `CUDA_IMAGE` and `TORCH_BACKEND` on the same CUDA release family.
+
+## License
+
+Agentrix's original code and documentation are licensed under the
+[Apache License 2.0](LICENSE). The `vllm`, `LMCache`, `llama.cpp`, and `sglang`
+Git submodules are separate upstream works and remain subject to the license
+files distributed in their respective repositories.
