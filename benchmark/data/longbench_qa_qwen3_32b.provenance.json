@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "source": {
+    "dataset": "LongBench v1",
+    "repository": "https://huggingface.co/datasets/zai-org/LongBench",
+    "archive": "data.zip",
+    "archive_sha256": "cb45b11a4133c6bc1d6a44b0f8e701335ff1e543195db1103472e575857f7f64",
+    "files": [
+      "data/multifieldqa_en.jsonl",
+      "data/qasper.jsonl"
+    ]
+  },
+  "selection": {
+    "script": "benchmark/scripts/build_longbench_agentrix_cases.py",
+    "cases": 32,
+    "questions": 68,
+    "minimum_questions_per_document": 2,
+    "maximum_questions_per_document": 4,
+    "maximum_context_tokens": 38000
+  },
+  "tokenizer": {
+    "model_family": "Qwen3",
+    "serving_model": "Qwen3-32B",
+    "tokenizer_json_sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+  },
+  "manifest": {
+    "path": "benchmark/data/longbench_qa_qwen3_32b.jsonl",
+    "sha256": "2a25cf48284ff2e01f3a83033d4ad8353f28031615c80565c15defb6a674f709",
+    "context_tokens_total": 245694,
+    "context_tokens_minimum": 4842,
+    "context_tokens_maximum": 14851
+  }
+}

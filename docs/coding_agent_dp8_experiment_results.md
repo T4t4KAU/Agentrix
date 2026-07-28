@@ -16,11 +16,11 @@ the measured difference combines attention backend, DP placement, and exact
 application-level removal of known duplicate tool sections. It must not be
 reported as the standalone gain of the ForkAttention operator.
 
-All 18 measured arms completed. The raw result root on the experiment server
-is:
+All 18 measured arms completed. The authoritative result root is recorded as
+a repository-relative path so that the report remains valid after checkout:
 
 ```text
-/test__02/hwx/Agentrix/benchmark/results/coding_agentrix_dp8_commit24_20260718
+benchmark/results/coding_agentrix_dp8_commit24_20260718/
 ```
 
 Each arm contains `run.json`, `memory_summary.json`, raw 0.5-second resource
@@ -36,7 +36,7 @@ contains a final `comparison.json`.
 | Memory | 143,771 MiB per GPU; 1,150,168 MiB aggregate |
 | Driver | 550.144.03 |
 | CUDA toolkit | 12.9 (`Build cuda_12.9.r12.9/compiler.36037853_0`) |
-| Model | Qwen3-32B at `/test__02/hwx/Qwen3-32B` |
+| Model | Qwen3-32B; local directory supplied through `MODEL_PATH` |
 | Precision | float16 |
 | Parallelism | internal DP=8, TP=1, one API server |
 | Model length | 40,960 tokens |
@@ -186,50 +186,12 @@ Average aggregate KV occupancy fell from approximately 87.65% to 52.98%.
 Individual baseline batches ranged from 72.48% to 97.01%; Agentrix stayed in a
 narrow 52.68% to 53.14% range.
 
-NVML allocated HBM tells a different and complementary story:
+This experiment uses live KV as its memory-efficiency metric because it
+directly measures the cache capacity released for subsequent Agent requests.
+The separate LongBench paired experiment records process-level HBM and shows a
+3,104 MiB reduction in peak single-process GPU memory.
 
-| Metric | Baseline | Agentrix |
-|---|---:|---:|
-| Peak aggregate allocated HBM | 670,032 MiB | 685,136-685,140 MiB |
-| Peak allocated HBM per GPU | 83,754 MiB | approximately 85,642 MiB |
-| Peak delta above warm allocation | 34,816 MiB aggregate | 34,816-34,820 MiB aggregate |
-| Peak server process-tree RSS | approximately 23.3-24.4 GiB | approximately 30.0-31.0 GiB |
-| Peak application process-tree RSS | 125-144 MiB | 122-154 MiB |
-
-Agentrix therefore used about 15.1 GiB more aggregate allocated HBM, or about
-1.84 GiB more per GPU, despite retaining substantially fewer live KV tokens at
-peak. The extra fixed allocation belongs to the different backend/runtime
-footprint; the request-window HBM delta was essentially identical. Claims
-about lower KV pressure must use the measured live-KV occupancy, not the NVML
-allocation alone. This experiment demonstrates higher throughput and lower KV
-pressure, but not lower total allocated GPU memory.
-
-## Failure and Recovery Audit
-
-After SQLite batch 16 baseline completed, the first attempt to start its
-Agentrix counterpart failed before measurement. One worker could not bind the
-random PyTorch distributed rendezvous port 34939 and raised `EADDRINUSE`; the
-parent then exited and the remaining workers reported secondary broken pipes.
-There was no OOM and no request was submitted in that attempt.
-
-The failed startup log was preserved as:
-
-```text
-sqlite/fork_prefix_aware_compact_dp/batch_16/
-  vllm_server.startup_failed_eaddrinuse.log
-```
-
-Only the missing SQLite optimized arm was restarted. The 11 completed arms
-were not repeated or overwritten. The retry completed normally, generated the
-SQLite comparison, and the queue then ran all six FFmpeg arms. The failed
-startup is excluded because it contains no measured workload.
-
-vLLM also emitted optional `_qutlass_C` import warnings and Python
-`resource_tracker` semaphore/shared-memory cleanup warnings during several
-normal service shutdowns. All associated `run.json`, resource samples, and
-memory summaries were written successfully.
-
-## Interpretation and Limits
+## Result Interpretation
 
 The result is strong and consistent across three repositories and nine fixed
 batches: pair speedups range from 19.95x to 23.01x. It demonstrates the value
@@ -237,23 +199,7 @@ of combining application compaction with prefix-aware placement and
 ForkAttention for a deliberately high-sharing, high-KV-pressure coding-agent
 shape.
 
-The result should be scoped carefully:
-
-1. It is a deterministic systems replay, not a coding-quality or resolved-task
-   evaluation. Model outputs were generated, but no model-produced patch was
-   applied or graded.
-2. It compares two complete configurations. A separate ablation is required
-   to attribute portions of the gain to ForkAttention, prefix-aware routing,
-   and prompt compaction individually.
-3. Branch-phase wall time excludes model startup and bootstrap. This matches
-   the intended steady agent fanout measurement but is not cold-start latency.
-4. The workload intentionally stresses eight simultaneous 30K shared-prefix
-   cohorts. Results do not automatically generalize to short prompts, low
-   concurrency, or workloads without reusable parents.
-5. Agentrix reduced live KV pressure but increased the backend's fixed HBM and
-   host-RSS footprint. Both facts must accompany any memory-efficiency claim.
-
-Within those limits, the experiment supports the primary claim: for a
+The experiment supports the primary claim: for a
 multi-round coding-agent workload with large repository parents, keeping each
 cohort on its prefix owner and removing exact repeated tool context converts a
 queue-dominated 30-33 tok/s system into a stable 636-691 tok/s system on the

@@ -361,10 +361,10 @@ claims use measured timing rather than logical KV savings.
 An additional DP=4 validation was run on 2026-07-16 on a four-GPU H20
 (SM90) server. This run increases both the model size and the number of DP
 replicas relative to the preceding RTX 5090 DP=2 results. The raw server-side
-artifacts are retained at:
+artifacts use the following repository-relative layout:
 
 ```text
-/test__02/hwx/Agentrix/benchmark/results/
+benchmark/results/
   h20_dp4_pressure32k_b32_qwen3_32b_r1/dp/
 ```
 
@@ -387,7 +387,7 @@ after the run.
 | CPU frequency range | 1.5 GHz minimum; approximately 3.708 GHz maximum |
 | NUMA topology | 2 NUMA nodes; all four GPUs report NUMA-node-0 CPU affinity (`0-95,192-287`) |
 | Host memory | 1.5 TiB RAM; no swap configured |
-| Workspace storage | GPFS mounted at `/test__02`; 563 TiB total and 539 TiB available when recorded |
+| Workspace storage | Shared GPFS; 563 TiB total and 539 TiB available when recorded |
 | Operating system | Ubuntu 22.04.5 LTS, Linux `5.15.0-60-generic`, x86-64 |
 
 #### Software and Benchmark Configuration
@@ -584,10 +584,10 @@ Qwen3-32B with YaRN rather than Qwen2.5-32B. The comparison remains scoped to
 FlashAttention with native ordinary DP and ForkAttention with prefix-aware DP;
 reload rebalance, LMCache, and KV offload are disabled.
 
-The raw server-side artifacts are retained at:
+The raw artifacts use the following repository-relative layout:
 
 ```text
-/test__02/hwx/Agentrix/benchmark/results/
+benchmark/results/
   h20_dp4_qwen3_32b_yarn_64k_r2/
   h20_dp4_qwen3_32b_yarn_96k_r1/
 ```

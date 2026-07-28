@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "case_manifest": "benchmark/data/longbench_qa_qwen3_32b.jsonl",
+  "case_manifest_sha256": "2a25cf48284ff2e01f3a83033d4ad8353f28031615c80565c15defb6a674f709",
+  "paired_questions": 68,
+  "baseline_f1": 0.40526672758571225,
+  "optimized_f1": 0.404173373738574,
+  "paired_mean_f1_delta": -0.0010933538471382814,
+  "prediction_exact_agreement": 0.9117647058823529,
+  "wall_speedup": 1.3982103744282244,
+  "throughput_speedup": 1.3982103744282246,
+  "ttft_speedup": 1.490724010968439,
+  "baseline_peak_process_memory_mib": 84926,
+  "optimized_peak_process_memory_mib": 81822
+}

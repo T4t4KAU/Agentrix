@@ -216,7 +216,7 @@ Single-GPU functional validation example:
 ```bash
 PROFILE_FORK=1 \
 CUDA_VISIBLE_DEVICES=0 \
-.venv/bin/vllm serve /test__02/hwx/Qwen3.5-27B \
+.venv/bin/vllm serve /path/to/Qwen3.5-27B \
   --attention-backend FORK_ATTN \
   --enable-prefix-caching \
   --tensor-parallel-size 1 \
@@ -225,7 +225,7 @@ CUDA_VISIBLE_DEVICES=0 \
   --enforce-eager
 ```
 
-Replace the model path with `/test__02/hwx/Qwen3.6-27B` for Qwen3.6. Use the
+Replace the model path with `/path/to/Qwen3.6-27B` for Qwen3.6. Use the
 `--attention-backend FORK_ATTN` CLI argument; the current code does not recognize
 `VLLM_ATTENTION_BACKEND` as a valid vLLM environment variable.
 
@@ -353,7 +353,7 @@ cd benchmark
   --output-dir results/weblinx_subset \
   --split validation --case-count 8 --branch-count 8 --seed 2026
 
-MODEL_PATH=/test__02/hwx/Qwen3.6-27B \
+MODEL_PATH=/path/to/Qwen3.6-27B \
 OUTPUT_TOKENS=256 \
 NUM_GPU_BLOCKS_OVERRIDE=84 \
 VARIANTS="flash_ordinary fork_ordinary fork_prefix_aware" \

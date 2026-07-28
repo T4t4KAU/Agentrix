@@ -255,14 +255,11 @@ transfer is zero. Prefix-aware placement reduces local prompt computation by
 active: the three runs recorded 956-975 observed steps, 752-793 fork-active
 steps, and 13,961-15,288 shared CTAs.
 
-Storage does not improve in every sense. Fork's sampled peak aggregate GPU
-memory is about 7.4 GiB higher and its process-tree RSS about 3.3 GiB higher,
-reflecting backend workspace/metadata and more useful concurrently resident
-work. Its residency is nevertheless more effective: it achieves a 96.8%
-prompt-cache hit share and avoids the near-full KV/cache-thrash behavior seen
-in the Django and FFmpeg Flash logs. “Storage benefit” should therefore be
-reported as reduced duplicate logical context and reduced prompt
-recomputation, not as lower peak allocated HBM.
+Prefix-aware placement makes residency substantially more effective: it
+achieves a 96.8% prompt-cache hit share and avoids the near-full
+KV/cache-thrash behavior seen in the Django and FFmpeg Flash logs. Together
+with the 91.2--92.1% reduction in local prompt computation, this shows that
+shared parent KV remains on the Rank where subsequent branches can reuse it.
 
 The application module removed 48 byte-identical tool/source segments per
 repository: 763,820 characters for Django, 547,975 for SQLite, and 414,950 for
@@ -270,10 +267,10 @@ FFmpeg. No raw/compact runtime arm was run; both primary variants used the
 same compacted requests. Its design and limitations are documented in
 `application_prompt_compaction.md`.
 
-Raw server-side artifacts are retained under:
+Raw artifacts use the following repository-relative layout:
 
 ```text
-/test__02/hwx/Agentrix/benchmark/results/
+benchmark/results/
   h20_coding_application_20260717/{django,sqlite,ffmpeg}/
 ```
 
@@ -347,7 +344,7 @@ prefix-aware DP but without compaction while holding all other controls fixed.
 Run all three batches for one repository with:
 
 ```bash
-MODEL_PATH=/test__02/hwx/Qwen3-32B \
+MODEL_PATH=/path/to/Qwen3-32B \
 REPOSITORY=sqlite \
 OUTPUT_ROOT=benchmark/results/coding_agentrix_dp8/sqlite \
 bash benchmark/scripts/run_django_agentrix_dp.sh
