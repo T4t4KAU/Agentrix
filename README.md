@@ -6,7 +6,17 @@ LMCache integration, and the end-to-end benchmark suite in one repository:
 - `vllm/` is a Git submodule pinned to the experimental implementation.
 - `LMCache/` is a Git submodule pinned to the tiered KV storage implementation.
 - `llama.cpp/` is a Git submodule pinned to the CUDA/MUSA ForkAttention implementation.
+- `sglang/` is a Git submodule pinned to the ForkAttention-enabled implementation.
 - `benchmark/` contains simulation, API, and local vLLM benchmarks.
+
+The implementation uses four pinned upstream baselines: vLLM
+`main@0ca39c4f1f` from the `v0.24.0` release cycle, LMCache
+`dev@bf20f51c` from the `v0.5.1` release cycle, llama.cpp `b9860`, and SGLang
+`main@d8d76c4d1` from the `v0.5.15.post1` release cycle. Hardware validation
+covers NVIDIA Tesla T4, RTX 5070, RTX 5090, and H20; Moore Threads MTT S4000 /
+QY2; and Apple M2 Max. Validated operating systems include Ubuntu 22.04 /
+22.04.5 LTS, Huawei Cloud EulerOS (HCE) 2.0, CentOS Linux 7.9, and macOS for
+the Apple Metal path.
 
 ## Validated Compatibility
 
@@ -14,7 +24,8 @@ LMCache integration, and the end-to-end benchmark suite in one repository:
 | --- | --- |
 | GPU / accelerator | NVIDIA Tesla T4, RTX 5070, RTX 5090, and H20 (CUDA); Moore Threads MTT S4000 / QY2 (MUSA); Apple M2 Max (Metal) |
 | Operating system | Ubuntu 22.04 / 22.04.5 LTS, Huawei Cloud EulerOS (HCE) 2.0, CentOS Linux 7.9, and macOS on the Apple Metal path |
-| vLLM source version | `fork-attn` at `3588b8ba36`, based on upstream `main` commit `0ca39c4f1f` dated 2026-06-29 |
+| Upstream system versions | vLLM `v0.24.0` cycle, LMCache `v0.5.1` cycle, llama.cpp `b9860`, and SGLang `v0.5.15.post1` cycle |
+| Pinned Agentrix revisions | vLLM `3588b8ba36`, LMCache `9559285039`, llama.cpp `f500456189`, and SGLang `17159d93d8` |
 | vLLM runtime stack | Python 3.10–3.14 and PyTorch 2.11.0; source builds validated with CUDA 12.8, 12.9, and 13.0 |
 
 The NVIDIA path supports Turing and newer architectures; BF16 requires Ampere
