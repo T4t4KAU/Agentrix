@@ -17,7 +17,7 @@ LMCache integration, and the end-to-end benchmark suite in one repository:
 - [Prefix-aware data parallel experiment results](docs/dp_experiment_results.md)
 - [Main shared-prefix experiment results](docs/main_experiment_results.md)
 - [HotpotQA Agentrix long-prefix experiment](docs/hotpot_agentrix_experiment.md)
-- [Current HotpotQA ForkAttention/offload restart experiment](docs/offload_restart_experiment.md)
+- [Branch-aware GPU KV lifecycle and reload experiment](docs/kv_lifecycle_reload_experiment.md)
 - [Executable Coding-Agent quality A/B](docs/coding_agent_quality_ab.md)
 - [ForkAttention CUDA operator profile](docs/forkattention_operator_profile.md)
 - [Main experiment procedures](docs/main_experiment_matrix.md)

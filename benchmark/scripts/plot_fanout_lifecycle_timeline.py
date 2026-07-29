@@ -19,8 +19,14 @@ EVENT_LABELS = {
     "wave2_completed": "wave 2 done",
     "cold_checkpoint": "COLD",
     "pressure_started": "cold pressure",
+    "all_shared_branches_finished": "branches done",
+    "post_finish_pressure_started": "GPU eviction pressure",
+    "post_finish_pressure_completed": "pressure done",
     "revisit_started": "cold revisit",
 }
+
+LOAD_BYTES_METRIC = "vllm:kv_offload_load_bytes"
+RELOAD_BLOCKS_METRIC = "vllm:kv_offload_reload_blocks"
 
 
 def read(path: Path) -> dict[str, Any]:
@@ -133,6 +139,82 @@ def event_time(payload: dict[str, Any], name: str) -> float | None:
     return None
 
 
+def connector_series(
+    payload: dict[str, Any],
+    metric_name: str,
+) -> tuple[list[float], list[float]]:
+    rows = payload["kv_samples"]
+    return (
+        [float(row["elapsed_ms"]) / 1000 for row in rows],
+        [float(row["connector"].get(metric_name, 0)) for row in rows],
+    )
+
+
+def plot_reload_panel(axis: Any, payload: dict[str, Any]) -> None:
+    x, cold = connector_series(
+        payload,
+        f"{RELOAD_BLOCKS_METRIC}:('cold',)",
+    )
+    _, cooling = connector_series(
+        payload,
+        f"{RELOAD_BLOCKS_METRIC}:('cooling',)",
+    )
+    _, hot = connector_series(
+        payload,
+        f"{RELOAD_BLOCKS_METRIC}:('hot',)",
+    )
+    axis.bar(
+        x,
+        cold,
+        width=0.025,
+        color="#60a5fa",
+        label="COLD reload blocks",
+    )
+    axis.bar(
+        x,
+        cooling,
+        width=0.025,
+        bottom=cold,
+        color="#fbbf24",
+        label="COOLING reload blocks",
+    )
+    hot_bottom = [
+        cold_value + cooling_value for cold_value, cooling_value in zip(cold, cooling)
+    ]
+    axis.bar(
+        x,
+        hot,
+        width=0.025,
+        bottom=hot_bottom,
+        color="#ef4444",
+        label="HOT reload blocks",
+    )
+    axis.set_ylabel("CPU→GPU reload\nblocks / interval")
+    axis.set_ylim(bottom=0)
+    axis.grid(alpha=0.2)
+    axis.legend(loc="upper left", fontsize=7)
+
+    _, load_bytes = connector_series(payload, LOAD_BYTES_METRIC)
+    cumulative_mib = []
+    total_bytes = 0.0
+    for value in load_bytes:
+        total_bytes += value
+        cumulative_mib.append(total_bytes / 1024**2)
+    byte_axis = axis.twinx()
+    byte_axis.step(
+        x,
+        cumulative_mib,
+        where="post",
+        color="#7c3aed",
+        linewidth=1.3,
+        label="cumulative load",
+    )
+    byte_axis.set_ylabel("Cumulative load (MiB)")
+    byte_axis.set_ylim(bottom=0)
+    byte_axis.legend(loc="upper right", fontsize=7)
+    annotate_events(axis, payload, labels=False)
+
+
 def plot_panel(
     axes: list[Any],
     payload: dict[str, Any],
@@ -141,7 +223,7 @@ def plot_panel(
     (
         branch_axis,
         state_axis,
-        eviction_axis,
+        transfer_axis,
         throughput_axis,
         gpu_axis,
     ) = axes
@@ -199,41 +281,44 @@ def plot_panel(
     annotate_events(state_axis, payload, labels=False)
 
     end_seconds = float(payload["events"][-1]["elapsed_ms"]) / 1000
-    eviction_x, cold_rate = windowed_rate(
-        payload["cpu_events"],
-        key="evicted_cold",
-        end_seconds=end_seconds,
-    )
-    _, cooling_rate = windowed_rate(
-        payload["cpu_events"],
-        key="evicted_cooling",
-        end_seconds=end_seconds,
-    )
-    _, hot_rate = windowed_rate(
-        payload["cpu_events"],
-        key="evicted_hot",
-        end_seconds=end_seconds,
-    )
-    _, unobserved_rate = windowed_rate(
-        payload["cpu_events"],
-        key="evicted_unobserved",
-        end_seconds=end_seconds,
-    )
-    eviction_axis.stackplot(
-        eviction_x,
-        cold_rate,
-        cooling_rate,
-        hot_rate,
-        unobserved_rate,
-        labels=("COLD", "COOLING", "HOT", "unobserved"),
-        colors=("#60a5fa", "#fbbf24", "#ef4444", "#9ca3af"),
-        alpha=0.8,
-    )
-    eviction_axis.set_ylabel("CPU evictions/s\n(500 ms window)")
-    eviction_axis.set_ylim(bottom=0)
-    eviction_axis.legend(loc="upper right", fontsize=7, ncol=2)
-    eviction_axis.grid(alpha=0.2)
-    annotate_events(eviction_axis, payload, labels=False)
+    if "load_operations" in payload["summary"]:
+        plot_reload_panel(transfer_axis, payload)
+    else:
+        eviction_x, cold_rate = windowed_rate(
+            payload["cpu_events"],
+            key="evicted_cold",
+            end_seconds=end_seconds,
+        )
+        _, cooling_rate = windowed_rate(
+            payload["cpu_events"],
+            key="evicted_cooling",
+            end_seconds=end_seconds,
+        )
+        _, hot_rate = windowed_rate(
+            payload["cpu_events"],
+            key="evicted_hot",
+            end_seconds=end_seconds,
+        )
+        _, unobserved_rate = windowed_rate(
+            payload["cpu_events"],
+            key="evicted_unobserved",
+            end_seconds=end_seconds,
+        )
+        transfer_axis.stackplot(
+            eviction_x,
+            cold_rate,
+            cooling_rate,
+            hot_rate,
+            unobserved_rate,
+            labels=("COLD", "COOLING", "HOT", "unobserved"),
+            colors=("#60a5fa", "#fbbf24", "#ef4444", "#9ca3af"),
+            alpha=0.8,
+        )
+        transfer_axis.set_ylabel("CPU evictions/s\n(500 ms window)")
+        transfer_axis.set_ylim(bottom=0)
+        transfer_axis.legend(loc="upper right", fontsize=7, ncol=2)
+        transfer_axis.grid(alpha=0.2)
+        annotate_events(transfer_axis, payload, labels=False)
 
     throughput_x, throughput = instantaneous_throughput(payload)
     throughput_axis.plot(
@@ -259,11 +344,24 @@ def plot_panel(
     effective = payload["summary"]["wave2_effective"]
     pressure = payload["summary"]["pressure_interval"]
     revisit = payload["summary"]["revisit"]
+    load_operations = payload["summary"].get("load_operations")
+    if load_operations is None:
+        reload_text = ""
+    else:
+        reload_blocks = sum(
+            payload["summary"].get(f"reload_blocks_{state}", 0)
+            for state in ("hot", "cooling", "cold")
+        )
+        reload_text = (
+            f"CPU→GPU: {reload_blocks} blocks / {load_operations} ops / "
+            f"{payload['summary']['load_bytes'] / 1024**2:.1f} MiB\n"
+        )
     throughput_axis.text(
         0.02,
         0.95,
         (
-            f"pressure goodput {pressure['goodput_tokens_per_second']:.1f} tok/s\n"
+            reload_text
+            + f"pressure goodput {pressure['goodput_tokens_per_second']:.1f} tok/s\n"
             f"re-fork goodput {effective['goodput_tokens_per_second']:.1f} tok/s; "
             f"{wave['branch_turns_per_second']:.1f} turns/s\n"
             f"P95 TTFT {wave['ttft_p95_ms']:.1f} ms; "
@@ -339,6 +437,14 @@ def flatten_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "cpu_evicted_unique_hot": summary.get("cpu_evicted_unique_hot", ""),
         "cpu_evicted_unique_cooling": summary.get("cpu_evicted_unique_cooling", ""),
         "cpu_evicted_unique_cold": summary.get("cpu_evicted_unique_cold", ""),
+        "load_operations": summary.get("load_operations", ""),
+        "load_bytes": summary.get("load_bytes", ""),
+        "reload_blocks_hot": summary.get("reload_blocks_hot", ""),
+        "reload_blocks_cooling": summary.get("reload_blocks_cooling", ""),
+        "reload_blocks_cold": summary.get("reload_blocks_cold", ""),
+        "gpu_evicted_hot": summary.get("gpu_evicted_hot", ""),
+        "gpu_evicted_cooling": summary.get("gpu_evicted_cooling", ""),
+        "gpu_evicted_cold": summary.get("gpu_evicted_cold", ""),
         "max_hot_blocks": summary["max_hot_blocks"],
         "max_cooling_blocks": summary["max_cooling_blocks"],
         "max_cold_blocks": summary["max_cold_blocks"],
@@ -384,6 +490,7 @@ def main() -> int:
     args = parser.parse_args()
     baseline = read(args.baseline)
     optimized = read(args.optimized)
+    gpu_reload_experiment = "gpu_lifecycle_eviction" in baseline["metadata"]
 
     figure, axes = plt.subplots(
         5, 2, figsize=(17, 16), sharex="col", constrained_layout=True
@@ -391,15 +498,27 @@ def main() -> int:
     plot_panel(
         [axes[row, 0] for row in range(5)],
         baseline,
-        "Original mode: LRU",
+        (
+            "Original GPU eviction: LRU"
+            if gpu_reload_experiment
+            else "Original mode: LRU"
+        ),
     )
     plot_panel(
         [axes[row, 1] for row in range(5)],
         optimized,
-        "Optimized mode: branch-aware cohort_lru",
+        (
+            "Optimized GPU eviction: lifecycle-aware"
+            if gpu_reload_experiment
+            else "Optimized mode: branch-aware cohort_lru"
+        ),
     )
     figure.suptitle(
-        "Branch-aware KV HOT / COOLING / COLD lifecycle and handling",
+        (
+            "Branch-aware GPU KV residency and CPU→GPU reload timeline"
+            if gpu_reload_experiment
+            else "Branch-aware KV HOT / COOLING / COLD lifecycle and handling"
+        ),
         fontsize=15,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)

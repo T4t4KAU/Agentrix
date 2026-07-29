@@ -24,8 +24,14 @@ import pynvml
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadingConnectorStats,
+    _LifecycleMetricName,
+    _TransferMetricName,
+)
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.sampling_params import RequestOutputKind
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.kv_offload.base import (
     OffloadEvictionMetadata,
@@ -44,6 +50,9 @@ PROFILE_FIELD = re.compile(r"([a-z_]+)=([^\s]+)")
 STARTED: float | None = None
 WALL_ZERO: float | None = None
 TRACE_PATH: Path | None = None
+MEMORY_ROOT_BLOCKS = 0
+MEMORY_KEY_INFO: dict[str, dict[str, Any]] = {}
+MEMORY_EVICTION_METADATA: dict[str, OffloadEvictionMetadata] = {}
 
 
 def elapsed_ms() -> float:
@@ -90,9 +99,85 @@ def metadata_dict(
     }
 
 
+def classify_memory_key(
+    request_id: str,
+    logical_block_index: int | None = None,
+) -> dict[str, Any]:
+    branch_match = re.search(r"(?:wave1|wave2|revisit)-(\d+)", request_id)
+    if branch_match is not None:
+        branch = int(branch_match.group(1))
+        if logical_block_index is not None and logical_block_index < MEMORY_ROOT_BLOCKS:
+            return {
+                "category": "shared_prefix",
+                "branch": None,
+                "source_request": request_id,
+            }
+        return {
+            "category": "branch",
+            "branch": branch,
+            "source_request": request_id,
+        }
+    return {
+        "category": "pressure",
+        "branch": None,
+        "source_request": request_id,
+    }
+
+
+def register_memory_key(
+    raw_key: bytes,
+    *,
+    request_id: str,
+    logical_block_index: int | None = None,
+) -> dict[str, Any]:
+    offload_key = OffloadKey(bytes(raw_key))
+    identifier = key_id(offload_key)
+    candidate = classify_memory_key(request_id, logical_block_index)
+    previous = MEMORY_KEY_INFO.get(identifier)
+    priority = {"pressure": 0, "branch": 1, "shared_prefix": 2}
+    if (
+        previous is None
+        or priority[candidate["category"]] > priority[previous["category"]]
+    ):
+        MEMORY_KEY_INFO[identifier] = candidate
+    return {"key": identifier, **MEMORY_KEY_INFO[identifier]}
+
+
+def serialize_memory_key(
+    raw_key: bytes,
+    *,
+    request_id: str,
+) -> dict[str, Any]:
+    offload_key = OffloadKey(bytes(raw_key))
+    identifier = key_id(offload_key)
+    info = MEMORY_KEY_INFO.get(identifier)
+    metadata = MEMORY_EVICTION_METADATA.get(identifier)
+    if info is None:
+        info = classify_memory_key(request_id)
+        if metadata is not None and (
+            metadata.fanout >= 4 or metadata.reuse_score >= MEMORY_ROOT_BLOCKS // 2
+        ):
+            info = {
+                "category": "shared_prefix",
+                "branch": None,
+                "source_request": request_id,
+            }
+        MEMORY_KEY_INFO[identifier] = info
+    return {
+        "key": identifier,
+        **info,
+        **metadata_dict(metadata),
+    }
+
+
 def install_cpu_eviction_observer() -> None:
     original_update = CPUOffloadingManager.update_eviction_metadata
     original_prepare = CPUOffloadingManager.prepare_store
+    original_complete_store = CPUOffloadingManager.complete_store
+    original_prepare_load = CPUOffloadingManager.prepare_load
+    original_complete_load = CPUOffloadingManager.complete_load
+    original_cache_full_blocks = BlockPool.cache_full_blocks
+    original_evict_gpu_block = BlockPool._maybe_evict_cached_block
 
     def update_eviction_metadata(
         self: CPUOffloadingManager,
@@ -106,6 +191,11 @@ def install_cpu_eviction_observer() -> None:
         else:
             shadow.update(metadata)
         self._agentrix_lifecycle_metadata = shadow
+        if replace:
+            MEMORY_EVICTION_METADATA.clear()
+        MEMORY_EVICTION_METADATA.update(
+            {key_id(key): value for key, value in metadata.items()}
+        )
         if WALL_ZERO is not None:
             counts = Counter(
                 lifecycle_name(item.lifecycle_value) for item in metadata.values()
@@ -165,10 +255,181 @@ def install_cpu_eviction_observer() -> None:
                 "evicted_keys_by_lifecycle": keys_by_lifecycle,
             }
             write_trace("cpu", row)
+        if output.evicted_keys:
+            write_trace(
+                "memory",
+                {
+                    "elapsed_ms": trace_elapsed_ms(),
+                    "event": "cpu_evict",
+                    "request_id": req_context.req_id,
+                    "keys": [
+                        serialize_memory_key(
+                            key,
+                            request_id=req_context.req_id,
+                        )
+                        for key in output.evicted_keys
+                    ],
+                },
+            )
         return output
+
+    def complete_store(
+        self: CPUOffloadingManager,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+        success: bool = True,
+    ) -> None:
+        original_complete_store(self, keys, req_context, success)
+        if not success or WALL_ZERO is None:
+            return
+        stored_keys = [
+            key
+            for key in keys
+            if (block := self._policy.get(key)) is not None and block.is_ready
+        ]
+        if stored_keys:
+            write_trace(
+                "memory",
+                {
+                    "elapsed_ms": trace_elapsed_ms(),
+                    "event": "cpu_store_complete",
+                    "request_id": req_context.req_id,
+                    "keys": [
+                        serialize_memory_key(
+                            key,
+                            request_id=req_context.req_id,
+                        )
+                        for key in stored_keys
+                    ],
+                },
+            )
+
+    def prepare_load(
+        self: CPUOffloadingManager,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ):
+        output = original_prepare_load(self, keys, req_context)
+        if WALL_ZERO is not None and keys:
+            write_trace(
+                "memory",
+                {
+                    "elapsed_ms": trace_elapsed_ms(),
+                    "event": "cpu_load_start",
+                    "request_id": req_context.req_id,
+                    "keys": [
+                        serialize_memory_key(
+                            key,
+                            request_id=req_context.req_id,
+                        )
+                        for key in keys
+                    ],
+                },
+            )
+        return output
+
+    def complete_load(
+        self: CPUOffloadingManager,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> None:
+        original_complete_load(self, keys, req_context)
+        if WALL_ZERO is not None and keys:
+            write_trace(
+                "memory",
+                {
+                    "elapsed_ms": trace_elapsed_ms(),
+                    "event": "cpu_load_complete",
+                    "request_id": req_context.req_id,
+                    "keys": [
+                        serialize_memory_key(
+                            key,
+                            request_id=req_context.req_id,
+                        )
+                        for key in keys
+                    ],
+                },
+            )
+
+    def cache_full_blocks(
+        self: BlockPool,
+        request: Any,
+        blocks: list[Any],
+        num_cached_blocks: int,
+        num_full_blocks: int,
+        block_size: int,
+        kv_cache_group_id: int,
+        block_mask: list[bool] | None = None,
+    ) -> None:
+        original_cache_full_blocks(
+            self,
+            request,
+            blocks,
+            num_cached_blocks,
+            num_full_blocks,
+            block_size,
+            kv_cache_group_id,
+            block_mask,
+        )
+        if WALL_ZERO is None or num_cached_blocks >= num_full_blocks:
+            return
+        cached = []
+        for logical_index in range(num_cached_blocks, num_full_blocks):
+            block = blocks[logical_index]
+            if block.is_null or block.block_hash is None:
+                continue
+            info = register_memory_key(
+                block.block_hash,
+                request_id=request.request_id,
+                logical_block_index=logical_index,
+            )
+            cached.append(
+                {
+                    **info,
+                    "block_id": block.block_id,
+                    "logical_block_index": logical_index,
+                }
+            )
+        if cached:
+            write_trace(
+                "memory",
+                {
+                    "elapsed_ms": trace_elapsed_ms(),
+                    "event": "gpu_cache",
+                    "request_id": request.request_id,
+                    "keys": cached,
+                },
+            )
+
+    def evict_gpu_block(self: BlockPool, block: Any) -> bool:
+        block_hash = block.block_hash
+        block_id = block.block_id
+        request_id = "gpu_allocator"
+        key_info = (
+            serialize_memory_key(block_hash, request_id=request_id)
+            if block_hash is not None
+            else None
+        )
+        evicted = original_evict_gpu_block(self, block)
+        if evicted and WALL_ZERO is not None and key_info is not None:
+            write_trace(
+                "memory",
+                {
+                    "elapsed_ms": trace_elapsed_ms(),
+                    "event": "gpu_evict",
+                    "request_id": request_id,
+                    "keys": [{**key_info, "block_id": block_id}],
+                },
+            )
+        return evicted
 
     CPUOffloadingManager.update_eviction_metadata = update_eviction_metadata
     CPUOffloadingManager.prepare_store = prepare_store
+    CPUOffloadingManager.complete_store = complete_store
+    CPUOffloadingManager.prepare_load = prepare_load
+    CPUOffloadingManager.complete_load = complete_load
+    BlockPool.cache_full_blocks = cache_full_blocks
+    BlockPool._maybe_evict_cached_block = evict_gpu_block
 
 
 @dataclass(frozen=True)
@@ -179,6 +440,12 @@ class KVSample:
     waiting: int
     tool_waiting: int
     connector: dict[str, float]
+    fork_kind: str
+    fork_active_ctas: int
+    fork_shared_ctas: int
+    fork_singleton_ctas: int
+    fork_shared_queries: int
+    fork_max_aggregated_queries: int
 
 
 class TimelineLogger(StatLoggerBase):
@@ -204,12 +471,17 @@ class TimelineLogger(StatLoggerBase):
         raw = getattr(scheduler_stats, "kv_connector_stats", None)
         if raw is not None and hasattr(raw, "reduce"):
             raw = raw.reduce()
+        elif isinstance(raw, Mapping) and {"types", "data"} <= raw.keys():
+            raw = OffloadingConnectorStats(data=dict(raw)).reduce()
         if isinstance(raw, Mapping):
             connector = {
                 str(key): float(value)
                 for key, value in raw.items()
                 if isinstance(value, (int, float))
             }
+        fork_stats = getattr(scheduler_stats, "fork_execution_stats", None)
+        if fork_stats is None:
+            fork_stats = ("", 0, 0, 0, 0, 0, 0)
         self.samples.append(
             KVSample(
                 timestamp=time.perf_counter(),
@@ -218,6 +490,12 @@ class TimelineLogger(StatLoggerBase):
                 waiting=int(scheduler_stats.num_waiting_reqs),
                 tool_waiting=int(scheduler_stats.num_skipped_waiting_reqs),
                 connector=connector,
+                fork_kind=str(fork_stats[0]),
+                fork_active_ctas=int(fork_stats[2]),
+                fork_shared_ctas=int(fork_stats[3]),
+                fork_singleton_ctas=int(fork_stats[4]),
+                fork_shared_queries=int(fork_stats[5]),
+                fork_max_aggregated_queries=int(fork_stats[6]),
             )
         )
 
@@ -362,21 +640,27 @@ async def run_cold_pressure(
     vocab_size: int,
     sampling_params: SamplingParams,
     events: list[dict[str, Any]],
+    label: str = "pressure",
+    seed_base: int = 100_000,
 ) -> None:
-    event(events, "pressure_started", pressure_requests=count)
+    event(events, f"{label}_started", pressure_requests=count)
     for index in range(count):
         async for _ in engine.generate(
-            {"prompt_token_ids": token_ids(100_000 + index, prompt_tokens, vocab_size)},
+            {
+                "prompt_token_ids": token_ids(
+                    seed_base + index, prompt_tokens, vocab_size
+                )
+            },
             sampling_params,
-            f"pressure-{index}",
+            f"{label}-{index}",
         ):
             pass
         event(
             events,
-            "pressure_request_completed",
+            f"{label}_request_completed",
             pressure_completed=index + 1,
         )
-    event(events, "pressure_completed", pressure_requests=count)
+    event(events, f"{label}_completed", pressure_requests=count)
 
 
 async def wait_live_ready(branches: list[LiveBranch]) -> None:
@@ -492,6 +776,7 @@ async def run_generation_wave(
     token_samples: list[dict[str, Any]],
     active_base: int = 0,
     index_start: int = 0,
+    distractors: int = 0,
 ) -> list[BranchResult]:
     sampling_params = SamplingParams(
         max_tokens=output_tokens,
@@ -548,7 +833,22 @@ async def run_generation_wave(
             output_tokens=generated,
         )
 
-    results = await asyncio.gather(*(generate_branch(index) for index in indices))
+    async def generate_distractor(index: int) -> None:
+        prompt = token_ids(800_000 + index, suffix_tokens * 2, vocab_size)
+        async for _ in engine.generate(
+            {"prompt_token_ids": prompt},
+            sampling_params,
+            f"{label}-private-{index}",
+        ):
+            pass
+
+    tasks: list[asyncio.Task[BranchResult | None]] = []
+    for offset, index in enumerate(indices):
+        tasks.append(asyncio.create_task(generate_branch(index)))
+        if offset < distractors:
+            tasks.append(asyncio.create_task(generate_distractor(index)))
+    gathered = await asyncio.gather(*tasks)
+    results = [result for result in gathered if result is not None]
     event(
         events,
         f"{label}_completed",
@@ -635,6 +935,49 @@ def summarize_interval(
     }
 
 
+def summarize_operator_interval(
+    events: list[dict[str, Any]],
+    operator_events: list[dict[str, Any]],
+    *,
+    started_event: str,
+    completed_event: str,
+) -> dict[str, float | int]:
+    started_ms = next(
+        float(row["elapsed_ms"]) for row in events if row["event"] == started_event
+    )
+    completed_ms = next(
+        float(row["elapsed_ms"]) for row in events if row["event"] == completed_event
+    )
+    interval = [
+        row
+        for row in operator_events
+        if started_ms <= float(row["elapsed_ms"]) <= completed_ms
+    ]
+    cohort_sizes = [int(row["max_aggregated_queries"]) for row in interval]
+    active_cohort_sizes = [size for size in cohort_sizes if size >= 2]
+    shared_queries = [int(row["shared_queries"]) for row in interval]
+    return {
+        "steps": len(interval),
+        "max_aggregated_queries": max(cohort_sizes, default=0),
+        "mean_aggregated_queries": (
+            statistics.fmean(cohort_sizes) if cohort_sizes else 0.0
+        ),
+        "mean_active_cohort_queries": (
+            statistics.fmean(active_cohort_sizes)
+            if active_cohort_sizes
+            else 0.0
+        ),
+        "mean_shared_queries": (
+            statistics.fmean(shared_queries) if shared_queries else 0.0
+        ),
+        "shared_step_fraction": (
+            sum(size >= 2 for size in cohort_sizes) / len(cohort_sizes)
+            if cohort_sizes
+            else 0.0
+        ),
+    }
+
+
 def unique_evicted_keys(
     cpu_events: list[dict[str, Any]], lifecycle: str | None = None
 ) -> int:
@@ -654,6 +997,14 @@ def unique_evicted_keys(
     return len(keys)
 
 
+def labeled_metric(
+    totals: Mapping[str, float],
+    metric_name: str,
+    label: str,
+) -> float:
+    return float(totals.get(f"{metric_name}:{(label,)!r}", 0.0))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -662,6 +1013,11 @@ def parse_args() -> argparse.Namespace:
         default=Path("/home/hwx/Documents/models/Qwen3-0.6B"),
     )
     parser.add_argument("--policy", choices=("lru", "cohort_lru"), required=True)
+    parser.add_argument(
+        "--gpu-lifecycle-eviction",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--root-tokens", type=int, default=4096)
     parser.add_argument("--suffix-tokens", type=int, default=128)
     parser.add_argument("--branches", type=int, default=8)
@@ -672,18 +1028,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cold-pulses", type=int, default=20)
     parser.add_argument("--hot-prefix-cooldown-steps", type=int, default=16)
     parser.add_argument("--pressure-sessions", type=int, default=6)
+    parser.add_argument("--post-finish-pressure-sessions", type=int, default=6)
     parser.add_argument("--pressure-prompt-tokens", type=int, default=2048)
     parser.add_argument("--wave-output-tokens", type=int, default=128)
     parser.add_argument("--revisit-output-tokens", type=int, default=32)
     parser.add_argument("--gpu-sample-ms", type=int, default=200)
     parser.add_argument("--num-gpu-blocks", type=int, default=1024)
+    parser.add_argument("--max-num-seqs", type=int, default=32)
     parser.add_argument("--cpu-cache-gib", type=float, default=0.75)
+    parser.add_argument("--revisit-distractors", type=int, default=0)
+    parser.add_argument(
+        "--attention-backend",
+        choices=("FLASH_ATTN", "FORK_ATTN"),
+        default="FLASH_ATTN",
+    )
+    parser.add_argument(
+        "--fork-query-join",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
 
 async def main_async(args: argparse.Namespace) -> dict[str, Any]:
-    global STARTED, TRACE_PATH, WALL_ZERO
+    global MEMORY_ROOT_BLOCKS, STARTED, TRACE_PATH, WALL_ZERO
     if not args.model.exists():
         raise FileNotFoundError(args.model)
     if not 0 < args.survivors < args.branches:
@@ -695,6 +1064,8 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     TRACE_PATH = trace_path
     WALL_ZERO = time.time()
     install_cpu_eviction_observer()
+    MEMORY_KEY_INFO.clear()
+    MEMORY_EVICTION_METADATA.clear()
     TimelineLogger.instances.clear()
     profile_handler = ProfileHandler()
     logging.getLogger(PROFILE_LOGGER).addHandler(profile_handler)
@@ -703,6 +1074,16 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         "cpu_bytes_to_use": int(args.cpu_cache_gib * 1024**3),
         "eviction_policy": args.policy,
         "fanout_offload": True,
+        "fanout_gpu_lifecycle_eviction": args.gpu_lifecycle_eviction,
+        "fanout_admission_window": (
+            max(16, args.branches + args.revisit_distractors)
+            if args.fork_query_join
+            else 0
+        ),
+        "fanout_preemption_enabled": args.fork_query_join,
+        "fanout_gpu_hotset_enabled": args.fork_query_join,
+        "fanout_join_max_deferral_steps": int(args.fork_query_join),
+        "fanout_arrival_wait_steps": 2 if args.fork_query_join else 0,
         "fanout_profile": True,
         "fanout_budget_blocks": 512,
         "fanout_allow_hot_prefix_backup": True,
@@ -713,10 +1094,13 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         "fanout_high_pressure_threshold": 0.90,
         "fanout_critical_pressure_threshold": 0.97,
     }
+    # The experiment uses the vLLM default 16-token full-attention block.
+    # Set this before engine startup so an EngineCore child inherits it.
+    MEMORY_ROOT_BLOCKS = args.root_tokens // 16
     engine_args = AsyncEngineArgs(
         model=str(args.model),
         dtype="float16",
-        attention_backend="FLASH_ATTN",
+        attention_backend=args.attention_backend,
         enforce_eager=True,
         gpu_memory_utilization=0.75,
         num_gpu_blocks_override=args.num_gpu_blocks,
@@ -728,7 +1112,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
             + 32,
             args.pressure_prompt_tokens + 32,
         ),
-        max_num_seqs=max(32, args.branches + args.pressure_sessions + 8),
+        max_num_seqs=max(args.max_num_seqs, args.branches),
         enable_prefix_caching=True,
         enable_chunked_prefill=True,
         async_scheduling=False,
@@ -743,6 +1127,9 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         generation_config="vllm",
     )
     engine = AsyncLLM.from_engine_args(engine_args, stat_loggers=[TimelineLogger])
+    MEMORY_ROOT_BLOCKS = args.root_tokens // int(
+        engine.vllm_config.cache_config.block_size
+    )
     gpu_stop = asyncio.Event()
     gpu_task: asyncio.Task[None] | None = None
     try:
@@ -767,7 +1154,12 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
                 interval_seconds=args.gpu_sample_ms / 1000,
             )
         )
-        event(events, "experiment_started", policy=args.policy)
+        event(
+            events,
+            "experiment_started",
+            policy=args.policy,
+            gpu_lifecycle_eviction=args.gpu_lifecycle_eviction,
+        )
 
         first_wave = launch_live_branches(
             engine,
@@ -835,6 +1227,16 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         )
         await stop_live_branches(engine, survivors)
         event(events, "all_shared_branches_finished", active_branches=0)
+        await run_cold_pressure(
+            engine,
+            count=args.post_finish_pressure_sessions,
+            prompt_tokens=args.pressure_prompt_tokens,
+            vocab_size=vocab_size,
+            sampling_params=sampling,
+            events=events,
+            label="post_finish_pressure",
+            seed_base=200_000,
+        )
         await pulse(
             engine,
             count=args.cold_pulses,
@@ -854,6 +1256,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
             output_tokens=args.revisit_output_tokens,
             events=events,
             token_samples=token_samples,
+            distractors=args.revisit_distractors,
         )
         event(events, "experiment_completed")
         gpu_stop.set()
@@ -881,6 +1284,11 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
             for row in trace_rows
             if row["kind"] == "lifecycle"
         ]
+        memory_events = [
+            {key: value for key, value in row.items() if key != "kind"}
+            for row in trace_rows
+            if row["kind"] == "memory"
+        ]
         kv_samples = [
             {
                 **asdict(sample),
@@ -892,6 +1300,23 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         ]
         for row in kv_samples:
             row.pop("timestamp")
+        operator_events = [
+            {
+                "elapsed_ms": sample["elapsed_ms"],
+                "event": "fork_plan",
+                "kind": sample["fork_kind"],
+                "active_queries": sample["running"],
+                "shared_queries": sample["fork_shared_queries"],
+                "max_aggregated_queries": sample[
+                    "fork_max_aggregated_queries"
+                ],
+                "shared_ctas": sample["fork_shared_ctas"],
+                "singleton_ctas": sample["fork_singleton_ctas"],
+                "active_ctas": sample["fork_active_ctas"],
+            }
+            for sample in kv_samples
+            if sample["fork_kind"]
+        ]
         connector_totals: Counter[str] = Counter()
         for sample in kv_samples:
             connector_totals.update(sample["connector"])
@@ -899,6 +1324,9 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
             "schema_version": 1,
             "metadata": {
                 "policy": args.policy,
+                "gpu_lifecycle_eviction": args.gpu_lifecycle_eviction,
+                "attention_backend": args.attention_backend,
+                "fork_query_join": args.fork_query_join,
                 "model": str(args.model),
                 "gpu": gpu_description(),
                 "root_tokens": args.root_tokens,
@@ -911,18 +1339,29 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
                 "cold_pulses": args.cold_pulses,
                 "hot_prefix_cooldown_steps": (args.hot_prefix_cooldown_steps),
                 "pressure_sessions": args.pressure_sessions,
+                "post_finish_pressure_sessions": (args.post_finish_pressure_sessions),
                 "pressure_prompt_tokens": args.pressure_prompt_tokens,
                 "wave_output_tokens": args.wave_output_tokens,
                 "revisit_output_tokens": args.revisit_output_tokens,
                 "gpu_sample_ms": args.gpu_sample_ms,
                 "num_gpu_blocks": args.num_gpu_blocks,
+                "max_num_seqs": args.max_num_seqs,
                 "cpu_cache_gib": args.cpu_cache_gib,
+                "revisit_distractors": args.revisit_distractors,
                 "block_size_tokens": int(engine.vllm_config.cache_config.block_size),
                 "lifecycle_config": extra_config,
             },
             "events": events,
             "profile_samples": profile_samples,
             "lifecycle_samples": lifecycle_samples,
+            "memory_events": sorted(
+                memory_events,
+                key=lambda item: item["elapsed_ms"],
+            ),
+            "operator_events": sorted(
+                operator_events,
+                key=lambda item: item["elapsed_ms"],
+            ),
             "kv_samples": sorted(kv_samples, key=lambda sample: sample["elapsed_ms"]),
             "cpu_events": sorted(cpu_events, key=lambda item: item["elapsed_ms"]),
             "token_samples": sorted(token_samples, key=lambda item: item["elapsed_ms"]),
@@ -937,6 +1376,20 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
                     (sample["usage"] for sample in kv_samples), default=0
                 ),
                 "profile_steps": len(profile_samples),
+                "fork_operator_steps": len(operator_events),
+                "fork_max_aggregated_queries": max(
+                    (
+                        int(event["max_aggregated_queries"])
+                        for event in operator_events
+                    ),
+                    default=0,
+                ),
+                "fork_mean_aggregated_queries": statistics.fmean(
+                    int(event["max_aggregated_queries"])
+                    for event in operator_events
+                )
+                if operator_events
+                else 0.0,
                 "cpu_evicted_blocks": sum(
                     event["evicted_blocks"] for event in cpu_events
                 ),
@@ -954,6 +1407,63 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
                     cpu_events, "cooling"
                 ),
                 "cpu_evicted_unique_cold": unique_evicted_keys(cpu_events, "cold"),
+                "load_operations": int(
+                    connector_totals.get(
+                        f"{_TransferMetricName.LOAD_SIZE}_count",
+                        0,
+                    )
+                ),
+                "load_bytes": int(
+                    connector_totals.get(_TransferMetricName.LOAD_BYTES, 0)
+                ),
+                "reload_blocks_hot": int(
+                    labeled_metric(
+                        connector_totals,
+                        _LifecycleMetricName.RELOAD_BLOCKS,
+                        "hot",
+                    )
+                ),
+                "reload_blocks_cooling": int(
+                    labeled_metric(
+                        connector_totals,
+                        _LifecycleMetricName.RELOAD_BLOCKS,
+                        "cooling",
+                    )
+                ),
+                "reload_blocks_cold": int(
+                    labeled_metric(
+                        connector_totals,
+                        _LifecycleMetricName.RELOAD_BLOCKS,
+                        "cold",
+                    )
+                ),
+                "gpu_evicted_hot": int(
+                    labeled_metric(
+                        connector_totals,
+                        _LifecycleMetricName.GPU_EVICTED_BLOCKS,
+                        "hot",
+                    )
+                ),
+                "gpu_evicted_cooling": int(
+                    labeled_metric(
+                        connector_totals,
+                        _LifecycleMetricName.GPU_EVICTED_BLOCKS,
+                        "cooling",
+                    )
+                ),
+                "gpu_evicted_cold": int(
+                    labeled_metric(
+                        connector_totals,
+                        _LifecycleMetricName.GPU_EVICTED_BLOCKS,
+                        "cold",
+                    )
+                ),
+                "coalesced_load_waits": int(
+                    connector_totals.get(
+                        _LifecycleMetricName.COALESCED_LOAD_WAITS,
+                        0,
+                    )
+                ),
                 "max_hot_blocks": max(
                     (sample["hot_blocks"] for sample in lifecycle_samples),
                     default=0,
@@ -973,6 +1483,12 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
                     started_event="pressure_started",
                     completed_event="pressure_completed",
                 ),
+                "post_finish_pressure_interval": summarize_interval(
+                    events,
+                    token_samples,
+                    started_event="post_finish_pressure_started",
+                    completed_event="post_finish_pressure_completed",
+                ),
                 "wave2_effective": summarize_interval(
                     events,
                     token_samples,
@@ -980,6 +1496,12 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
                     completed_event="wave2_completed",
                 ),
                 "revisit": summarize_wave(revisit_results),
+                "revisit_operator": summarize_operator_interval(
+                    events,
+                    operator_events,
+                    started_event="revisit_started",
+                    completed_event="revisit_completed",
+                ),
             },
         }
     finally:

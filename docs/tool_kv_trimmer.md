@@ -755,6 +755,180 @@ benchmark/.venv/bin/python \
   --output benchmark/results/fanout_lifecycle/timeline.png
 ```
 
+## GPU Lifecycle-Aware Eviction and Reload Optimization
+
+### Optimization Target
+
+This experiment targets the specific path discussed above:
+**CPU/offload medium → GPU KV reload**. It does not change CPU eviction policy
+or the attention kernel. Both modes use `cohort_lru` for the CPU cache; the
+only A/B variable is GPU prefix-cache eviction:
+
+| Mode | GPU idle-prefix eviction |
+|---|---|
+| Original | ordinary block-level LRU |
+| Optimized | lifecycle, reuse, fanout, prefix position, and post-load residency |
+
+The optimized ranking evicts unclassified/COLD blocks first, then COOLING
+blocks, and HOT blocks last. Within a lifecycle tier it prefers low-reuse,
+low-fanout suffix blocks. A completed CPU→GPU load receives a short soft
+residency window so it is not immediately evicted by the next allocation.
+The protection is soft: allocation can still reclaim these blocks if no
+lower-value candidate exists.
+
+Lifecycle metadata remains attached to an idle cached prefix after the last
+request releases it. Each physical-block mapping is validated against the
+expected block hash so a recycled GPU block cannot inherit stale HOT state.
+Concurrent requests for the same missing prefix continue to share the
+connector's in-flight load instead of issuing duplicate transfers.
+
+### Reload-Producing Agent Timeline
+
+The earlier lifecycle run did not directly measure reload because the shared
+root remained in GPU cache. The revised timeline adds a second pressure phase
+after all shared branches finish:
+
+```text
+4K root -> 8 branches -> 2 survivors -> cold pressure -> re-fork
+        -> all shared branches finish
+        -> six new independent 2K prompts force idle GPU-prefix eviction
+        -> eight branches revisit the original root
+```
+
+The CPU cache is increased from 0.5 GiB to 2.0 GiB for this isolation test.
+At 0.5 GiB, the pressure phase can evict both the GPU copy and its CPU backup,
+turning the revisit into recomputation. At 2.0 GiB the CPU copy remains
+available, so the experiment measures the intended GPU eviction and reload
+path. GPU capacity remains fixed at 512 blocks in both modes.
+
+The new direct metrics are:
+
+- physical offload load operations and bytes;
+- reloaded KV blocks labeled HOT, COOLING, or COLD;
+- GPU prefix evictions labeled by lifecycle;
+- GPU-resident blocks by lifecycle;
+- blocks granted post-load residency and requests coalesced behind an
+  in-flight load.
+
+### Results
+
+The following values are mean ± sample standard deviation over three runs on
+the same RTX 5070 and Qwen3-0.6B FP16 configuration:
+
+| Metric | Original GPU LRU | Lifecycle GPU eviction | Change |
+|---|---:|---:|---:|
+| CPU→GPU load operations | 7.0 ± 0.0 | 6.0 ± 0.0 | -14.29% |
+| CPU→GPU load volume | 521.5 ± 0.0 MiB | 73.5 ± 0.0 MiB | **-85.91%** |
+| CPU→GPU transfer time | 13.79 ± 0.25 ms | 2.13 ± 0.01 ms | **-84.54%** |
+| Reloaded KV blocks | 298.0 ± 0.0 | 42.0 ± 0.0 | **-85.91%** |
+| Reloaded COOLING blocks | 256.0 ± 0.0 | 0.0 ± 0.0 | **-100.00%** |
+| Reloaded COLD blocks | 42.0 ± 0.0 | 42.0 ± 0.0 | 0.00% |
+| Revisit P95 TTFT | 81.3 ± 6.2 ms | 54.2 ± 0.8 ms | **-33.28%** |
+| Revisit branch throughput | 98.6 ± 7.9 turns/s | 146.5 ± 1.9 turns/s | **+48.52%** |
+
+The optimized runs recorded 1,507 COLD GPU-eviction occurrences and zero
+HOT/COOLING GPU-eviction occurrences. These are eviction occurrences rather
+than unique keys: pressure blocks can cycle through the fixed GPU pool.
+
+The operation-count reduction is smaller than the block/byte reduction because
+the connector already coalesces the 256-block shared root into one large
+physical load. Retaining that root therefore removes one load operation but
+removes 256 block transfers. The remaining six operations and 42 blocks are
+the branch-specific COLD suffixes. Thus the direct evidence for reduced KV
+loading is both one fewer transfer launch and 85.91% fewer blocks/bytes moved.
+
+The raw three-run table is
+[`experiment_results/gpu_lifecycle_reload.csv`](experiment_results/gpu_lifecycle_reload.csv).
+The two figures below use actual cache- and operator-path events. The first
+lane is the number of queries in one physical shared ForkAttention CTA. The
+remaining lanes show GPU KV residency, store/evict/load events, and CPU KV
+residency. Gold is the shared prefix, branch colors are suffix KV, and gray is
+cold pressure traffic.
+
+![Baseline actual KV memory-event timeline](assets/kv_memory_timeline_baseline.png)
+
+Under original GPU LRU, pressure removes the 256-block shared prefix from GPU,
+so revisit reloads 256 prefix blocks and 42 branch blocks. With eight shared
+branches interleaved among eight private requests, FCFS forms at most a
+four-query cohort.
+
+![Optimized actual KV memory-event timeline](assets/kv_memory_timeline_optimized.png)
+
+With lifecycle-aware eviction, the shared prefix remains on GPU and only the
+42 branch blocks reload. Its retained HOT/COOLING fanout hint also enables a
+bounded query-join window, producing an eight-query cohort in all three
+repeats. A GPU-to-CPU store creates a CPU copy rather than immediately
+removing the GPU copy, so simultaneous residency in both lanes is expected.
+Full experiment details and the 12-run ablation are in
+[`kv_lifecycle_reload_experiment.md`](kv_lifecycle_reload_experiment.md).
+
+### Interpretation and Limits
+
+This result supports the fork-version offload mechanism at the GPU residency
+boundary: branch-derived HOT/COOLING value is preserved when the prefix
+becomes idle, cold pressure absorbs eviction, and the next multi-branch turn
+avoids rereading the shared root. The benefit appears as lower reload traffic,
+lower revisit TTFT, and higher short-turn branch throughput rather than lower
+preallocated `nvidia-smi` memory.
+
+This is still a controlled mechanism experiment, not an AppWorld end-to-end
+result. The deterministic topology is useful here because it keeps shared-root
+length, branch fanout, GPU pressure, and CPU availability identical across
+modes. AppWorld should be used next to measure the distribution of retained
+HOT lifetime and reload savings across real Agent trajectories.
+
+### Reproduction
+
+Run both modes with identical workload arguments and toggle lifecycle eviction
+and query join together:
+
+```bash
+export PYTHONPATH="$PWD/vllm:$PWD/vllm/.venv.broken-root-20260715/lib/python3.12/site-packages"
+
+CUDA_VISIBLE_DEVICES=0 vllm/.venv/bin/python \
+  benchmark/scripts/benchmark_fanout_lifecycle_timeline.py \
+  --policy cohort_lru \
+  --no-gpu-lifecycle-eviction \
+  --attention-backend FORK_ATTN \
+  --no-fork-query-join \
+  --num-gpu-blocks 512 \
+  --max-num-seqs 8 \
+  --cpu-cache-gib 2.0 \
+  --hot-prefix-cooldown-steps 1024 \
+  --pressure-sessions 6 \
+  --post-finish-pressure-sessions 6 \
+  --wave-output-tokens 8 \
+  --revisit-output-tokens 16 \
+  --revisit-distractors 8 \
+  --gpu-sample-ms 50 \
+  --output benchmark/results/gpu_lifecycle_reload/baseline.json
+
+CUDA_VISIBLE_DEVICES=0 vllm/.venv/bin/python \
+  benchmark/scripts/benchmark_fanout_lifecycle_timeline.py \
+  --policy cohort_lru \
+  --gpu-lifecycle-eviction \
+  --attention-backend FORK_ATTN \
+  --fork-query-join \
+  --num-gpu-blocks 512 \
+  --max-num-seqs 8 \
+  --cpu-cache-gib 2.0 \
+  --hot-prefix-cooldown-steps 1024 \
+  --pressure-sessions 6 \
+  --post-finish-pressure-sessions 6 \
+  --wave-output-tokens 8 \
+  --revisit-output-tokens 16 \
+  --revisit-distractors 8 \
+  --gpu-sample-ms 50 \
+  --output benchmark/results/gpu_lifecycle_reload/optimized.json
+
+benchmark/.venv/bin/python \
+  benchmark/scripts/plot_kv_memory_event_timeline.py \
+  --baseline benchmark/results/gpu_lifecycle_reload/baseline.json \
+  --optimized benchmark/results/gpu_lifecycle_reload/optimized.json \
+  --baseline-output docs/assets/kv_memory_timeline_baseline.png \
+  --optimized-output docs/assets/kv_memory_timeline_optimized.png
+```
+
 ## Deployment Guidance
 
 Use the following sequence for a real workload:

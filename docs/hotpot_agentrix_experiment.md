@@ -188,9 +188,9 @@ unrelated request streams, narrow fanouts, DP routing, offload, multimodal
 models, or naturally interleaved production RAG traffic. Those require
 separate controls.
 
-The current Qwen3-0.6B 100-case GPU-only and two-level CPU-offload follow-up is
-recorded separately in
-[`offload_restart_experiment.md`](offload_restart_experiment.md).
+The current branch-aware GPU KV lifecycle and CPU-to-GPU reload mechanism
+experiment is recorded separately in
+[`kv_lifecycle_reload_experiment.md`](kv_lifecycle_reload_experiment.md).
 
 ## Reproduction
 
