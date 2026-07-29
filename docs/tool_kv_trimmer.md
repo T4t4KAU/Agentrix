@@ -594,6 +594,167 @@ vllm/.venv/bin/python -m ruff check \
 
 The current result is 27 passing application tests and a clean Ruff check.
 
+## Branch-aware HOT/COOLING/COLD Offload Experiment
+
+### Question
+
+This second experiment isolates the fork-aware offload policy. It asks whether
+branch fanout can identify high-value shared KV, retain it across a realistic
+Agent-scale cooling interval, and turn that retention into faster completion
+of later branch turns.
+
+The original and optimized modes have the same model, request order, GPU KV
+capacity, CPU cache capacity, and fanout lifecycle metadata:
+
+| Mode | CPU offload eviction policy |
+|---|---|
+| Original | ordinary `lru` |
+| Optimized | branch-aware `cohort_lru` |
+
+Both modes use FlashAttention so the result measures cache lifecycle and
+offload handling rather than a ForkAttention kernel-speed difference.
+
+### Agent Timeline and Metrics
+
+Each run uses deterministic valid token IDs and the following workflow:
+
+```text
+4K shared root
+  -> fork to 8 running branches: root becomes HOT
+  -> drop to 2 long-running branches: root becomes COOLING
+  -> admit six independent 2K cold requests: CPU/GPU KV pressure
+  -> re-fork to 8 branches
+  -> finish shared branches and age the root
+  -> 8-branch short-turn revisit
+```
+
+The controlled token workload is intentional. AppWorld is appropriate for the
+separate tool-TTL lifetime experiment, but its heterogeneous prompts would
+make it difficult to hold branch fanout, shared-root length, and cold-pressure
+volume constant between eviction policies.
+
+The timeline records:
+
+- active Agent branch count and semantic fork/drop/revisit events;
+- logical vLLM GPU KV usage;
+- lifecycle-classified HOT, COOLING, and COLD blocks;
+- CPU eviction occurrences by lifecycle in a 500 ms window;
+- useful output throughput from token emission timestamps;
+- completed branch turns per second and P50/P95 TTFT;
+- NVML GPU SM utilization, memory-controller utilization, physical memory,
+  power, and PCIe RX/TX.
+
+`nvidia-smi` memory is not used as the logical KV metric because vLLM
+preallocates its KV pool. GPU utilization is supporting evidence only:
+recomputation can keep SM utilization high without producing useful output.
+
+### Configuration
+
+The reported run was executed locally on 2026-07-29:
+
+| Item | Value |
+|---|---:|
+| GPU | NVIDIA GeForce RTX 5070, 12,227 MiB |
+| Driver | 590.48.01 |
+| Model | Qwen3-0.6B, FP16 |
+| Shared root | 4,096 tokens, 256 KV blocks |
+| Branch suffix | 128 tokens |
+| Maximum fanout / survivors | 8 / 2 |
+| Cold pressure | 6 requests × 2,048 tokens |
+| GPU KV capacity | 512 blocks |
+| CPU cache | 0.5 GiB |
+| HOT minimum fanout | 4 |
+| HOT minimum reuse | 128 blocks |
+| HOT minimum residency | 4 scheduler steps |
+| Cooling interval | 1,024 scheduler steps |
+| Re-fork continuation | 8 tokens per new branch |
+| Cold-revisit continuation | 1 token per branch |
+| Repetitions | 3 per policy |
+
+The 1,024-step cooling interval is a deliberate Agent-scale TTL setting, not
+the repository default of 16 scheduler steps. Preliminary runs found that 16
+steps expired during cold-request prefill, before the later branch reuse.
+Likewise, a 0.25 GiB CPU cache forced both policies to evict the shared root
+before cold alternatives were available. Those configurations test overload,
+but cannot test whether the policy chooses COLD over HOT/COOLING when it has a
+choice.
+
+### Results
+
+The following values are mean ± sample standard deviation over three runs:
+
+| Metric | Original LRU | Branch-aware `cohort_lru` | Change |
+|---|---:|---:|---:|
+| Peak logical GPU KV usage | 79.45% ± 0.00% | 79.45% ± 0.00% | 0.00% |
+| HOT eviction occurrences | 107.7 ± 6.5 | 40.0 ± 0.0 | -62.85% |
+| COOLING eviction occurrences | 256.0 ± 0.0 | 104.0 ± 0.0 | -59.38% |
+| Unique HOT blocks evicted | 76.7 ± 4.2 | 40.0 ± 0.0 | -47.83% |
+| Cold-revisit branch throughput | 101.6 ± 2.7 turns/s | 119.9 ± 7.8 turns/s | **+18.00%** |
+| Cold-revisit P95 TTFT | 78.6 ± 2.1 ms | 66.8 ± 4.2 ms | **-15.09%** |
+| Immediate re-fork throughput | 38.66 ± 0.11 turns/s | 37.39 ± 0.45 turns/s | -3.30% |
+| Immediate re-fork P95 TTFT | 64.6 ± 1.0 ms | 64.6 ± 1.1 ms | -0.10% |
+
+The full summary table is
+[`experiment_results/fanout_lifecycle_short_turn.csv`](experiment_results/fanout_lifecycle_short_turn.csv).
+The representative paired timeline is shown below.
+
+![Branch-aware KV lifecycle timeline](assets/fanout_lifecycle_timeline.png)
+
+### Interpretation and Limits
+
+The equal peak shows that this is not a lower-capacity experiment. Under the
+same 512-block GPU budget, `cohort_lru` changes *which* CPU-backed KV survives:
+it substantially reduces HOT/COOLING eviction and makes the later short
+8-branch turn complete 18% more turns per second.
+
+The immediate re-fork result is intentionally reported even though it is
+neutral to slightly negative. HOT KV retention does not improve the model's
+steady decode kernel. The measured benefit appears when branch work is
+prefix-recovery dominated, which is common for short Agent planning/tool
+turns. Long continuations amortize TTFT and should not be claimed as an 18%
+token-throughput gain.
+
+The run uses one small model, one branch topology, deterministic synthetic
+tokens, and three repetitions. The result supports the lifecycle mechanism and
+its TTL requirement; it is not yet an AppWorld-wide performance result.
+A follow-up matrix should vary shared-root length, fanout, CPU/GPU cache ratio,
+cooldown steps, and short-turn length, then replay the selected settings on
+AppWorld trajectories.
+
+### Reproduction
+
+Run each policy with the same arguments:
+
+```bash
+PYTHONPATH="$PWD/vllm" vllm/.venv/bin/python \
+  benchmark/scripts/benchmark_fanout_lifecycle_timeline.py \
+  --policy lru \
+  --num-gpu-blocks 512 \
+  --cpu-cache-gib 0.5 \
+  --hot-prefix-cooldown-steps 1024 \
+  --wave-output-tokens 8 \
+  --revisit-output-tokens 1 \
+  --gpu-sample-ms 50 \
+  --output benchmark/results/fanout_lifecycle/lru.json
+
+PYTHONPATH="$PWD/vllm" vllm/.venv/bin/python \
+  benchmark/scripts/benchmark_fanout_lifecycle_timeline.py \
+  --policy cohort_lru \
+  --num-gpu-blocks 512 \
+  --cpu-cache-gib 0.5 \
+  --hot-prefix-cooldown-steps 1024 \
+  --wave-output-tokens 8 \
+  --revisit-output-tokens 1 \
+  --gpu-sample-ms 50 \
+  --output benchmark/results/fanout_lifecycle/cohort_lru.json
+
+benchmark/.venv/bin/python \
+  benchmark/scripts/plot_fanout_lifecycle_timeline.py \
+  --baseline benchmark/results/fanout_lifecycle/lru.json \
+  --optimized benchmark/results/fanout_lifecycle/cohort_lru.json \
+  --output benchmark/results/fanout_lifecycle/timeline.png
+```
+
 ## Deployment Guidance
 
 Use the following sequence for a real workload:
