@@ -25,12 +25,35 @@ the Apple Metal path.
 | GPU / accelerator | NVIDIA Tesla T4, RTX 5070, RTX 5090, and H20 (CUDA); Moore Threads MTT S4000 / QY2 (MUSA); Apple M2 Max (Metal) |
 | Operating system | Ubuntu 22.04 / 22.04.5 LTS, Huawei Cloud EulerOS (HCE) 2.0, CentOS Linux 7.9, and macOS on the Apple Metal path |
 | Upstream system versions | vLLM `v0.24.0` cycle, LMCache `v0.5.1` cycle, llama.cpp `b9860`, and SGLang `v0.5.15.post1` cycle |
-| Pinned Agentrix revisions | vLLM `3588b8ba36`, LMCache `9559285039`, llama.cpp `f500456189`, and SGLang `17159d93d8` |
+| Pinned Agentrix revisions | vLLM `dbeaf7fcb6`, LMCache `9559285039`, llama.cpp `f500456189`, and SGLang `17159d93d8` |
 | vLLM runtime stack | Python 3.10–3.14 and PyTorch 2.11.0; source builds validated with CUDA 12.8, 12.9, and 13.0 |
 
 The NVIDIA path supports Turing and newer architectures; BF16 requires Ampere
 or newer. Backend-specific ForkAttention constraints fall back to the native
 attention path when they are not satisfied.
+
+## Validated Results
+
+Agentrix combines prefix-aware request placement, shared-prefix execution, and
+lifecycle-aware KV management. The main paired results cover task quality,
+physical GPU memory, live KV capacity, reload traffic, and serving latency:
+
+| Evidence | Baseline | Agentrix | Result |
+|---|---:|---:|---:|
+| LongBench exact match, Qwen3-32B on 4x H20 | 5.88% | 5.88% | unchanged |
+| LongBench token F1 | 40.53% | 40.42% | -0.11 percentage points |
+| LongBench peak process HBM | 84,926 MiB | 81,822 MiB | **-3,104 MiB (-3.66%)** |
+| LongBench mean TTFT | 44.01 s | 29.52 s | **1.49x faster** |
+| Coding-Agent DP=8 mean live KV | 432,139 tokens | 261,245 tokens | **-39.17%** |
+| Tool-wait peak live KV | 3.500 GiB | 1.750 GiB | **-50.00%** |
+| Lifecycle-aware CPU-to-GPU reload | 521.5 MiB | 73.5 MiB | **-85.91%** |
+
+The lifecycle scheduler and bounded query join form one closed loop: shared
+roots remain resident across Agent turn boundaries, concurrent reloads are
+coalesced, and ready siblings are regrouped into one physical ForkAttention
+cohort. In the controlled revisit experiment this reduced P95 TTFT from
+272.4 ms to 54.4 ms (**-80.05%**) and increased goodput from 291.6 to
+481.7 tok/s (**+65.20%**).
 
 ## Documentation
 
@@ -42,7 +65,8 @@ attention path when they are not satisfied.
 - [LongBench shared-document QA inputs, results, and reproduction](docs/longbench_qa_experiment.md)
 - [Main shared-prefix experiment results](docs/main_experiment_results.md)
 - [HotpotQA Agentrix long-prefix experiment](docs/hotpot_agentrix_experiment.md)
-- [Current HotpotQA ForkAttention/offload restart experiment](docs/offload_restart_experiment.md)
+- [Branch-aware GPU KV lifecycle and reload experiment](docs/kv_lifecycle_reload_experiment.md)
+- [Executable Coding-Agent quality A/B](docs/coding_agent_quality_ab.md)
 - [ForkAttention CUDA operator profile](docs/forkattention_operator_profile.md)
 - [Main experiment procedures](docs/main_experiment_matrix.md)
 - [ForkAttention TP model compatibility](docs/tp_model_compatibility.md)

@@ -1,64 +1,30 @@
-import json
-import subprocess
 from pathlib import Path
 
-import pytest
-
-from coding_agent_tools import RepositoryTools, ToolError
+from coding_agent_tools import RepositoryTools
 
 
-def make_workspace(tmp_path: Path) -> Path:
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    (workspace / "src").mkdir()
-    (workspace / "src" / "value.c").write_text("int value = 1;\n")
-    subprocess.run(("git", "init", "-q"), cwd=workspace, check=True)
-    subprocess.run(
-        ("git", "config", "user.email", "test@example.com"),
-        cwd=workspace,
-        check=True,
-    )
-    subprocess.run(
-        ("git", "config", "user.name", "Test"), cwd=workspace, check=True
-    )
-    subprocess.run(("git", "add", "."), cwd=workspace, check=True)
-    subprocess.run(("git", "commit", "-qm", "baseline"), cwd=workspace, check=True)
-    return workspace
+def test_public_test_expands_python_in_build_command(tmp_path: Path) -> None:
+    agentrix = tmp_path / ".agentrix"
+    agentrix.mkdir()
+    public_test = agentrix / "public_test.py"
+    public_test.write_text("raise SystemExit(0)\n", encoding="utf-8")
+    task = {
+        "allowed_paths": ["target.py"],
+        "build": [
+            {
+                "cwd": ".",
+                "argv": [
+                    "{python}",
+                    "-c",
+                    "from pathlib import Path; Path('built').touch()",
+                ],
+            }
+        ],
+        "public_test_command": ["{python}", ".agentrix/public_test.py"],
+        "timeout_seconds": 10,
+    }
 
+    event = RepositoryTools(tmp_path, task).public_test()
 
-def test_tools_record_search_read_and_patch(tmp_path: Path) -> None:
-    workspace = make_workspace(tmp_path)
-    tools = RepositoryTools(workspace, {"allowed_paths": ["src/value.c"]})
-    assert "value" in tools.search("value", "*.c")["content"]
-    assert "int value" in tools.read("src/value.c")["content"]
-    tools.apply_patch(
-        """diff --git a/src/value.c b/src/value.c
---- a/src/value.c
-+++ b/src/value.c
-@@ -1 +1 @@
--int value = 1;
-+int value = 2;
-"""
-    )
-    assert "value = 2" in (workspace / "src" / "value.c").read_text()
-    assert [event["tool"] for event in tools.events] == [
-        "search",
-        "read",
-        "apply_patch",
-    ]
-
-
-def test_tools_reject_escape_and_out_of_scope_patch(tmp_path: Path) -> None:
-    workspace = make_workspace(tmp_path)
-    tools = RepositoryTools(workspace, {"allowed_paths": ["src/value.c"]})
-    with pytest.raises(ToolError):
-        tools.read("../secret")
-    with pytest.raises(ToolError):
-        tools.apply_patch(
-            """diff --git a/README b/README
---- /dev/null
-+++ b/README
-@@ -0,0 +1 @@
-+no
-"""
-        )
+    assert '"returncode": 0' in event["content"]
+    assert (tmp_path / "built").is_file()

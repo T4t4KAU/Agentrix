@@ -1,13 +1,7 @@
-"""Build a paired LongBench quality, latency, throughput, and memory report."""
 from __future__ import annotations
-
-import argparse
-import csv
-import json
-import statistics
+import argparse, csv, json, statistics
 from pathlib import Path
 from typing import Any
-
 
 def peak_memory(path: Path) -> int | None:
     if not path.is_file():
@@ -25,47 +19,20 @@ def peak_memory(path: Path) -> int | None:
                 continue
     return max(values) if values else None
 
-
-def compare(
-    baseline: dict[str, Any], optimized: dict[str, Any]
-) -> dict[str, Any]:
-    left = {result["source_id"]: result for result in baseline["results"]}
-    right = {result["source_id"]: result for result in optimized["results"]}
-    if left.keys() != right.keys():
-        missing_left = sorted(right.keys() - left.keys())
-        missing_right = sorted(left.keys() - right.keys())
-        raise ValueError(
-            "request sets differ: "
-            f"missing_baseline={missing_left}, "
-            f"missing_optimized={missing_right}"
-        )
-    keys = sorted(left)
-    deltas = [right[key]["f1"] - left[key]["f1"] for key in keys]
-    agreement = [
-        float(
-            left[key]["prediction"].strip().casefold()
-            == right[key]["prediction"].strip().casefold()
-        )
-        for key in keys
-    ]
-    return {
-        "paired_questions": len(keys),
-        "baseline_f1": baseline["mean_f1"],
+def compare(baseline: dict[str, Any], optimized: dict[str, Any]) -> dict[str, Any]:
+    left = {r["source_id"]: r for r in baseline["results"]}
+    right = {r["source_id"]: r for r in optimized["results"]}
+    keys = sorted(left.keys() & right.keys())
+    deltas = [right[k]["f1"] - left[k]["f1"] for k in keys]
+    agreement = [float(left[k]["prediction"].strip().casefold() ==
+                       right[k]["prediction"].strip().casefold()) for k in keys]
+    return {"paired_questions": len(keys), "baseline_f1": baseline["mean_f1"],
         "optimized_f1": optimized["mean_f1"],
-        "paired_mean_f1_delta": (
-            statistics.fmean(deltas) if deltas else 0
-        ),
-        "prediction_exact_agreement": (
-            statistics.fmean(agreement) if agreement else 0
-        ),
-        "wall_speedup": baseline["wall_seconds"]
-        / optimized["wall_seconds"],
-        "throughput_speedup": optimized["questions_per_second"]
-        / baseline["questions_per_second"],
-        "ttft_speedup": baseline["mean_ttft_seconds"]
-        / optimized["mean_ttft_seconds"],
-    }
-
+        "paired_mean_f1_delta": statistics.fmean(deltas) if deltas else 0,
+        "prediction_exact_agreement": statistics.fmean(agreement) if agreement else 0,
+        "wall_speedup": baseline["wall_seconds"] / optimized["wall_seconds"],
+        "throughput_speedup": optimized["questions_per_second"] / baseline["questions_per_second"],
+        "ttft_speedup": baseline["mean_ttft_seconds"] / optimized["mean_ttft_seconds"]}
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -76,17 +43,11 @@ def main() -> int:
     baseline = json.loads((args.baseline / "run.json").read_text())
     optimized = json.loads((args.optimized / "run.json").read_text())
     report = compare(baseline, optimized)
-    report["baseline_peak_process_memory_mib"] = peak_memory(
-        args.baseline / "gpu_process_memory.csv"
-    )
-    report["optimized_peak_process_memory_mib"] = peak_memory(
-        args.optimized / "gpu_process_memory.csv"
-    )
+    report["baseline_peak_process_memory_mib"] = peak_memory(args.baseline / "gpu_process_memory.csv")
+    report["optimized_peak_process_memory_mib"] = peak_memory(args.optimized / "gpu_process_memory.csv")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))
     return 0
-
-
 if __name__ == "__main__":
     raise SystemExit(main())

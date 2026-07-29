@@ -19,6 +19,7 @@ MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-16384}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-64}"
 NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE:-3852}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.70}"
+VLLM_SERVER_EXTRA_ARGS="${VLLM_SERVER_EXTRA_ARGS:-}"
 BRANCH_OUTPUT_TOKENS="${BRANCH_OUTPUT_TOKENS:-64}"
 ROUNDS="${ROUNDS:-3}"
 TRAJECTORY_MODE="${TRAJECTORY_MODE:-replay}"
@@ -97,6 +98,10 @@ run_variant() {
   local output_dir="${OUTPUT_ROOT}/${variant}/batch_${batch_offset}"
   mkdir -p "${output_dir}"
   local log="${output_dir}/vllm_server.log"
+  local -a extra_vllm_args=()
+  if [[ -n "${VLLM_SERVER_EXTRA_ARGS}" ]]; then
+    read -r -a extra_vllm_args <<<"${VLLM_SERVER_EXTRA_ARGS}"
+  fi
   CUDA_VISIBLE_DEVICES="${GPU_IDS}" \
     PYTHONHASHSEED=0 \
     VLLM_USE_FLASHINFER_SAMPLER=0 \
@@ -118,7 +123,8 @@ run_variant() {
       --num-gpu-blocks-override "${NUM_GPU_BLOCKS_OVERRIDE}" \
       --max-model-len "${MAX_MODEL_LEN}" \
       --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
-      --max-num-seqs "${MAX_NUM_SEQS}" >"${log}" 2>&1 &
+      --max-num-seqs "${MAX_NUM_SEQS}" \
+      "${extra_vllm_args[@]}" >"${log}" 2>&1 &
   SERVER_PID=$!
   wait_server "${log}"
   curl --silent --fail "http://127.0.0.1:${PORT}/metrics" \

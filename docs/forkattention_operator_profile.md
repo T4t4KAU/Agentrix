@@ -426,6 +426,78 @@ The practical conclusions are:
    limited sweep, but the near-zero margin justifies a conservative fallback
    band if end-to-end tests show additional metadata or scheduling overhead.
 
+## Agent-Time Query Cohort Aggregation
+
+The pure-operator matrix above assumes that all queries in a cell reach one
+ForkAttention invocation together. A serving scheduler can lose that benefit
+even while the shared KV remains resident: FCFS admission, asynchronous branch
+reloads, and interleaved private requests may split one logical eight-branch
+fanout into smaller physical cohorts.
+
+The implementation now closes this scheduler/operator boundary in three
+places:
+
+1. requests whose asynchronous KV reloads finish together are re-clustered by
+   block-hash prefix before returning to execution;
+2. a running decode that shares a long prefix with pending reload siblings can
+   defer for a bounded number of scheduler steps;
+3. a resident HOT/COOLING prefix exposes its historical fanout as an arrival
+   hint, allowing admission to wait at most two steps for the expected cohort.
+
+The wait applies only to a lifecycle-classified resident prefix meeting the
+fanout and prefix-length thresholds. Private requests, cold prefixes, weak
+fanout, and requests that exhaust the bounded wait retain normal scheduling.
+This restriction is important because unconditionally delaying singleton
+queries would recreate the low-query latency regressions measured above.
+
+### Physical Operator Telemetry
+
+ForkAttention execution statistics now include:
+
+- queries participating in at least one physically shared CTA;
+- maximum queries aggregated by one shared CTA in each model step;
+- the existing shared, singleton, and total CTA counts.
+
+These values are produced by the physical forest/common plan. They are not
+inferred from the number of running requests. Prometheus exports the cumulative
+shared-query count as `vllm:fork_attention_shared_queries` and the per-step
+maximum cohort histogram as `vllm:fork_attention_query_cohort_size`.
+
+### Joint Memory and Operator Experiment
+
+The controlled Agent revisit interleaves eight branches sharing a 4K-token
+root with eight private requests, limits the engine to eight sequence slots,
+and applies identical GPU/CPU pressure in every mode. Each result is the mean
+of three GPU runs:
+
+| Mode | CPU→GPU reload | Active shared-CTA cohort | Max cohort | Revisit P95 TTFT | Revisit goodput |
+|---|---:|---:|---:|---:|---:|
+| GPU LRU + FCFS | 521.5 MiB | 3.98 ± 0.02 | 4.0 ± 0.0 | 272.4 ± 7.4 ms | 291.6 ± 2.1 tok/s |
+| Lifecycle only | 73.5 MiB | 3.97 ± 0.00 | 4.0 ± 0.0 | 281.5 ± 0.2 ms | 277.8 ± 0.4 tok/s |
+| Lifecycle + hot-prefix query join | **73.5 MiB** | **8.00 ± 0.00** | **8.0 ± 0.0** | **54.4 ± 7.0 ms** | **481.7 ± 31.9 tok/s** |
+
+The lifecycle-only ablation is the key control. It proves that keeping KV hot
+is necessary but not sufficient: reload falls by 85.91%, yet FCFS still feeds
+the operator two four-query cohorts. Adding the bounded hot-prefix join doubles
+the active physical cohort to eight, reduces P95 TTFT by 80.05% versus the
+unoptimized baseline, and raises revisit goodput by 65.20%.
+
+Query join without lifecycle residency was not stable: its three maximum
+cohorts were 4, 8, and 7. This ablation supports coupling admission to a
+resident HOT/COOLING prefix rather than enabling a blind global batching
+delay.
+
+![Baseline KV placement and physical query cohorts](assets/kv_memory_timeline_baseline.png)
+
+![Lifecycle-aware KV placement and physical query cohorts](assets/kv_memory_timeline_optimized.png)
+
+The raw 12-run data is
+[`experiment_results/fork_query_aggregation.csv`](experiment_results/fork_query_aggregation.csv).
+The figures share one time axis: physical query cohort, GPU KV placement,
+memory transfer/eviction events, and CPU KV placement. This is a system-level
+admission experiment; it complements rather than replaces the isolated
+25-cell CUDA operator matrix.
+
 ## Reliability and Repeatability
 
 All 25 cells passed output validation and all five counter groups captured

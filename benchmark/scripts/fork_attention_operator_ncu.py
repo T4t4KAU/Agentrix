@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Profile one matched Flash/Fork 16-branch decode operator invocation."""
+"""Profile one matched Flash/Cascade/Fork decode operator invocation."""
 
 from __future__ import annotations
 
@@ -11,7 +11,11 @@ from collections.abc import Callable
 import torch
 
 from vllm import _custom_ops as ops
-from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
+from vllm.v1.attention.backends.fa_utils import (
+    flash_attn_varlen_func,
+    get_flash_attn_version,
+)
+from vllm.v1.attention.backends.flash_attn import cascade_attention
 from vllm.v1.attention.backends.fork_attn import (
     _get_adaptive_prefix_chunk_blocks,
     _get_mnw,
@@ -22,7 +26,9 @@ from vllm.v1.attention.backends.fork_attn import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--attention-backend", choices=("FLASH_ATTN", "FORK_ATTN"), required=True
+        "--attention-backend",
+        choices=("FLASH_ATTN", "CASCADE_ATTN", "FORK_ATTN"),
+        required=True,
     )
     parser.add_argument("--prefix-tokens", type=int, default=8192)
     parser.add_argument("--private-suffix-tokens", type=int, default=128)
@@ -242,6 +248,56 @@ def make_flash(
     return run, output
 
 
+def make_cascade(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    prefix_tokens: int,
+) -> tuple[Callable[[], None], torch.Tensor]:
+    """Build vLLM's native two-level Cascade Attention invocation."""
+    batch, _, num_heads, head_dim = q.shape
+    query = q.view(batch, num_heads, head_dim)
+    output = torch.empty_like(query)
+    cu_query_lens = torch.arange(batch + 1, dtype=torch.int32, device=q.device)
+    cu_prefix_query_lens = torch.tensor(
+        [0, batch], dtype=torch.int32, device=q.device
+    )
+    prefix_kv_lens = torch.tensor(
+        [prefix_tokens], dtype=torch.int32, device=q.device
+    )
+    suffix_kv_lens = seq_lens - prefix_tokens
+    max_kv_len = int(seq_lens.max().item())
+    fa_version = get_flash_attn_version(head_size=head_dim)
+    if fa_version is None:
+        raise RuntimeError("Cascade operator profiling requires CUDA FlashAttention")
+
+    def run() -> None:
+        cascade_attention(
+            output=output,
+            query=query,
+            key_cache=k_cache,
+            value_cache=v_cache,
+            cu_query_lens=cu_query_lens,
+            max_query_len=1,
+            cu_prefix_query_lens=cu_prefix_query_lens,
+            prefix_kv_lens=prefix_kv_lens,
+            suffix_kv_lens=suffix_kv_lens,
+            max_kv_len=max_kv_len,
+            softmax_scale=1.0 / math.sqrt(head_dim),
+            alibi_slopes=None,
+            sliding_window=(-1, -1),
+            logits_soft_cap=0.0,
+            block_table=block_table,
+            common_prefix_len=prefix_tokens,
+            max_num_splits=0,
+            fa_version=fa_version,
+        )
+
+    return run, output
+
+
 def make_fork(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -293,21 +349,41 @@ def main() -> None:
     args = parse_args()
     q, k_cache, v_cache, block_table, seq_lens, boxes = make_inputs(args)
     flash, flash_output = make_flash(q, k_cache, v_cache, block_table, seq_lens)
+    cascade, cascade_output = make_cascade(
+        q,
+        k_cache,
+        v_cache,
+        block_table,
+        seq_lens,
+        args.prefix_tokens,
+    )
     fork, fork_output = make_fork(q, k_cache, v_cache, boxes, args.block_size)
 
     flash()
+    cascade()
     fork()
     torch.cuda.synchronize()
+    torch.testing.assert_close(
+        cascade_output, flash_output.view_as(cascade_output), atol=2e-2, rtol=2e-2
+    )
     torch.testing.assert_close(
         fork_output, flash_output.view_as(q), atol=2e-2, rtol=2e-2
     )
 
-    target = flash if args.attention_backend == "FLASH_ATTN" else fork
+    targets = {
+        "FLASH_ATTN": flash,
+        "CASCADE_ATTN": cascade,
+        "FORK_ATTN": fork,
+    }
+    target = targets[args.attention_backend]
     for _ in range(args.warmups):
         target()
     torch.cuda.synchronize()
 
     torch.cuda.profiler.start()
+    # Nsight Systems enables cudaProfilerApi capture asynchronously. This
+    # empty barrier ensures the range is active before the first target kernel.
+    torch.cuda.synchronize()
     target()
     torch.cuda.synchronize()
     torch.cuda.profiler.stop()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import statistics
 import tempfile
 import time
 from dataclasses import asdict
@@ -27,7 +28,9 @@ Allowed actions:
 {"action":"final","summary":"..."}
 Inspect evidence before editing. Run the public test after editing. Do not edit tests.
 Search for exact symbols before reading files. Read narrow line ranges and never repeat an identical action.
-Once the faulty implementation is identified, apply a focused patch and run public_test; do not spend all steps browsing."""
+Once the faulty implementation is identified, apply a focused patch and run public_test; do not spend all steps browsing.
+For apply_patch, emit a valid unified git diff using exact context you just read. Omit invented index hashes.
+A final action is accepted only after a patch is applied and its latest public_test passes."""
 
 
 def parse_action(text: str) -> dict[str, Any]:
@@ -67,13 +70,75 @@ def execute_action(tools: RepositoryTools, action: dict[str, Any]) -> dict[str, 
     raise ToolError(f"unknown action: {name}")
 
 
+def public_test_passed(event: dict[str, Any]) -> bool:
+    """Return whether a repository public-test event completed successfully."""
+    try:
+        payload = json.loads(event["content"])
+    except (KeyError, TypeError, json.JSONDecodeError):
+        return False
+    return payload.get("returncode") == 0
+
+
+def finalization_blocker(
+    *, patch_applied: bool, passing_public_test: bool
+) -> str | None:
+    """Require a real edit-and-test loop before accepting a final action."""
+    if not patch_applied:
+        return (
+            "Cannot finish yet: no patch has been applied. Inspect the faulty "
+            "implementation and use apply_patch."
+        )
+    if not passing_public_test:
+        return (
+            "Cannot finish yet: the latest public test after the patch has not "
+            "passed. Run public_test and revise the patch if needed."
+        )
+    return None
+
+
+def select_case(
+    cases: list[dict[str, Any]],
+    *,
+    case_id: str | None,
+    task_id: str | None,
+) -> dict[str, Any]:
+    """Select exactly one case by case ID or executable-oracle task ID."""
+    if bool(case_id) == bool(task_id):
+        raise ValueError("provide exactly one of case_id and task_id")
+    key = "case_id" if case_id else "oracle_task_id"
+    value = case_id or task_id
+    matches = [case for case in cases if case.get(key) == value]
+    if len(matches) != 1:
+        raise ValueError(f"expected one case for {key}={value!r}, found {len(matches)}")
+    return matches[0]
+
+
+def summarize_request_metrics(metrics: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return quality-adjusted performance inputs from one executable task."""
+    latencies = [float(item["latency_ms"]) for item in metrics]
+    ttfts = [
+        float(item["ttft_ms"])
+        for item in metrics
+        if item.get("ttft_ms") is not None
+    ]
+    return {
+        "request_count": len(metrics),
+        "input_tokens": sum(int(item["input_tokens"]) for item in metrics),
+        "output_tokens": sum(int(item["output_tokens"]) for item in metrics),
+        "request_latency_mean_ms": (
+            statistics.fmean(latencies) if latencies else None
+        ),
+        "ttft_mean_ms": statistics.fmean(ttfts) if ttfts else None,
+    }
+
+
 async def run(args: argparse.Namespace) -> dict[str, Any]:
     cases = [
         json.loads(line)
         for line in args.cases.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    selected = next(case for case in cases if case["case_id"] == args.case_id)
+    selected = select_case(cases, case_id=args.case_id, task_id=args.task_id)
     index = json.loads((args.task_root / "index.json").read_text(encoding="utf-8"))
     entry = next(
         item for item in index["tasks"] if item["task_id"] == selected["oracle_task_id"]
@@ -94,7 +159,11 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         for round_index in range(1, args.rounds + 1)
     })
     graph = build_graph(
-        runtime, args.branch_output_tokens, args.rounds, args.trajectory_mode
+        runtime,
+        args.branch_output_tokens,
+        args.rounds,
+        args.trajectory_mode,
+        args.prompt_compaction,
     )
     started = time.perf_counter()
     state = await graph.ainvoke({"case": selected, "branch_results": []})
@@ -124,6 +193,8 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     final_summary = ""
     parse_failures = 0
     seen_actions: set[str] = set()
+    patch_applied = False
+    passing_public_test = False
     for step in range(args.max_tool_steps):
         compact_summary = []
         if len(history) > 4:
@@ -165,6 +236,13 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             continue
         actions.append(action)
         if action["action"] == "final":
+            blocker = finalization_blocker(
+                patch_applied=patch_applied,
+                passing_public_test=passing_public_test,
+            )
+            if blocker:
+                history.append({"role": "user", "content": blocker})
+                continue
             final_summary = str(action.get("summary", ""))
             break
         signature = json.dumps(action, sort_keys=True, ensure_ascii=False)
@@ -175,6 +253,11 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             try:
                 event = execute_action(tools, action)
                 observation = event["content"]
+                if action["action"] == "apply_patch":
+                    patch_applied = True
+                    passing_public_test = False
+                elif action["action"] == "public_test" and patch_applied:
+                    passing_public_test = public_test_passed(event)
             except (ToolError, KeyError, ValueError) as error:
                 observation = f"Tool error: {error}"
         history.append(
@@ -185,6 +268,8 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         )
     await client.close()
     score = evaluate(task_path, workspace)
+    request_metrics = [asdict(metric) for metric in runtime.metrics]
+    total_wall_time_ms = (time.perf_counter() - started) * 1000
     return {
         "schema_version": 1,
         "workload": "coding_agent_executable_e2e",
@@ -196,13 +281,16 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "resolved": score["resolved"],
         "score": score,
         "branch_wall_time_ms": branch_wall_ms,
+        "total_wall_time_ms": total_wall_time_ms,
         "subagent_count": len(state["branch_results"]),
         "action_count": len(actions),
         "parse_failures": parse_failures,
         "actions": actions,
         "tool_events": tools.events,
         "final_summary": final_summary,
-        "requests": [asdict(metric) for metric in runtime.metrics],
+        "requests": request_metrics,
+        "request_summary": summarize_request_metrics(request_metrics),
+        "prompt_compaction": args.prompt_compaction,
     }
 
 
@@ -211,12 +299,15 @@ def main() -> None:
     parser.add_argument("--base-url", default="http://127.0.0.1:9000/v1")
     parser.add_argument("--model", required=True)
     parser.add_argument("--cases", type=Path, required=True)
-    parser.add_argument("--case-id", required=True)
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--case-id")
+    selection.add_argument("--task-id")
     parser.add_argument("--task-root", type=Path, required=True)
     parser.add_argument("--repo", type=Path, required=True)
     parser.add_argument("--workspace", type=Path)
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--trajectory-mode", choices=("live", "replay"), default="live")
+    parser.add_argument("--prompt-compaction", action="store_true")
     parser.add_argument("--branch-output-tokens", type=int, default=128)
     parser.add_argument("--parent-output-tokens", type=int, default=512)
     parser.add_argument("--max-tool-steps", type=int, default=14)
@@ -227,7 +318,24 @@ def main() -> None:
     payload = asyncio.run(run(args))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
-    print(json.dumps({k: payload[k] for k in ("case_id", "task_id", "resolved", "subagent_count", "action_count", "parse_failures", "branch_wall_time_ms")}, indent=2))
+    print(
+        json.dumps(
+            {
+                k: payload[k]
+                for k in (
+                    "case_id",
+                    "task_id",
+                    "resolved",
+                    "subagent_count",
+                    "action_count",
+                    "parse_failures",
+                    "branch_wall_time_ms",
+                    "total_wall_time_ms",
+                )
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

@@ -195,11 +195,12 @@ The frozen 100-case matrix, manifest generation, and executed settings are
 maintained separately in
 [`hotpot_agentrix_experiment.md`](hotpot_agentrix_experiment.md).
 
-The corrected closed-loop Qwen3-0.6B 100-case comparison, including the
-7 GiB GPU-only Flash/Fork pair and the 4 GiB two-level Flash-original versus
-Fork-optimized offload pair, is recorded in
-[`offload_restart_experiment.md`](offload_restart_experiment.md). Three-level
-storage scheduling is excluded from that formal matrix.
+The branch-aware GPU KV lifecycle scheduler and its controlled CPU-to-GPU
+reload A/B are recorded in
+[`kv_lifecycle_reload_experiment.md`](kv_lifecycle_reload_experiment.md).
+That mechanism experiment holds the CPU policy fixed and is separate from the
+formal HotpotQA matrix. Three-level storage scheduling remains excluded from
+the formal matrix.
 
 ## Detached Runs
 

@@ -14,6 +14,8 @@ export PATH="$(dirname "${VLLM_BIN}"):${PATH}"
 
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-0.6B}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3-0.6b-local}"
+ATTENTION_BACKEND="${ATTENTION_BACKEND:-FORK_ATTN}"
+ENABLE_CASCADE_ATTN="${ENABLE_CASCADE_ATTN:-auto}"
 DTYPE="${DTYPE:-float16}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
 HOST="${HOST:-127.0.0.1}"
@@ -42,11 +44,13 @@ OUTPUT_DIR="${OUTPUT_DIR:-results/fork_attention_nsys_${DATASET}_c${CASE_COUNT}_
 KEEP_SERVER="${KEEP_SERVER:-0}"
 VLLM_SERVER_EXTRA_ARGS="${VLLM_SERVER_EXTRA_ARGS:-}"
 BENCHMARK_EXTRA_ARGS="${BENCHMARK_EXTRA_ARGS:-}"
-NSYS_OUTPUT_NAME="${NSYS_OUTPUT_NAME:-fork_attention}"
+backend_lower="$(tr '[:upper:]' '[:lower:]' <<<"${ATTENTION_BACKEND}")"
+PROFILE_NAME="${PROFILE_NAME:-${backend_lower}}"
+NSYS_OUTPUT_NAME="${NSYS_OUTPUT_NAME:-${PROFILE_NAME}}"
 NSYS_EXTRA_ARGS="${NSYS_EXTRA_ARGS:-}"
 
 BASE_URL="http://${HOST}:${PORT}"
-BACKEND_OUTPUT_DIR="${OUTPUT_DIR}/fork_attn"
+BACKEND_OUTPUT_DIR="${OUTPUT_DIR}/${PROFILE_NAME}"
 BACKEND_LOG_DIR="${BENCHMARK_DIR}/${BACKEND_OUTPUT_DIR}"
 SERVER_LOG="${BACKEND_LOG_DIR}/vllm_server_nsys.log"
 NSYS_OUTPUT="${BACKEND_LOG_DIR}/${NSYS_OUTPUT_NAME}"
@@ -98,7 +102,7 @@ vllm_args=(
   --host "${HOST}"
   --port "${PORT}"
   --served-model-name "${SERVED_MODEL_NAME}"
-  --attention-backend FORK_ATTN
+  --attention-backend "${ATTENTION_BACKEND}"
   --dtype "${DTYPE}"
   --generation-config vllm
   --enable-prefix-caching
@@ -106,6 +110,19 @@ vllm_args=(
   --max-model-len "${MAX_MODEL_LEN}"
   --max-num-seqs "${MAX_NUM_SEQS}"
 )
+if [[ "${ENABLE_CASCADE_ATTN}" == "auto" ]]; then
+  if [[ "${ATTENTION_BACKEND}" == "FORK_ATTN" ]]; then
+    ENABLE_CASCADE_ATTN=1
+  else
+    ENABLE_CASCADE_ATTN=0
+  fi
+fi
+if [[ "${ENABLE_CASCADE_ATTN}" == "1" ]]; then
+  # Shared-prefix metadata is opt-in in vLLM. Native Cascade consumes it
+  # directly, while ForkAttention uses the same metadata to build its plan.
+  # The server log/trace must still confirm that the intended path ran.
+  vllm_args+=(--no-disable-cascade-attn)
+fi
 if [[ "${ENFORCE_EAGER}" == "1" ]]; then
   vllm_args+=(--enforce-eager)
 fi
@@ -128,7 +145,8 @@ if [[ -n "${NSYS_EXTRA_ARGS}" ]]; then
   nsys_args+=("${extra_nsys_args[@]}")
 fi
 
-echo "Starting ${MODEL_PATH} with FORK_ATTN under Nsight Systems..."
+echo "Starting ${MODEL_PATH} profile=${PROFILE_NAME} backend=${ATTENTION_BACKEND} " \
+  "cascade=${ENABLE_CASCADE_ATTN} under Nsight Systems..."
 "${NSYS_BIN}" "${nsys_args[@]}" "${VLLM_BIN}" "${vllm_args[@]}" \
   >"${SERVER_LOG}" 2>&1 &
 SERVER_PID=$!
@@ -184,7 +202,7 @@ if [[ -n "${BENCHMARK_EXTRA_ARGS}" ]]; then
   benchmark_args+=("${extra_benchmark_args[@]}")
 fi
 
-echo "Running Agentrix benchmark for FORK_ATTN under Nsight Systems..."
+echo "Running Agentrix benchmark for ${ATTENTION_BACKEND} under Nsight Systems..."
 OPENAI_API_KEY="vllm-local" "${BENCHMARK_PYTHON}" "${benchmark_args[@]}"
 
 stop_server

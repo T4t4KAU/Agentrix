@@ -1,0 +1,10 @@
+metric,lru_mean,lru_stddev,cohort_lru_mean,cohort_lru_stddev,relative_change_percent
+peak_logical_gpu_kv_usage,0.794521,0.000000,0.794521,0.000000,0.00
+hot_eviction_occurrences,107.667,6.506,40.000,0.000,-62.85
+cooling_eviction_occurrences,256.000,0.000,104.000,0.000,-59.38
+unique_hot_blocks_evicted,76.667,4.163,40.000,0.000,-47.83
+unique_cooling_blocks_evicted,256.000,0.000,104.000,0.000,-59.38
+wave2_branch_turns_per_second,38.663,0.113,37.387,0.448,-3.30
+wave2_p95_ttft_ms,64.632,1.011,64.567,1.055,-0.10
+cold_revisit_branch_turns_per_second,101.583,2.660,119.869,7.802,18.00
+cold_revisit_p95_ttft_ms,78.631,2.090,66.764,4.207,-15.09
