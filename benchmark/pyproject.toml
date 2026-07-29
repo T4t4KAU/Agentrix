@@ -9,8 +9,10 @@ description = "Shared-prefix Agent attention benchmark from benchmark.md"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+  "asgiref>=3.12.1",
   "openai>=1.0",
   "PyYAML>=6.0",
+  "sqlparse>=0.5.0",
   "tiktoken>=0.7",
 ]
 
@@ -46,6 +48,12 @@ py-modules = [
   "models",
   "langgraph_runner",
   "langgraph_e2e_report",
+  "longbench_qa",
+  "longbench_qa_report",
+  "longbench_qa_runner",
+  "full_stack_agent",
+  "full_stack_agent_report",
+  "real_agent_report",
   "agent_context_redundancy",
   "coding_agent_e2e_runner",
   "coding_agent_memory",
@@ -53,6 +61,7 @@ py-modules = [
   "coding_agent_demo_tui",
   "coding_agent_demo_web",
   "coding_agent_gpu_telemetry",
+  "coding_quality_report",
   "coding_agent_tools",
   "coding_task_oracle",
   "commit_case_specs",

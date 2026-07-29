@@ -5,13 +5,14 @@ BENCHMARK_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_ROOT="$(cd -- "${BENCHMARK_DIR}/.." && pwd)"
 VLLM_PYTHON="${VLLM_PYTHON:-${REPO_ROOT}/vllm/.venv/bin/python}"
 NCU_BIN="${NCU_BIN:-/usr/local/cuda-13.1/bin/ncu}"
+export PYTHONPATH="${REPO_ROOT}/vllm${PYTHONPATH:+:${PYTHONPATH}}"
 BACKENDS="${BACKENDS:-FLASH_ATTN,FORK_ATTN}"
 PREFIX_TOKENS="${PREFIX_TOKENS:-8192}"
 PRIVATE_SUFFIX_TOKENS="${PRIVATE_SUFFIX_TOKENS:-128}"
 PREFIX_CHUNK_TOKENS="${PREFIX_CHUNK_TOKENS:-0}"
 BRANCHES="${BRANCHES:-16}"
 OUTPUT_DIR="${OUTPUT_DIR:-${BENCHMARK_DIR}/results/ncu_forkattention_operator_8k16}"
-KERNEL_REGEX=".*(flash_fwd|fork_fwd|gather_kernel|merge_attn_states_kernel).*"
+KERNEL_REGEX=".*(flash_fwd|FlashAttnFwd|prepare_varlen_num_blocks_kernel|fork_fwd|gather_kernel|merge_attn_states_kernel).*"
 
 group_names=(dram l2_total l2_hit l2_miss instructions)
 group_metrics=(

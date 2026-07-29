@@ -162,7 +162,12 @@ class RepositoryTools:
         started = time.perf_counter()
         for command in self.task.get("build", []):
             result = subprocess.run(
-                tuple(command["argv"]),
+                tuple(
+                    value.format(
+                        python=sys.executable, workspace=str(self.workspace)
+                    )
+                    for value in command["argv"]
+                ),
                 cwd=self._path(command.get("cwd", ".")),
                 text=True,
                 capture_output=True,
