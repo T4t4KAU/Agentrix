@@ -8,6 +8,29 @@ LMCache integration, and the end-to-end benchmark suite in one repository:
 - `llama.cpp/` is a Git submodule pinned to the CUDA/MUSA ForkAttention implementation.
 - `benchmark/` contains simulation, API, and local vLLM benchmarks.
 
+## Validated Results
+
+Agentrix combines prefix-aware request placement, shared-prefix execution, and
+lifecycle-aware KV management. The main paired results cover task quality,
+physical GPU memory, live KV capacity, reload traffic, and serving latency:
+
+| Evidence | Baseline | Agentrix | Result |
+|---|---:|---:|---:|
+| LongBench exact match, Qwen3-32B on 4x H20 | 5.88% | 5.88% | unchanged |
+| LongBench token F1 | 40.53% | 40.42% | -0.11 percentage points |
+| LongBench peak process HBM | 84,926 MiB | 81,822 MiB | **-3,104 MiB (-3.66%)** |
+| LongBench mean TTFT | 44.01 s | 29.52 s | **1.49x faster** |
+| Coding-Agent DP=8 mean live KV | 432,139 tokens | 261,245 tokens | **-39.17%** |
+| Tool-wait peak live KV | 3.500 GiB | 1.750 GiB | **-50.00%** |
+| Lifecycle-aware CPU-to-GPU reload | 521.5 MiB | 73.5 MiB | **-85.91%** |
+
+The lifecycle scheduler and bounded query join form one closed loop: shared
+roots remain resident across Agent turn boundaries, concurrent reloads are
+coalesced, and ready siblings are regrouped into one physical ForkAttention
+cohort. In the controlled revisit experiment this reduced P95 TTFT from
+272.4 ms to 54.4 ms (**-80.05%**) and increased goodput from 291.6 to
+481.7 tok/s (**+65.20%**).
+
 ## Documentation
 
 - [Agentrix system overview](docs/agentrix_system_overview.md)
