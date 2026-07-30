@@ -15,7 +15,7 @@ from collections import Counter
 from collections.abc import AsyncGenerator, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from agentrix_application.prompt_compactor import (
     ToolResultBackingStore,
@@ -28,21 +28,24 @@ from agentrix_application.tool_kv_trimmer import (
 )
 from agentrix_application.tool_ttl_predictor import ToolTTLContext
 from full_stack_agent import (
-    BM25Index,
     AgentAction,
+    BM25Index,
     Passage,
     build_passages,
     parse_action,
     render_search_results,
 )
 from longbench_qa import load_cases, score_answer
-from vllm import SamplingParams
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadingConnectorStats,
+)
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.protocol import StreamingInput
-from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.metrics.loggers import StatLoggerBase
+
+from vllm import SamplingParams
 
 
 @dataclass(frozen=True)
@@ -56,7 +59,7 @@ class KVSample:
 
 
 class FullStackLogger(StatLoggerBase):
-    instances: list["FullStackLogger"] = []
+    instances: ClassVar[list[FullStackLogger]] = []
 
     def __init__(self, vllm_config: Any, engine_index: int = 0) -> None:
         self.vllm_config = vllm_config
@@ -92,6 +95,8 @@ class FullStackLogger(StatLoggerBase):
         raw = getattr(scheduler_stats, "kv_connector_stats", None)
         if raw is not None and hasattr(raw, "reduce"):
             raw = raw.reduce()
+        elif isinstance(raw, Mapping) and {"types", "data"} <= raw.keys():
+            raw = OffloadingConnectorStats(data=dict(raw)).reduce()
         if isinstance(raw, Mapping):
             for key, value in raw.items():
                 if isinstance(value, (int, float)):
@@ -177,7 +182,7 @@ class StreamingAgentSession:
                     text_parts = []
                     first_token = None
                     cached_tokens = 0
-        except BaseException as error:
+        except BaseException as error:  # noqa: BLE001
             await self.turns.put(error)
 
     async def generate_turn(
@@ -293,10 +298,13 @@ def choose_action(
     last_matches: list[tuple[Passage, float]],
 ) -> tuple[AgentAction, bool]:
     parsed = parse_action(generated)
-    if parsed is not None and parsed.kind == expected:
-        if expected != "read" or parsed.value.upper() in passages_by_id:
-            value = parsed.value.upper() if expected == "read" else parsed.value
-            return AgentAction(expected, value), True
+    if (
+        parsed is not None
+        and parsed.kind == expected
+        and (expected != "read" or parsed.value.upper() in passages_by_id)
+    ):
+        value = parsed.value.upper() if expected == "read" else parsed.value
+        return AgentAction(expected, value), True
     if expected == "search":
         return AgentAction("search", question), False
     passage_id = (

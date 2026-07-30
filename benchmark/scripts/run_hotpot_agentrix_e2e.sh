@@ -36,6 +36,8 @@ FS_READ_THREADS="${FS_READ_THREADS:-4}"
 FS_WRITE_THREADS="${FS_WRITE_THREADS:-4}"
 OFFLOAD_FANOUT_OPTIMIZATION="${OFFLOAD_FANOUT_OPTIMIZATION:-1}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-16384}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"
+FORK_CUDAGRAPH_CAPTURE_BUCKETS="${VLLM_FORK_ATTN_CUDAGRAPH_CAPTURE_BUCKETS:-common:4,8,12;forest:2048}"
 TRACE_PATH="${TRACE_PATH:-}"
 REPLAY_TIMING="${REPLAY_TIMING:-agent}"
 REPLAY_GAP_MS="${REPLAY_GAP_MS:-0}"
@@ -108,7 +110,13 @@ stop_server() {
       if [[ "${mmap_path}" == /dev/shm/vllm_offload_*.mmap ]]; then
         find "${mmap_path}" -maxdepth 0 -type f -delete 2>/dev/null || true
       fi
-    done < <(rg -o '/dev/shm/vllm_offload_[0-9]+\.mmap' "${SERVER_LOG}" | sort -u)
+    done < <(
+      if command -v rg >/dev/null 2>&1; then
+        rg -o '/dev/shm/vllm_offload_[0-9]+\.mmap' "${SERVER_LOG}" || true
+      else
+        grep -Eo '/dev/shm/vllm_offload_[0-9]+\.mmap' "${SERVER_LOG}" || true
+      fi | sort -u
+    )
   fi
   SERVER_LOG=""
 }
@@ -229,6 +237,7 @@ PY
     VLLM_USE_FLASHINFER_SAMPLER=0 \
     VLLM_FORK_ATTN_ENABLE_FOREST=1 \
     VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH=1 \
+    VLLM_FORK_ATTN_CUDAGRAPH_CAPTURE_BUCKETS="${FORK_CUDAGRAPH_CAPTURE_BUCKETS}" \
     "${VLLM_BIN}" serve "${MODEL_PATH}" \
       --served-model-name "${MODEL_NAME}" --host "${HOST}" --port "${PORT}" \
       --dtype bfloat16 --attention-backend "${backend}" \
@@ -239,7 +248,8 @@ PY
       --default-chat-template-kwargs '{"enable_thinking":false}' \
       --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" --max-model-len "${MAX_MODEL_LEN}" \
       "${gpu_kv_cache[@]}" \
-      --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" --max-num-seqs 32 \
+      --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
+      --max-num-seqs "${MAX_NUM_SEQS}" \
       "${connector[@]}" >"${SERVER_LOG}" 2>&1 &
   SERVER_PID=$!
   wait_server

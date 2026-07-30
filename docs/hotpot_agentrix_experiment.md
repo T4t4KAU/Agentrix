@@ -1,44 +1,39 @@
-# HotpotQA LangGraph End-to-End Experiment
+# HotpotQA LangGraph Agentrix End-to-End Experiment
 
 ## Scope
 
-This document records the corrected 2026-07-30 live LangGraph experiment.
-It measures the relationship between Agent activity, ForkAttention execution,
-GPU KV-cache occupancy, and end-to-end performance.
+This document records the corrected live LangGraph experiment for the
+long-prefix ForkAttention workload. It replaces the earlier report based on
+resumable in-process sessions.
 
-This is online inference rather than trajectory replay. `StateGraph` and
-dynamic `Send` construct the workflow at runtime, and every planner,
-tool-selection, reflection, and reducer turn is sent to the local vLLM server
-through its OpenAI-compatible HTTP API. Tool calls execute against the
-HotpotQA candidate paragraphs.
+The measured workflow uses LangGraph `StateGraph` and dynamic `Send`. Every
+planner, branch tool-selection, post-tool reflection, and reducer turn is
+generated online through the OpenAI-compatible vLLM HTTP server. Tool calls
+execute against the HotpotQA candidate paragraphs. No LLM response or request
+timing is replayed.
 
-Each model turn is an independent HTTP request. In particular, reflection
-does not resume an in-process request that retained private KV across the tool
-boundary. This preserves the repeated long-prefix request structure that the
-experiment is intended to evaluate.
-
-## Workflow
-
-Each case follows this live dependency chain:
+Each LLM turn is an independent HTTP request:
 
 ```text
 HotpotQA question and candidate paragraphs
-  -> case-scoped bootstrap retrieval
-  -> online planner request
+  -> case-scoped BM25 bootstrap retrieval
+  -> LangGraph planner
   -> StateGraph Send to 16 branches
-  -> 16 online tool-selection requests
-  -> 16 paragraph_search tool executions
-  -> 16 online evidence-reflection requests
-  -> online reducer request
+  -> 16 independent tool-selection requests
+  -> local paragraph_search tools
+  -> 16 independent reflection requests
+  -> StateGraph reducer
 ```
 
-The run contains 100 distinct HotpotQA cases. Four cases are active
-concurrently, giving up to 64 simultaneous sibling branch requests. In total,
-each arm completes 1,600 branches and records 5,100 Agent lifecycle events.
+This request lifecycle matters. A previous diagnostic used
+`StreamingAgentSession` to retain each request's KV across the tool boundary.
+That path also allowed the Flash baseline to avoid reprefilling the long
+prefix and was not equivalent to the original positive OpenAI-API workflow.
+Its performance numbers are intentionally not retained in this report.
 
-## Dataset and Prefix Distribution
+## Data and Prefix Distribution
 
-The source is the official HotpotQA distractor development split with
+The source is the official HotpotQA distractor development split, with
 SHA-256:
 
 ```text
@@ -47,171 +42,271 @@ SHA-256:
 
 The frozen manifest is
 [`benchmark/configs/hotpot_agentrix_long_prefix_100.jsonl`](../benchmark/configs/hotpot_agentrix_long_prefix_100.jsonl).
-It contains 100 different target questions and deterministic donor
-paragraphs. Measured with the Qwen3 tokenizer, the shared root ranges from
-7,871 to 14,311 tokens, with a mean of 11,236 tokens. The branch count is
-overridden to 16 for this experiment.
+It contains 100 distinct target questions. Each target keeps its official
+candidate paragraphs and adds deterministic donor cases as realistic
+distractors.
 
-Accuracy is deliberately not reported. The experiment studies systems
-performance and KV residency, not a difficult-subset quality score.
+The actual Qwen3 tokenizer measurements for the sibling roots are:
 
-## Compared Modes
+| Item | Value |
+|---|---:|
+| Cases | 100 distinct cases |
+| Shared-root range | 7,871-14,311 tokens |
+| Mean shared root | 11,236 tokens |
+| Branches per case | 16 |
+| Total branches | 1,600 |
+| Recorded Agent lifecycle events | 5,100 per arm |
 
-| Arm | Attention | Exact prompt compaction | Prefix cache | TTL | KV offload | DP |
-|---|---|---|---|---|---|---|
-| Flash baseline | `FLASH_ATTN` | Off | On | Off | Off | Off |
-| Optimized | `FORK_ATTN` | On | On | Off | Off | Off |
+No accuracy result is reported. This experiment studies memory and systems
+performance rather than a difficult semantic subset.
 
-The comparison therefore measures the complete requested optimized mode,
-ForkAttention plus exact prompt compaction, against an uncompressed
-FlashAttention baseline. It is not a pure attention-kernel ablation.
+## Matched Configuration
 
-The tool-selection phase supplies a cleaner ForkAttention signal because it
-occurs before tool results exist and therefore cannot benefit from prompt
-compaction.
-
-## Executed Configuration
+The experiment ran on one NVIDIA RTX PRO 6000 Blackwell Server Edition GPU
+with Qwen3-14B BF16.
 
 | Setting | Value |
 |---|---|
-| GPU | NVIDIA RTX PRO 6000 Blackwell Server Edition, 97,887 MiB |
 | Model | Qwen3-14B, BF16 |
 | Cases / concurrent cases | 100 / 4 |
-| Branches per case / total branches | 16 / 1,600 |
-| Maximum client request concurrency | 64 |
-| Maximum server sequences | 80 |
-| Model context limit | 24,576 tokens |
+| Branches per case | 16 |
+| Maximum concurrent HTTP requests | 64 |
+| Maximum vLLM sequences | 80 |
+| Maximum model length | 24,576 tokens |
 | Maximum batched tokens | 16,384 |
 | GPU memory utilization | 0.9 |
-| GPU KV capacity | 22,770 blocks / 364,320 tokens in both arms |
-| Output limits | planner 128, tool selection 64, reflection 256, reducer 192 |
-| Tool delay | zero |
+| Prefix caching | enabled in both arms |
 | Async scheduling | disabled |
-| Sampling | greedy, model thinking disabled |
-| Fork CUDA Graph capture | `common:4,8,12;forest:2048` |
-| Repetitions | one complete matched pair |
+| Artificial tool delay | zero |
+| TTL / CPU offload / DP | disabled |
+| Repetitions | one complete engine lifetime per arm |
 
-The server is warmed before measurement. Engine startup and CUDA Graph capture
-are excluded from workflow wall time. The GPU KV pool is selected
-automatically from the same 0.9 memory-utilization limit and is identical in
-both arms.
+The requested comparison is a full optimized-mode pair:
 
-## End-to-End Performance and Memory Results
+| Arm | Attention backend | Exact prompt compaction |
+|---|---|---|
+| Baseline | `FLASH_ATTN` | off |
+| Optimized | `FORK_ATTN` | on |
+
+The baseline therefore does not enable compression. Because attention and
+compaction change together, the end-to-end result is not presented as a
+kernel-only ablation.
+
+ForkAttention used Prefix Forest and CUDA Graph execution with
+`common:4,8,12;forest:2048`. The explicit forest plan avoids an unsafe default
+estimate that can select a 64-CTA workspace for a runtime forest requiring
+more CTAs.
+
+## End-to-End Results
 
 Both arms completed all 100 cases, 1,600 branches, and 5,100 lifecycle events.
+Neither server log contains an EngineCore fatal error, CUDA Graph workspace
+mismatch, or HTTP 500 response.
 
-| Metric | Flash baseline, no compaction | ForkAttention + compaction | Change |
+| Metric | Flash baseline, no compaction | Fork + compaction | Change |
 |---|---:|---:|---:|
 | Workflow wall time | 1,395.17 s | 960.27 s | **-31.17% / 1.453x** |
+| Total model tokens | 44,384,141 | 40,386,192 | -9.01% |
 | Prompt tokens | 44,081,743 | 40,117,888 | -8.99% |
 | Completion tokens | 302,398 | 268,304 | -11.27% |
-| Total model tokens | 44,384,141 | 40,386,192 | -9.01% |
 | Total model tokens/s | 31,812.81 | 42,057.34 | **+32.20%** |
 | GPU KV usage-seconds | 377.91 | 131.11 | **-65.31%** |
 | Time-averaged GPU KV usage | 27.09% | 13.65% | **-13.44 pp / -49.60%** |
 | Peak live GPU KV usage | 74.69% | 24.19% | **-50.50 pp / -67.62%** |
-| Peak live KV tokens | 272,108 | 88,116 | **-183,992 / -67.62%** |
 | Peak process GPU memory | 89,371 MiB | 89,693 MiB | +322 MiB |
 | Maximum running / waiting requests | 64 / 31 | 64 / 31 | equal |
 
-The optimized mode removes 15,137,150 repeated tool-result characters. This
-explains the 9.01% reduction in total model tokens and contributes to the
-reflection and reducer gains.
+`nvidia-smi` process memory is nearly unchanged because vLLM preallocates its
+KV pool. The scheduler's live-KV percentage and its time integral describe the
+actual change in KV residency.
 
-The live-KV metrics and process-level GPU-memory metric measure different
-things. ForkAttention reduces the number and lifetime of live KV tokens, but
-its CUDA Graph and kernel workspaces increase the sampled process peak by 322
-MiB. Because vLLM preallocates the equal 364,320-token KV pool in both arms,
-the higher process peak does not mean that ForkAttention retains more KV.
+The optimized run activated ForkAttention on 9,839 of 11,122 measured engine
+steps, or 88.46%, and recorded 326,528 shared plus 687,945 singleton CTA plan
+entries. The result is therefore not a silent fallback to FlashAttention.
 
-`GPU KV usage-seconds` is the time integral of the periodic KV utilization
-series. It captures both how much KV is live and how long it remains live.
-The optimized arm reduces this area by 65.31%, while also completing the
-workflow 31.17% sooner.
+## Stage Attribution
 
-## Stage-Level Performance
+Prompt compaction removed 15,137,150 repeated tool-result characters. This
+explains part of the post-tool improvement and the 9.01% reduction in total
+model tokens.
 
-| LLM stage | Flash mean latency | ForkAttention + compaction | Change | Prompt-token interpretation |
+The branch tool-selection phase provides a cleaner ForkAttention signal. It
+occurs before tool results exist, so prompt compaction cannot shorten this
+phase. Both arms process exactly 18,833,694 prompt tokens; completion-token
+volume differs by only 0.46%.
+
+| LLM stage | Flash mean latency | Fork + compaction | Change | Attribution |
 |---|---:|---:|---:|---|
-| Planner | 11,107.38 ms | 10,798.57 ms | -2.78% | identical prompts |
-| Branch tool selection | 9,938.35 ms | 5,931.82 ms | **-40.31%** | identical prompt tokens |
-| Branch reflection | 17,255.41 ms | 9,202.04 ms | **-46.67%** | ForkAttention plus compaction |
+| Planner | 11,107.38 ms | 10,798.57 ms | -2.78% | no branch cohort |
+| Branch tool selection | 9,938.35 ms | 5,931.82 ms | **-40.31%** | same prompt volume; Fork signal |
+| Branch reflection | 17,255.41 ms | 9,202.04 ms | **-46.67%** | Fork + compaction |
 | Reducer | 6,876.43 ms | 5,837.72 ms | -15.11% | shorter branch outputs |
 
-The branch tool-selection phase processes exactly 18,833,694 prompt tokens in
-each arm. Completion volume differs by only 0.46%, yet mean latency falls by
-40.31%. This same-token phase is the strongest end-to-end evidence that the
-ForkAttention execution path itself accelerates the synchronized 16-branch
-cohort.
+The corrected run therefore contains two distinct effects:
 
-The optimized server reports 9,839 active ForkAttention steps out of 11,122
-observed measured steps, an 88.46% activation rate. It also records 326,528
-shared and 687,945 singleton CTA plan entries. These counters confirm that
-the configured ForkAttention operator executed during the measured workflow.
+- ForkAttention substantially accelerates the same-token sibling cohort
+  before compaction applies.
+- Exact compaction further shortens post-tool reflection and downstream
+  reduction.
+
+The overall 1.453x speedup is the combined optimized-mode result. The
+tool-selection row is the strongest evidence that the gain is not merely a
+consequence of processing fewer tokens.
 
 ## Agent and KV Timeline
 
-![Qwen3-14B 100-case LangGraph Agent and KV timeline](assets/hotpot_langgraph_http_100case_b16_no_ttl_qwen14b_c4.png)
+![Qwen3-14B corrected 100-case independent-HTTP timeline](assets/hotpot_langgraph_http_100case_b16_no_ttl_qwen14b_c4.png)
 
-The upper panels align outstanding planner, branch tool-selection, tool,
-reflection, and reducer operations with wall-clock time. The lower panels show
-GPU KV-cache utilization on the same clock. The Flash baseline reaches a
-74.69% live-KV peak and repeatedly returns to a higher occupancy band. The
-optimized arm remains below 24.19% and finishes 434.90 seconds earlier.
-
-The plotted lifecycle and complete systems/stage summary are stored in
+The upper lanes show outstanding online LangGraph operations on the same clock
+as the lower GPU KV-usage lanes. The complete systems and stage summary is
+available in
 [`experiment_results/hotpot_langgraph_http_100case_b16_no_ttl_qwen14b_c4.csv`](experiment_results/hotpot_langgraph_http_100case_b16_no_ttl_qwen14b_c4.csv).
-Raw run JSON, memory samples, Prometheus snapshots, and server logs remain on
-the experiment server under
-`benchmark/results/hotpot_http_100case_b16_no_ttl_qwen14b_c4/`.
 
-## Interpretation
+Full `run.json` files, server logs, Prometheus snapshots, and memory samples
+remain on the experiment server:
 
-Under the corrected independent-request HTTP workflow, the requested
-optimized mode is 1.453x faster and substantially reduces live KV residency.
-The result is consistent with the intended ForkAttention operating region:
-long case-specific roots followed by synchronized 16-way sibling fanout.
+```text
+/root/autodl-tmp/Agentrix/benchmark/results/
+  hotpot_http_100case_b16_no_ttl_qwen14b_c4/
+```
 
-The full 1.453x result combines two mechanisms and must not be attributed to
-ForkAttention alone. The pre-compaction tool-selection stage isolates the
-shared-prefix effect more closely and shows a 40.31% latency reduction at
-identical prompt-token volume.
+Only the compact CSV and rendered timeline are kept in the documentation tree.
 
-This experiment disables TTL, offload, and DP. It therefore does not make a
-claim about eviction, CPU recovery, or distributed routing.
+## Eight-Case Concurrency Follow-Up
+
+### Purpose and Configuration
+
+The follow-up keeps the same 100 cases, 16 branches per case, Qwen3-14B
+model, independent OpenAI-compatible HTTP requests, zero tool delay, and
+Flash-uncompressed versus Fork-compacted arms. It changes only the concurrency
+limits:
+
+| Setting | Four-case experiment | Eight-case follow-up |
+|---|---:|---:|
+| Concurrent LangGraph cases | 4 | 8 |
+| Maximum concurrent HTTP requests | 64 | 128 |
+| Maximum vLLM sequences | 80 | 144 |
+
+Eight different HotpotQA tasks can therefore be mixed in one server batch.
+Each task contributes a separate 16-sibling cohort with its own case-specific
+root. ForkAttention shares KV reads within a sibling cohort; it does not treat
+the eight unrelated roots as one common prefix.
+
+The Flash arm from the original c8 pair was already complete and valid. The
+first Fork attempt used the default forest CUDA Graph estimate and terminated
+when a runtime forest required 86 CTAs but the selected workspace held only
+64. That incomplete attempt is excluded. The corrected Fork arm used
+`common:4,8,12;forest:2048`, preserving CUDA Graph execution while holding all
+other c8 settings fixed.
+
+### Results
+
+Both corrected arms completed all 100 cases, 1,600 branches, 3,400 online LLM
+requests, and 5,100 lifecycle events. Neither completed arm contains an
+EngineCore fatal error, workspace mismatch, or HTTP 500 response.
+
+| Metric | Flash baseline, no compaction | Fork + compaction | Change |
+|---|---:|---:|---:|
+| Workflow wall time | 1,344.81 s | 867.93 s | **-35.46% / 1.549x** |
+| Total model tokens | 44,435,458 | 40,386,170 | -9.11% |
+| Prompt tokens | 44,132,611 | 40,117,608 | -9.10% |
+| Completion tokens | 302,847 | 268,562 | -11.32% |
+| Total model tokens/s | 33,042.11 | 46,531.79 | **+40.83%** |
+| GPU KV usage-seconds | 730.18 | 242.61 | **-66.77%** |
+| Time-averaged GPU KV usage | 54.30% | 27.95% | **-26.34 pp / -48.52%** |
+| Peak live GPU KV usage | 100.00% | 46.98% | **-53.02 pp / -53.02%** |
+| Peak process GPU memory | 89,735 MiB | 90,129 MiB | +394 MiB |
+| Maximum running requests | 128 | 128 | equal |
+| Maximum waiting requests | 79 | 84 | +5 |
+
+Prompt compaction removed 15,148,979 repeated tool-result characters. The
+optimized arm activated ForkAttention on 4,509 of 5,638 measured engine steps
+(80.0%) and recorded 285,706 shared plus 504,098 singleton CTA plan entries.
+
+The same-token tool-selection phase again separates the shared-prefix signal
+from compaction. Flash and Fork process 18,833,558 and 18,833,694 prompt
+tokens respectively, a difference of only 136 tokens or 0.0007%. Completion
+volume differs by 0.53%, while mean latency falls by 35.84%.
+
+| LLM stage | Flash mean latency | Fork + compaction | Change | Attribution |
+|---|---:|---:|---:|---|
+| Planner | 25,496.23 ms | 19,433.71 ms | -23.78% | queueing; roots are unrelated |
+| Branch tool selection | 16,648.69 ms | 10,682.07 ms | **-35.84%** | same token volume; Fork signal |
+| Branch reflection | 32,648.03 ms | 17,314.72 ms | **-46.97%** | Fork + compaction |
+| Reducer | 11,104.71 ms | 9,173.66 ms | -17.39% | shorter branch outputs |
+
+Compared with the four-case pair, the Flash baseline rises from a 74.69% KV
+peak to 100%, while the optimized arm rises from 24.19% to 46.98%. The
+end-to-end speedup changes from 1.453x to 1.549x. This is consistent with
+greater opportunity at wider concurrency, but each point is a single matched
+pair, so the difference between the two speedups is not a confidence-bounded
+scaling claim.
+
+### Agent and KV Timeline
+
+![Qwen3-14B eight-case concurrency Agent and KV timeline](assets/hotpot_langgraph_http_100case_b16_no_ttl_qwen14b_c8_corrected.png)
+
+The complete two-row systems and stage summary is
+[`experiment_results/hotpot_langgraph_http_100case_b16_no_ttl_qwen14b_c8_corrected.csv`](experiment_results/hotpot_langgraph_http_100case_b16_no_ttl_qwen14b_c8_corrected.csv).
+The large raw JSON files, server logs, Prometheus data, and memory samples
+remain only on the experiment server:
+
+```text
+/root/autodl-tmp/Agentrix/benchmark/results/
+  hotpot_http_100case_b16_no_ttl_qwen14b_c8_corrected/
+```
+
+To reproduce this follow-up, use the two commands in the reproduction section
+with `CASE_CONCURRENCY=8`, `CONCURRENCY=128`, `MAX_NUM_SEQS=144`, and a
+separate c8 output root. The Fork arm must retain the explicit
+`forest:2048` capture plan.
+
+## Limits
+
+- This is one matched pair, not a repeated-run confidence interval.
+- The comparison intentionally changes both ForkAttention and prompt
+  compaction, so 1.453x is not a pure kernel speedup.
+- TTL, offload, and DP are disabled. This run does not measure KV recovery or
+  CPU-to-GPU transfer overhead.
+- No task-accuracy claim is made.
+- Case concurrency is four. Higher independent-request concurrency needs a
+  sufficiently large forest CUDA Graph plan.
 
 ## Reproduction
 
-Run the baseline first:
+Run the Flash baseline without compaction:
 
 ```bash
-export VLLM_FORK_ATTN_CUDAGRAPH_CAPTURE_BUCKETS='common:4,8,12;forest:2048'
-
 MODEL_PATH=/root/autodl-tmp/models/Qwen3-14B \
 HOTPOT_PATH=/root/autodl-tmp/data/HotpotQA/hotpot_dev_distractor_v1.json \
 HOTPOT_CASE_FILE="$PWD/benchmark/configs/hotpot_agentrix_long_prefix_100.jsonl" \
-VLLM_BIN="$PWD/vllm/.venv/bin/vllm" \
 OUTPUT_ROOT="$PWD/benchmark/results/hotpot_http_100case_b16_no_ttl_qwen14b_c4" \
-VARIANTS=baseline \
-PROMPT_COMPACTION=0 \
+VARIANTS=baseline PROMPT_COMPACTION=0 \
 CASES=100 CASE_CONCURRENCY=4 HOTPOT_BRANCHES=16 CONCURRENCY=64 \
+MAX_NUM_SEQS=80 MAX_MODEL_LEN=24576 MAX_NUM_BATCHED_TOKENS=16384 \
 GPU_MEMORY_UTILIZATION=0.9 \
-MAX_MODEL_LEN=24576 MAX_NUM_BATCHED_TOKENS=16384 MAX_NUM_SEQS=80 \
 bash benchmark/scripts/run_hotpot_agentrix_e2e.sh
 ```
 
-Then run the optimized arm into the same result root:
+Run the optimized arm with the same workload:
 
 ```bash
 MODEL_PATH=/root/autodl-tmp/models/Qwen3-14B \
 HOTPOT_PATH=/root/autodl-tmp/data/HotpotQA/hotpot_dev_distractor_v1.json \
 HOTPOT_CASE_FILE="$PWD/benchmark/configs/hotpot_agentrix_long_prefix_100.jsonl" \
-VLLM_BIN="$PWD/vllm/.venv/bin/vllm" \
 OUTPUT_ROOT="$PWD/benchmark/results/hotpot_http_100case_b16_no_ttl_qwen14b_c4" \
-VARIANTS=forkattention \
-PROMPT_COMPACTION=1 \
+VARIANTS=forkattention PROMPT_COMPACTION=1 \
 CASES=100 CASE_CONCURRENCY=4 HOTPOT_BRANCHES=16 CONCURRENCY=64 \
+MAX_NUM_SEQS=80 MAX_MODEL_LEN=24576 MAX_NUM_BATCHED_TOKENS=16384 \
 GPU_MEMORY_UTILIZATION=0.9 \
-MAX_MODEL_LEN=24576 MAX_NUM_BATCHED_TOKENS=16384 MAX_NUM_SEQS=80 \
+VLLM_FORK_ATTN_CUDAGRAPH_CAPTURE_BUCKETS='common:4,8,12;forest:2048' \
 bash benchmark/scripts/run_hotpot_agentrix_e2e.sh
+```
+
+Generate the compact summary and timeline from the remote raw result:
+
+```bash
+benchmark/.venv/bin/python benchmark/scripts/plot_hotpot_http_pair.py \
+  --root \
+  benchmark/results/hotpot_http_100case_b16_no_ttl_qwen14b_c4
 ```
