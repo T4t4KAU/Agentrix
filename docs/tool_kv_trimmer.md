@@ -594,6 +594,208 @@ vllm/.venv/bin/python -m ruff check \
 
 The current result is 27 passing application tests and a clean Ruff check.
 
+## Live LangGraph Agent TTL Timeline Experiment
+
+### Question
+
+The preceding Qwen3-0.6B experiment controls token allocation precisely, but it
+does not show how KV lifetime aligns with an Agent's decisions and real tool
+activity. This experiment asks:
+
+1. can one resumable vLLM request remain live across a real LangGraph tool
+   node;
+2. does KV remain resident during the tool wait when trimming is disabled;
+3. do fixed and predicted TTLs release that KV at the expected point in the
+   Agent timeline; and
+4. does the Agent resume with the same deterministic result?
+
+This is not a trajectory replay. Qwen3-14B chooses `SEARCH`, `READ`, or
+`FINAL`; the search and file-read tools execute against files in an isolated
+workspace. LangGraph controls the state transition, while vLLM streaming input
+keeps the same request ID resumable across the tool node.
+
+### Hardware, Software, and Workload
+
+The run was executed on 2026-07-29 with:
+
+| Item | Value |
+|---|---:|
+| GPU | NVIDIA RTX PRO 6000 Blackwell Server Edition, 97,887 MiB |
+| Driver | 580.82.09 |
+| Model | Qwen3-14B, BF16 |
+| Agentrix base commit | `4856244aa5fb0abd70154055cfd54cc4bfb9d8dd` |
+| vLLM commit | `3588b8ba36674738340f9a420ad9964568db8a5c` |
+| Attention backend | FlashAttention 2 |
+| Maximum model length | 8,192 tokens |
+| GPU KV capacity | 2,048 blocks / 32,768 tokens |
+| Tool wait | 2,000 ms per call |
+| Fixed fallback TTL | 500 ms |
+| Predicted minimum TTL | 100 ms |
+| KV sampling interval | 50 ms |
+| Repetitions | 3 per mode, fresh engine per repetition |
+
+The constructed `S2` incident task contains three real workspace files: an
+incident report, zone-specific cache metrics, and a change log. The Agent must
+identify the cause of checkout HTTP 503 errors and name the remediation. In
+all nine measured runs it independently followed the same valid workflow:
+
+```text
+Agent reasoning
+  -> SEARCH: checkout 503 incident root cause analysis
+  -> real BM25 search, 2,000 ms tool node
+  -> READ: CACHE_METRICS.TXT
+  -> real file read, 2,000 ms tool node
+  -> FINAL: west-b catalog-cache connection limit and rollback
+```
+
+The fixture and random seed are fixed, but tool choices and arguments are
+model outputs. Invalid output would be recorded and routed through the
+benchmark's safe fallback; no measured action used that fallback.
+
+Three modes use identical task, model, seed, KV capacity, and tool delays:
+
+- **baseline:** tool KV trimming disabled;
+- **fixed:** active trim after the 500 ms fallback TTL;
+- **predicted:** `OnlineHorizonTTLPredictor` actively selects the TTL.
+
+### Predictor Calibration
+
+The active predictor is loaded from a serialized state rather than assigning
+100 ms in the runner. The state was calibrated from the six completed
+search/read durations in the three fixed-TTL runs. It used
+`min_training_samples=6`, then predicted both measured long-tool calls to
+survive the 2,000 ms interval:
+
+```text
+P(duration > [100, 250, 500, 1000, 2000, 5000] ms)
+  = [0.875, 0.875, 0.875, 0.875, 0.875, 0.125]
+selected TTL = 100 ms, used_fallback = false
+```
+
+This small real-trace warm start verifies serialization, inference, active TTL
+selection, observation, and trimming end to end. Six samples are not an
+independent predictor-accuracy result and do not establish generalization to
+other tool families.
+
+### Metrics
+
+The primary timeline metric is scheduler KV usage sampled every 50 ms. During
+a tool wait, the sampler carries the latest scheduler state forward; a trim
+transaction produces an immediate updated scheduler value. This avoids
+linearly interpolating across a quiet tool interval, where vLLM otherwise
+emits no periodic scheduler record.
+
+`tool-window KV usage-seconds` is the trapezoidal integral of the KV usage
+fraction over the two tool windows. It measures how much of the fixed KV pool
+is occupied and for how long. `resume TTFT` is the mean TTFT of model turns
+after a tool result. The peak includes generation as well as tool activity.
+
+### Results
+
+The values below are mean ± sample standard deviation over three independent
+engine lifetimes:
+
+| Mode | Tool-window KV usage-seconds | Reduction vs. baseline | Peak KV usage | Released block references | Resume TTFT |
+|---|---:|---:|---:|---:|---:|
+| Baseline | 0.036167 ± 0.000006 | — | 2.003% ± 0.000% | 0 | 57.56 ± 0.57 ms |
+| Fixed TTL, 500 ms | 0.008929 ± 0.000157 | **75.31%** | 2.003% ± 0.000% | 37 per run | 57.83 ± 0.69 ms |
+| Predicted TTL, 100 ms | 0.001813 ± 0.000262 | **94.99%** | 2.003% ± 0.000% | 37 per run | 56.99 ± 0.88 ms |
+
+All 12 trim attempts across the six trimming runs succeeded: two tool calls
+per run, three fixed repetitions, and three predicted repetitions. There were
+no pressure skips, trim rejections, predictor fallbacks, or policy errors.
+Both trim points reduced the request's reported KV usage to zero. The first
+and second calls released 8 and 29 block references respectively in every
+trimming run.
+
+The final Agent response was byte-identical across all nine runs and identified
+the same connection-limit cause and rollback remediation. The benchmark output
+token budget truncated the tail of the response, so this run checks lifecycle
+equivalence rather than full task-answer scoring.
+
+The equal peak is expected. In this single-Agent workload the highest
+allocation occurs while the model is generating, when tool-wait trimming
+cannot apply. The TTL policies reduce long-lived occupancy and KV-time area,
+not the active generation peak. Peak reduction requires multiple Agent
+sessions whose generation and tool waits overlap.
+
+![Live LangGraph Agent KV lifetime timeline](assets/langgraph_tool_kv_timeline.png)
+
+The shaded regions are real LangGraph tool-node intervals. Red dashed lines
+are successful trim transactions. Baseline retains the current request KV for
+each complete 2-second wait; fixed TTL releases it after approximately 500 ms;
+predicted mode releases it after approximately 100 ms.
+
+Per-repetition data is available in
+[`experiment_results/langgraph_tool_kv_ttl.csv`](experiment_results/langgraph_tool_kv_ttl.csv).
+
+### Limits and Next Experiment
+
+- This is one deterministic incident-investigation case with one Agent, two
+  tool calls, and three repeats per mode.
+- The predictor warm start contains only six examples from the same tool
+  duration regime. A mixed short/read/network/test/build workload is required
+  to evaluate 100/250/500 ms choices and premature-trim cost.
+- A 2.003% peak does not create meaningful capacity pressure on the 96 GiB
+  GPU. Concurrent long-context Agents are required to measure peak admission
+  and throughput effects.
+- The pressure threshold is deliberately zero to exercise policy timing. A
+  production experiment must restore a capacity-driven threshold.
+- The approximately 1 ms TTFT spread is smaller than the three-repeat
+  variability. These data support no latency-improvement claim.
+
+### Reproduction
+
+Run the baseline and fixed arms three times, then calibrate from the six real
+tool observations:
+
+```bash
+export PYTHONPATH="$PWD/benchmark/src:$PWD/application/src:$PWD/vllm"
+
+vllm/.venv/bin/python \
+  benchmark/scripts/calibrate_langgraph_tool_ttl_predictor.py \
+  --input \
+    benchmark/results/langgraph_tool_lifecycle/periodic/s2_ttl_r1.json \
+    benchmark/results/langgraph_tool_lifecycle/periodic/s2_ttl_r2.json \
+    benchmark/results/langgraph_tool_lifecycle/periodic/s2_ttl_r3.json \
+  --output \
+    benchmark/results/langgraph_tool_lifecycle/periodic/predictor_real6.json \
+  --min-training-samples 6
+```
+
+Run one active predicted-TTL repetition with:
+
+```bash
+vllm/.venv/bin/python \
+  benchmark/scripts/benchmark_langgraph_tool_lifecycle.py \
+  --model /root/autodl-tmp/models/Qwen3-14B \
+  --output \
+    benchmark/results/langgraph_tool_lifecycle/periodic/s2_predicted_r1.json \
+  --workspace /root/autodl-tmp/agentrix_cases/s2_predicted_r1 \
+  --mode predicted \
+  --predictor-state \
+    benchmark/results/langgraph_tool_lifecycle/periodic/predictor_real6.json \
+  --tool-delay-ms 2000 \
+  --ttl-ms 500 \
+  --max-rounds 4 \
+  --action-tokens 48 \
+  --num-gpu-blocks 2048
+```
+
+Generate the three-arm timeline with:
+
+```bash
+vllm/.venv/bin/python \
+  benchmark/scripts/plot_langgraph_tool_lifecycle.py \
+  --baseline \
+    benchmark/results/langgraph_tool_lifecycle/periodic/s2_baseline_r1.json \
+  --ttl \
+    benchmark/results/langgraph_tool_lifecycle/periodic/s2_ttl_r1.json \
+  --predicted \
+    benchmark/results/langgraph_tool_lifecycle/periodic/s2_predicted_r1.json \
+  --output docs/assets/langgraph_tool_kv_timeline.png
+```
+
 ## Branch-aware HOT/COOLING/COLD Offload Experiment
 
 ### Question
