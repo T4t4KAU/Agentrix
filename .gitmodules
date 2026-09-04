@@ -5,7 +5,7 @@
 [submodule "LMCache"]
 	path = LMCache
 	url = https://github.com/T4t4KAU/LMCache.git
-	branch = fork-attn
+	branch = dev
 [submodule "llama.cpp"]
 	path = llama.cpp
 	url = https://github.com/T4t4KAU/llama.cpp.git
