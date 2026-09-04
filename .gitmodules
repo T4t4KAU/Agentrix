@@ -1,7 +1,7 @@
 [submodule "vllm"]
 	path = vllm
 	url = https://github.com/T4t4KAU/vllm.git
-	branch = fork-attn
+	branch = agentrix
 [submodule "LMCache"]
 	path = LMCache
 	url = https://github.com/T4t4KAU/LMCache.git
