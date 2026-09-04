@@ -14,3 +14,7 @@
 	path = sglang
 	url = https://github.com/oyyyyy61/sglang.git
 	branch = fork-attn
+[submodule "Mooncake"]
+	path = Mooncake
+	url = https://github.com/T4t4KAU/Mooncake.git
+	branch = main
