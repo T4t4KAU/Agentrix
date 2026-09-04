@@ -321,8 +321,17 @@ def router_stats(engine: AsyncLLM) -> dict[str, Any]:
         return {"active": False}
     fields = (
         "route_count",
+        "routing_policy",
         "prefix_route_count",
         "affinity_route_count",
+        "first_turn_balance_count",
+        "followup_affinity_count",
+        "followup_rebalance_count",
+        "session_overload_rebalance_count",
+        "session_cache_miss_rebalance_count",
+        "session_id_route_count",
+        "session_prefix_fallback_count",
+        "unknown_turn_route_count",
         "graph_bound_route_count",
         "arrival_wave_count",
         "ordinary_bypass_route_count",
@@ -342,6 +351,7 @@ def router_stats(engine: AsyncLLM) -> dict[str, Any]:
     counts = getattr(router, "rank_route_counts", None)
     if counts is not None:
         result["rank_route_counts"] = list(counts)
+    result["average_route_us"] = getattr(router, "average_route_us", None)
     return result
 
 
