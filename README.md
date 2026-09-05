@@ -18,14 +18,21 @@ preemptions versus zero. This is one run per arm; feature attribution remains op
 CPU/Mooncake full-path validation is paused after two KV-restore failures.
 Historical synthetic shared-prefix gains are not current production guarantees.
 Protocol, provenance, caveats and raw-data locations are maintained in the
-[TraceLab report](docs/tracelab_timeline_replay.md).
+[TraceLab report](docs/coding_agent/tracelab_timeline_replay.md).
+
+A separate [controlled Agent workload study](docs/coding_agent/agent_scenario_exploration.md)
+found gains from FlashAttention with prefix-aware DP: three cold-cache trials
+on long-context coding conversations reduced multi-turn makespan by 26–47%.
+Same-source routing ablations and a GPU swap retained the benefit. Parallel
+branches also benefited, with placement variability; single-GPU ForkAttention
+screening did not establish a stable end-to-end gain.
 
 ## Documentation
 
 Start with the [documentation index](docs/README.md).
 Core references: [server environment](docs/autodl_build_and_benchmark.md),
 [DP routing](docs/dp_routing.md), [KV memory](docs/kv_memory_optimization_status.md),
-[profiling](docs/forkattention_operator_profile.md).
+[profiling](docs/fork_attention/forkattention_operator_profile.md).
 Superseded reports are summarized in the [historical index](docs/historical_experiments.md).
 
 The generic build and experimental recipes below include older runtime paths.
@@ -372,7 +379,7 @@ prefix in the same decode step. On the evaluated GPU, use it primarily for
 active siblings; 8-16 aligned branches have the strongest evidence. Single
 continuations, prefill, short prefixes, or unrelated round-robin cases should
 remain on FlashAttention. The exact boundary and KV-work model are documented
-in [the operator profile](docs/forkattention_operator_profile.md#applicability-boundary).
+in [the operator profile](docs/fork_attention/forkattention_operator_profile.md#applicability-boundary).
 
 Long-prefix tail batches use shape-aware adaptive splitting by default. The
 planner targets about two CTA waves only when the shared prefix is at least 4K
@@ -433,7 +440,7 @@ MODE=tp_accuracy MODEL_SPECS='qwen3-14b|/path/to/Qwen3-14B' \
 The historical DP matrices used separate warm-cache and capacity-pressure
 workloads; their provenance is in the [historical index](docs/historical_experiments.md#dp).
 For the current implementation and matched serving comparison, use the
-[DP guide](docs/dp_routing.md) and [TraceLab protocol](docs/tracelab_timeline_replay.md).
+[DP guide](docs/dp_routing.md) and [TraceLab protocol](docs/coding_agent/tracelab_timeline_replay.md).
 
 Override `PREFIX_LENGTHS`, `BRANCH_COUNTS`, `DATASETS`, `CASE_COUNT`,
 `MAX_DATASET_RECORDS`, `GPU_IDS`, `DP_REPLICAS`, `TP_SIZE`, and

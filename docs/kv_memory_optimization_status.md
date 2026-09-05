@@ -5,7 +5,7 @@
 截至 2026-09-05，六阶段优化已有 opt-in 实现，不等于全部路径已达到生产可用标准。
 当前只记录 GPU-only 数据：
 
-- [TraceLab 时间线对照](tracelab_timeline_replay.md)：Agentrix 259.79 s，
+- [TraceLab 时间线对照](coding_agent/tracelab_timeline_replay.md)：Agentrix 259.79 s，
   原始 vLLM 218.23 s，慢 19.05%；抢占 34 次对 0 次，原因待消融。
 - CPU/Mooncake 完整路径连续两次在恢复时出现失效 `MemoryObj` 和 GPU connector
   assertion；没有有效完成汇总。按用户要求暂停，不能断言是虚拟环境导致。

@@ -52,10 +52,10 @@ controlled before/after optimization series.
 
 Artifacts (Git-ignored, retained locally and on the server):
 
-- [Upstream result](../benchmark/results/tracelab_timeline_compare/upstream_4x_2/replay/result.json),
-  [configuration](../benchmark/results/tracelab_timeline_compare/upstream_4x_2/configuration.json).
-- [Agentrix result](../benchmark/results/tracelab_timeline_compare/agentrix_gpu_4x_1/replay/result.json),
-  [configuration](../benchmark/results/tracelab_timeline_compare/agentrix_gpu_4x_1/configuration.json).
+- [Upstream result](../../benchmark/results/tracelab_timeline_compare/upstream_4x_2/replay/result.json),
+  [configuration](../../benchmark/results/tracelab_timeline_compare/upstream_4x_2/configuration.json).
+- [Agentrix result](../../benchmark/results/tracelab_timeline_compare/agentrix_gpu_4x_1/replay/result.json),
+  [configuration](../../benchmark/results/tracelab_timeline_compare/agentrix_gpu_4x_1/configuration.json).
 - Both directories retain `replay/requests.jsonl`, `replay/metrics_samples.jsonl`,
   before/after Prometheus counters, engine logs and GPU samples. The 213 upstream
   and 253 Agentrix metric samples reported no scraping errors.
@@ -274,4 +274,4 @@ replica, 64 MiB scratch, 128 MiB pending remote ownership and a 4,096-token
 external-load limit. Their logs remain locally and on the server.
 Investigation is paused at the user's request. Virtualization has not been
 established as the cause. Earlier small restore smokes do not invalidate these
-failures; see [current KV status](kv_memory_optimization_status.md).
+failures; see [current KV status](../kv_memory_optimization_status.md).

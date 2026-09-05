@@ -55,7 +55,13 @@ cache group。LoRA、salt、多模态身份、embedding、hybrid group 和其他
 
 ## 实验结论
 
-当前完整系统结论见 [TraceLab](tracelab_timeline_replay.md)：92 会话、132 请求的
+2026-09-05 的[受控 Agent 场景探索](coding_agent/agent_scenario_exploration.md)验证了
+`FLASH_ATTN + prefix_aware` 在长上下文多轮与多根分支上的收益。三个源码数据集
+三次冷缓存复测中，多轮耗时降低 26–47%；同源码消融与换卡复测保持收益方向。
+分支场景仍有抢占和路由波动，12K 宽松容量对照近乎持平。该结论限定于报告的
+闭环负载、模型及容量，TraceLab 开环结果继续单独保留。
+
+当前完整系统结论见 [TraceLab](coding_agent/tracelab_timeline_replay.md)：92 会话、132 请求的
 4x 时间线回放中，组合配置慢 19.05%，不能用旧的强亲和 microbenchmark 宣称普遍提速。
 
 较早的 matched GPU-event 对照为 Qwen3-VL-8B、2 x RTX 5090、384 blocks/replica、

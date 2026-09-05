@@ -2,7 +2,7 @@
 
 This overview includes historical application/backend paths, not a claim that
 all combinations pass on the current deployment. Current evidence and limitations
-are maintained in [TraceLab](tracelab_timeline_replay.md),
+are maintained in [TraceLab](coding_agent/tracelab_timeline_replay.md),
 [KV memory](kv_memory_optimization_status.md) and [DP routing](dp_routing.md).
 
 ## Purpose

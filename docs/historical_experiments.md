@@ -2,7 +2,7 @@
 
 本页替代旧的逐轮报告。历史实验并非全部无效，但其硬件、分支、工作负载和
 baseline 不同，不能作为当前 Agentrix 的总体性能结论。当前结果见
-[TraceLab](tracelab_timeline_replay.md)。
+[TraceLab](coding_agent/tracelab_timeline_replay.md)。
 
 ## 原文与数据
 
@@ -14,8 +14,8 @@ baseline 不同，不能作为当前 Agentrix 的总体性能结论。当前结�
   按下表原文件名读取，例如
   `git show 61ef01a:docs/dp_experiment_results.md`。不需要 reset 工作区。
 - 小型 CSV、插图和 H20 EPD 绘图输入继续保留在
-  [experiment_results](experiment_results/)、[assets](assets/)、
-  [experiments](experiments/)，仅用于历史追溯。
+  [experiment_results](experiment_results)、[assets](assets)、
+  [experiments](experiments)，仅用于历史追溯。
 - 服务器较早的 residency/proactive/placement smoke 与 microprofile 已集中至
   `/root/autodl-tmp/agentrix-archive/cleanup-20260905/legacy-results.tar.gz`；
   55 个条目在归档内保留原目录名。散落的 Mooncake 日志、旧脚本和未提交源码包
@@ -33,7 +33,7 @@ baseline 不同，不能作为当前 Agentrix 的总体性能结论。当前结�
 | `session_aware_dp_profile.md` | 12 会话、单 token、prefix-aware 对 session-aware；不是原始 vLLM 对照 |
 | `dp_kv_placement.md` | GPU 事件提示未建立显著加速，router-only P50 35.30→72.54 us；当前机制见 [DP 路由](dp_routing.md) |
 | `dp_experiment_results.md` | Adaptive/Pressure、H20 DP=4/6/8、32K/64K/96K 等旧矩阵；容量、模型、人工分支均需随原文解释 |
-| `coding_agent_dp8_experiment_results.md` | Coding-agent 系统回放，不等于真实源码任务成功率；质量验证另见 [任务 A/B](coding_agent_quality_ab.md) |
+| `coding_agent_dp8_experiment_results.md` | Coding-agent 系统回放，不等于真实源码任务成功率；质量验证另见 [任务 A/B](coding_agent/coding_agent_quality_ab.md) |
 
 ## memory
 
@@ -58,7 +58,7 @@ baseline 不同，不能作为当前 Agentrix 的总体性能结论。当前结�
 `run_main_experiment.sh`、`run_vllm_dp_full_dataset.sh`、
 `run_hotpot_agentrix_e2e.sh`。它们可能默认开启较旧功能，应先阅读脚本，
 不要作为当前服务器默认配置。当前 profiling 方法见
-[ForkAttention 指南](forkattention_operator_profile.md)。
+[ForkAttention 指南](fork_attention/forkattention_operator_profile.md)。
 
 ## multimodal
 
@@ -71,6 +71,6 @@ baseline 不同，不能作为当前 Agentrix 的总体性能结论。当前结�
 ## TraceLab 旧协议
 
 `tracelab_upstream_comparison.md` 已合并到
-[TraceLab 的历史闭环与失败记录](tracelab_timeline_replay.md#legacy-and-failures)。
+[TraceLab 的历史闭环与失败记录](coding_agent/tracelab_timeline_replay.md#legacy-and-failures)。
 16-session 闭环的 8.53% 改善与 92-session open-loop 的 19.05% 退化是不同实验；
 两组原始数据均保留，不能相互替代。

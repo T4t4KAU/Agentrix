@@ -18,7 +18,7 @@
 | `/root/autodl-tmp/uv-cache` | 可再下载的安装缓存，不是运行环境 |
 
 服务器有 4 张 RTX 5090（每张约 32 GiB）。当前 matched DP=2 使用 GPUs 0/1，
-不是固定占用全部 GPU。父仓库及子模块版本见 [TraceLab 来源](tracelab_timeline_replay.md#provenance)；
+不是固定占用全部 GPU。父仓库及子模块版本见 [TraceLab 来源](coding_agent/tracelab_timeline_replay.md#provenance)；
 不要依赖生成后未更新的 vLLM version 字符串。
 
 ## 环境
@@ -79,7 +79,7 @@ LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6 \
 ```
 
 当前协议、模型、容量、baseline 和完整运行命令统一见
-[TraceLab 对照](tracelab_timeline_replay.md)。每次使用新的输出目录，结束后确认
+[TraceLab 对照](coding_agent/tracelab_timeline_replay.md)。每次使用新的输出目录，结束后确认
 进程和 GPU 已释放。CPU/Mooncake 恢复仍暂停，不要为环境 smoke 自动开启完整 offload。
 
 ## 清理与归档规则

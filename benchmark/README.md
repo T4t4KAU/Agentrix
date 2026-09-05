@@ -126,7 +126,7 @@ the validated Qwen3.6/H20 build. At that deliberately tight boundary, the
 validated optimized run still recorded 27 preemptions because Qwen3.6 uses
 coarse 784-token hybrid cache pages. The result directory contains per-variant
 CSV/JSON summaries, server logs, Prometheus metrics, and `comparison.md`. See
-`docs/qwen35_qwen36_forkattention_design.md` for the validated result and its
+`docs/fork_attention/qwen35_qwen36_forkattention_design.md` for the validated result and its
 limitations.
 
 ## SGLang Local Benchmark
