@@ -19,6 +19,54 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.core.kv_residency import KVResidencyIndex
 
 
+class CallbackCountingObserver:
+    """Count timed lifecycle callbacks in a separate untimed trial."""
+
+    def __init__(self, delegate: KVResidencyIndex) -> None:
+        self.delegate = delegate
+        self.count = 0
+
+    def on_allocated(self, block_id: int, ref_count: int) -> int:
+        self.count += 1
+        return self.delegate.on_allocated(block_id, ref_count)
+
+    def on_cache_inserted(self, block_id: int) -> None:
+        self.count += 1
+        self.delegate.on_cache_inserted(block_id)
+
+    def on_cache_hit(self, block_id: int, ref_count: int) -> None:
+        self.count += 1
+        self.delegate.on_cache_hit(block_id, ref_count)
+
+    def on_pinned(self, block_id: int, ref_count: int) -> None:
+        self.count += 1
+        self.delegate.on_pinned(block_id, ref_count)
+
+    def on_released(self, block_id: int, ref_count: int) -> None:
+        self.count += 1
+        self.delegate.on_released(block_id, ref_count)
+
+    def on_unpinned(self, block_id: int, ref_count: int) -> None:
+        self.count += 1
+        self.delegate.on_unpinned(block_id, ref_count)
+
+    def on_cache_removed(
+        self,
+        block_id: int,
+        num_hashes: int,
+        *,
+        evicted: bool = False,
+    ) -> None:
+        self.count += 1
+        self.delegate.on_cache_removed(block_id, num_hashes, evicted=evicted)
+
+    def on_step(self) -> None:
+        self.delegate.on_step()
+
+    def reset(self) -> None:
+        self.delegate.reset()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--blocks", type=int, default=8192)
@@ -35,7 +83,8 @@ def run_trial(
     num_blocks: int,
     batch_size: int,
     rounds: int,
-) -> tuple[int, dict[str, int] | None]:
+    count_callbacks: bool = False,
+) -> tuple[int, dict[str, int] | None, int]:
     pool = BlockPool(
         num_gpu_blocks=num_blocks + 1,
         enable_caching=True,
@@ -47,7 +96,8 @@ def run_trial(
             pool.num_gpu_blocks,
             null_block_id=pool.null_block.block_id,
         )
-        pool.set_observer(index)
+        observer = CallbackCountingObserver(index) if count_callbacks else index
+        pool.set_observer(observer)
 
     block_hashes = [
         make_block_hash_with_group_id(
@@ -76,16 +126,21 @@ def run_trial(
     elapsed_ns = time.perf_counter_ns() - started_ns
 
     if index is None:
-        return elapsed_ns, None
+        return elapsed_ns, None, 0
     index.check_consistency()
     stats = index.snapshot()
-    return elapsed_ns, {
-        "allocations": stats.allocations,
-        "cache_hits": stats.cache_hits,
-        "cache_insertions": stats.cache_insertions,
-        "cache_removals": stats.cache_removals,
-        "shared_blocks": stats.shared_blocks,
-    }
+    callback_count = observer.count if count_callbacks else 0
+    return (
+        elapsed_ns,
+        {
+            "allocations": stats.allocations,
+            "cache_hits": stats.cache_hits,
+            "cache_insertions": stats.cache_insertions,
+            "cache_removals": stats.cache_removals,
+            "shared_blocks": stats.shared_blocks,
+        },
+        callback_count,
+    )
 
 
 def main() -> None:
@@ -118,7 +173,7 @@ def main() -> None:
     for repeat in range(args.repeats):
         modes = (False, True) if repeat % 2 == 0 else (True, False)
         for enable_shadow in modes:
-            elapsed_ns, stats = run_trial(
+            elapsed_ns, stats, _ = run_trial(
                 enable_shadow=enable_shadow,
                 num_blocks=args.blocks,
                 batch_size=args.batch_size,
@@ -129,6 +184,15 @@ def main() -> None:
                 shadow_stats = stats
             else:
                 baseline_samples.append(elapsed_ns)
+    _, counted_stats, observer_callbacks = run_trial(
+        enable_shadow=True,
+        num_blocks=args.blocks,
+        batch_size=args.batch_size,
+        rounds=args.rounds,
+        count_callbacks=True,
+    )
+    if counted_stats != shadow_stats:
+        raise RuntimeError("callback-counting trial did not reproduce timed workload")
     baseline_ns = statistics.median(baseline_samples)
     shadow_ns = statistics.median(shadow_samples)
     blocks_processed = args.batch_size * args.rounds
@@ -140,7 +204,8 @@ def main() -> None:
             "rounds": args.rounds,
             "repeats": args.repeats,
             "blocks_processed_per_trial": blocks_processed,
-            "observer_callbacks_per_block": 5,
+            "observer_callbacks_per_trial": observer_callbacks,
+            "observer_callbacks_per_block": observer_callbacks / blocks_processed,
         },
         "baseline": {
             "median_ms": baseline_ns / 1e6,
@@ -157,7 +222,7 @@ def main() -> None:
             "median_ms": delta_ns / 1e6,
             "ns_per_block": delta_ns / blocks_processed,
             "percent": (delta_ns / baseline_ns) * 100,
-            "ns_per_callback": delta_ns / (blocks_processed * 5),
+            "ns_per_callback": delta_ns / observer_callbacks,
         },
     }
     output = json.dumps(result, indent=2) + "\n"

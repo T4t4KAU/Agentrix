@@ -36,14 +36,20 @@ stop_server() {
 
 wait_for_server() {
   local log="$1"
+  local expected_model="$2"
   for _ in $(seq 1 "${STARTUP_TIMEOUT}"); do
-    if curl --silent --fail --max-time 2 \
-      "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
-      return 0
-    fi
     if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
       tail -n 120 "${log}" >&2
       return 1
+    fi
+    local response
+    if response="$(
+      curl --silent --fail --max-time 2 \
+        "http://127.0.0.1:${PORT}/v1/models" 2>/dev/null
+    )" && "${PYTHON}" -c \
+      'import json, sys; raise SystemExit(sys.argv[1] not in {item["id"] for item in json.loads(sys.argv[2])["data"]})' \
+      "${expected_model}" "${response}"; then
+      return 0
     fi
     sleep 1
   done
@@ -62,6 +68,14 @@ for shadow in ${MODES}; do
   output_dir="${OUTPUT_ROOT}/${label}"
   mkdir -p "${output_dir}"
   server_log="${output_dir}/server.log"
+  server_model_name="qwen3-vl-shadow-${label}-$$-${RANDOM}"
+
+  if ! "${PYTHON}" -c \
+    'import socket, sys; sock = socket.socket(); sock.bind(("127.0.0.1", int(sys.argv[1]))); sock.close()' \
+    "${PORT}"; then
+    echo "Port ${PORT} is already in use; refusing to profile another service." >&2
+    exit 1
+  fi
 
   setsid env \
     CUDA_VISIBLE_DEVICES="${GPU_ID}" \
@@ -73,7 +87,7 @@ for shadow in ${MODES}; do
     "${VLLM_BIN}" serve "${MODEL_PATH}" \
       --host 127.0.0.1 \
       --port "${PORT}" \
-      --served-model-name qwen3-vl \
+      --served-model-name "${server_model_name}" \
       --attention-backend FORK_ATTN \
       --dtype bfloat16 \
       --generation-config vllm \
@@ -85,11 +99,11 @@ for shadow in ${MODES}; do
       --max-num-seqs 16 \
       >"${server_log}" 2>&1 &
   SERVER_PID=$!
-  wait_for_server "${server_log}"
+  wait_for_server "${server_log}" "${server_model_name}"
 
   "${PYTHON}" "${BENCHMARK_DIR}/scripts/benchmark_agent_session_dp.py" \
     --base-url "http://127.0.0.1:${PORT}" \
-    --model qwen3-vl \
+    --model "${server_model_name}" \
     --policy-label "${label}-warmup" \
     --sessions 2 \
     --shared-prefix-tokens 256 \
@@ -100,7 +114,7 @@ for shadow in ${MODES}; do
 
   "${PYTHON}" "${BENCHMARK_DIR}/scripts/benchmark_agent_session_dp.py" \
     --base-url "http://127.0.0.1:${PORT}" \
-    --model qwen3-vl \
+    --model "${server_model_name}" \
     --policy-label "${label}" \
     --sessions "${SESSIONS}" \
     --shared-prefix-tokens 2048 \

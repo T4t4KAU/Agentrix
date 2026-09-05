@@ -88,7 +88,7 @@ When active placement is enabled, the planner subtracts uncached free blocks
 and the current request's not-yet-touched, window-resident cache hits from
 allocation demand. Local-attention hits outside the current window remain
 valid eviction candidates.
-It scans only non-shared idle queues and ranks candidates as follows:
+It ranks candidates as follows:
 
 1. blocks with an existing CPU or remote copy;
 2. cold blocks that have never been reused;
@@ -99,10 +99,10 @@ unbacked warm cache from stalling admission. Proactive backup reduces how
 often this fallback is needed. Current-request cache hits are explicitly
 excluded. Every selected generation is revalidated immediately before
 `BlockPool` atomically moves the complete victim set to the front of its free
-queue. If the plan is incomplete or stale, allocation returns `None` to the
-existing scheduler admission/preemption path; it never falls back to a shared
-prefix. Explicit cache reset and correctness invalidation remain allowed to
-remove shared entries.
+queue. If the bounded plan is incomplete or stale, allocation returns `None`
+to the existing scheduler admission/preemption path; it never falls back to a
+shared prefix. Explicit cache reset and correctness invalidation remain
+allowed to remove shared entries.
 
 ## Proactive LMCache backup
 
@@ -143,11 +143,17 @@ pressure falls after registration, candidates are released within the same
 per-step scan budget. A candidate already owned by another backup is also
 released instead of being requeued indefinitely.
 
-The D2H call is synchronous inside the connector-only step. It therefore does
-not extend an already-running model forward, although a newly arriving request
-can wait behind the bounded transfer. Event-driven D2H overlap is a later
-optimization and should use LMCache's CUDA stream/event ownership rather than
-calling CUDA from a Python executor thread.
+The default D2H path remains synchronous. Setting
+`VLLM_AGENTRIX_KV_PROACTIVE_ASYNC=1` instead enqueues the copy on LMCache's
+connector-owned store stream after waiting for current-stream KV writes. A
+CUDA event fences publication to the CPU cache. Newly registered chunks wait
+one planning step and are then revalidated, allowing concurrent prefix reuse
+to promote them to protected shared state before any copy starts. Event checks
+do not synchronize CUDA; once a copy completes, the bounded CPU-cache publish
+runs before ACKing the scheduler and releasing the pinned GPU generation.
+Async mode may attach a bounded backup to a model-bearing step, permitting D2H
+to overlap forward execution without moving CUDA work to a Python executor
+thread.
 
 ## Configuration
 
@@ -161,6 +167,7 @@ VLLM_AGENTRIX_KV_PLACEMENT_SHADOW=1
 VLLM_AGENTRIX_KV_PLACEMENT_ACTIVE=0
 VLLM_AGENTRIX_KV_PLACEMENT_SCAN_BUDGET=64
 VLLM_AGENTRIX_KV_PROACTIVE_BACKUP=1
+VLLM_AGENTRIX_KV_PROACTIVE_ASYNC=0
 VLLM_AGENTRIX_KV_BACKUP_HIGH_WATERMARK=0.8
 VLLM_AGENTRIX_KV_BACKUP_SCAN_BUDGET=32
 VLLM_AGENTRIX_KV_BACKUP_BATCH_BLOCKS=64
@@ -176,7 +183,9 @@ scan budget is a separate positive per-step limit. Active mode may inspect at
 least one entry per requested allocation block, so its work is
 `O(allocation)` rather than `O(cache size)` even when an allocation exceeds the
 configured budget. Proactive backup also enables the residency index and
-requires non-layerwise local CPU storage without CacheBlend.
+requires non-layerwise local CPU storage without CacheBlend. Asynchronous D2H
+is separately gated so the synchronous path remains the default and can serve
+as an A/B baseline.
 
 ## Initial profiling
 
@@ -221,10 +230,10 @@ Raw server artifacts are under
 ## Review hardening
 
 After separating internal pins, scoping sharing metadata to a generation, and
-adding operation-aware backup tracking, the same synthetic profile measured
-2.45 microseconds of shadow bookkeeping per processed block (0.49
-microseconds per callback). Idle metadata remained 128.6 bytes per physical
-block.
+adding operation-aware backup tracking, a fresh callback-counted synthetic
+profile measured 2.82 microseconds of shadow bookkeeping per processed block
+(0.48 microseconds across 5.872 callbacks per block). Idle metadata measured
+128.0 bytes per physical block.
 
 Temporary pins now save their intrusive-list neighbors and restore the idle
 position in O(1) when those anchors remain valid. If aging moved either
@@ -327,4 +336,20 @@ an end-to-end throughput comparison.
 
 Deferring one synchronization per chunk was also measured separately over 60
 alternating 32 MiB trials. It regressed the median from 8.42 ms to 9.19 ms, so
-that change was rejected and is not present in the source.
+per-chunk deferral remains rejected. The optional event-driven implementation
+instead removes the batch-level wait and delays cache publication until one
+batch completion event.
+
+Two event-driven runs of the 8-case, 32-branch workload measured 3,550.56 ms
+median end-to-end and 1,838.29 ms median branch-wall time. Two synchronous
+runs measured 3,571.91 ms and 1,885.73 ms respectively. The differences are
+small enough to treat as noise, not as a demonstrated speedup. One-step
+sharing revalidation reduced asynchronous backup volume from 7,680 to 5,120
+tokens, but the synchronous path stored only 2,560 tokens. Async mode therefore
+remains opt-in. Raw artifacts are under
+`benchmark/results/proactive_async_grace_async_*` on the test server.
+
+A separate 96-GPU-block pressure test ran prompts in A/B/C/D/A order. The last
+A request reloaded 768 tokens from LMCache after GPU recycling and reproduced
+the first request's deterministic output exactly. Its server log is under
+`benchmark/results/proactive_async_forced_reload`.
