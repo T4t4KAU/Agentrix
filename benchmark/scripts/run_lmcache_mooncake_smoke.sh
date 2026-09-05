@@ -18,6 +18,7 @@ MOONCAKE_MASTER_PORT="${MOONCAKE_MASTER_PORT:-50051}"
 MOONCAKE_METADATA_PORT="${MOONCAKE_METADATA_PORT:-8005}"
 VLLM_PORT="${PORT:-9000}"
 MOONCAKE_MEMORY_SIZE_GB="${MOONCAKE_MEMORY_SIZE_GB:-4}"
+MOONCAKE_PROTOCOL="${MOONCAKE_PROTOCOL:-tcp}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-420}"
 LMCACHE_CONFIG_FILE="${OUTPUT_ROOT}/lmcache_mooncake.yaml"
 
@@ -109,17 +110,20 @@ cat >"${LMCACHE_CONFIG_FILE}" <<EOF
 chunk_size: ${LMCACHE_CHUNK_SIZE:-256}
 remote_url: "mooncakestore://${HOST}:${MOONCAKE_MASTER_PORT}/"
 remote_serde: "naive"
-local_cpu: false
-max_local_cpu_size: 1
+local_cpu: ${LMCACHE_LOCAL_CPU:-false}
+max_local_cpu_size: ${LMCACHE_CPU_SIZE_GB:-1}
+enable_async_loading: ${LMCACHE_ASYNC_LOADING:-false}
 extra_config:
+  proactive_remote_backup: ${PROACTIVE_REMOTE_BACKUP:-false}
+  remote_max_inflight_bytes: ${REMOTE_MAX_INFLIGHT_BYTES:-134217728}
   save_chunk_meta: false
   local_hostname: "${HOST}"
   metadata_server: "http://${HOST}:${MOONCAKE_METADATA_PORT}/metadata"
-  protocol: "tcp"
-  device_name: ""
+  protocol: "${MOONCAKE_PROTOCOL}"
+  device_name: "${MOONCAKE_DEVICE_NAME:-}"
   master_server_address: "${HOST}:${MOONCAKE_MASTER_PORT}"
   global_segment_size: ${mooncake_memory_bytes}
-  local_buffer_size: ${mooncake_memory_bytes}
+  local_buffer_size: ${MOONCAKE_BUFFER_BYTES:-${mooncake_memory_bytes}}
   transfer_timeout: 5
 EOF
 
@@ -158,6 +162,14 @@ wait_for_port \
   "${MOONCAKE_MASTER_PID}" \
   "${OUTPUT_ROOT}/mooncake_master.log"
 
+if [[ "${PROFILE_RESTORE:-0}" == "1" ]]; then
+  "${RUNTIME_PYTHON}" "${BENCHMARK_DIR}/scripts/profile_kv_restore.py" \
+    --model "${MODEL_PATH:-${REPO_ROOT}/../models/Qwen3-VL-8B-Instruct}" \
+    --config "${LMCACHE_CONFIG_FILE}" \
+    --port "${VLLM_PORT}" \
+    --output "${OUTPUT_ROOT}"
+  server_log="${OUTPUT_ROOT}/vllm_server.log"
+else
 LMCACHE_CONFIG_FILE="${LMCACHE_CONFIG_FILE}" \
 PYTHONHASHSEED=0 \
 RUNTIME_PYTHONPATH="${LMCACHE_SOURCE}" \
@@ -191,6 +203,7 @@ OUTPUT_DIR="${OUTPUT_DIR}" \
 backend_name="${BACKENDS:-FLASH_ATTN}"
 backend_name="${backend_name,,}"
 server_log="${OUTPUT_ROOT}/${backend_name}/vllm_server.log"
+fi
 if ! grep -q "Mooncake store setup completed successfully" "${server_log}"; then
   echo "Mooncake smoke failed: LMCache did not initialize Mooncake Store." >&2
   tail -n 120 "${server_log}" >&2
@@ -205,9 +218,9 @@ fi
 
 cat >"${OUTPUT_ROOT}/smoke_summary.txt" <<EOF
 status=passed
-transport=tcp
+transport=${MOONCAKE_PROTOCOL}
 lmcache_mode=inprocess
-lmcache_local_cpu=false
+lmcache_local_cpu=${LMCACHE_LOCAL_CPU:-false}
 mooncake_memory_size_gb=${MOONCAKE_MEMORY_SIZE_GB}
 model=${MODEL_PATH:-${REPO_ROOT}/../models/Qwen3-VL-8B-Instruct}
 lmcache_config=${LMCACHE_CONFIG_FILE}

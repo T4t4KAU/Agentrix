@@ -1,0 +1,19 @@
+chunk_size: 256
+local_cpu: true
+max_local_cpu_size: 1
+remote_url: "mooncakestore://127.0.0.1:50051/"
+remote_serde: "naive"
+save_unfull_chunk: false
+enable_async_loading: true
+extra_config:
+  proactive_remote_backup: true
+  remote_max_inflight_bytes: 134217728
+  save_chunk_meta: false
+  local_hostname: "127.0.0.1"
+  metadata_server: "http://127.0.0.1:8005/metadata"
+  protocol: "tcp"
+  device_name: ""
+  master_server_address: "127.0.0.1:50051"
+  global_segment_size: 4294967296
+  local_buffer_size: 67108864
+  transfer_timeout: 5
