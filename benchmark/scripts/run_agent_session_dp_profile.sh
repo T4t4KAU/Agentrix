@@ -21,6 +21,16 @@ TRIALS="${TRIALS:-5}"
 SHARED_PREFIX_TOKENS="${SHARED_PREFIX_TOKENS:-2048}"
 SESSION_TOKENS="${SESSION_TOKENS:-1024}"
 FOLLOWUP_TOKENS="${FOLLOWUP_TOKENS:-64}"
+server_args=()
+if [[ -n "${NUM_GPU_BLOCKS:-}" ]]; then
+  server_args+=(--num-gpu-blocks-override "${NUM_GPU_BLOCKS}")
+fi
+if [[ -n "${KV_TRANSFER_CONFIG:-}" ]]; then
+  server_args+=(--kv-transfer-config "${KV_TRANSFER_CONFIG}")
+fi
+if [[ "${ENFORCE_EAGER:-0}" == "1" ]]; then
+  server_args+=(--enforce-eager)
+fi
 export PATH="$(dirname "${VLLM_BIN}"):${PATH}"
 
 SERVER_PID=""
@@ -97,6 +107,7 @@ for policy in ${POLICIES}; do
       --max-model-len "${MAX_MODEL_LEN}" \
       --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
       --max-num-seqs "${MAX_NUM_SEQS}" \
+      "${server_args[@]}" \
       >"${server_log}" 2>&1 &
   SERVER_PID=$!
   wait_for_server "${server_log}"

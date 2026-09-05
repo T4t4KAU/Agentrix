@@ -15,9 +15,9 @@ from 92.5% to 98.0%, reduced median batch makespan by 45.0%, and increased
 throughput by 81.9%.
 
 This profile intentionally isolates local DP routing. LMCache and Mooncake were
-not enabled, and the external KV-transfer counter remained zero. A second
-experiment is still needed to quantify the policy together with the unified
-external memory tier.
+not enabled, and the external KV-transfer counter remained zero. The later
+[GPU residency feedback profile](dp_kv_placement.md) covers actual GPU eviction
+events and a separate CPU/Mooncake integration run.
 
 ## Implementation
 
@@ -54,10 +54,10 @@ client does not supply it. The legacy
 `VLLM_FORK_ATTN_DP_PREFIX_ROUTING=1` variable remains a compatibility alias for
 the `prefix_aware` policy.
 
-The current cache-residency signal is deliberately conservative and logical.
-It does not yet consume authoritative physical-eviction events from an LMCache
-multi-process connector. `agentrix_history_tokens` supplies an additional
-lower-bound check until that event path is available.
+The default cache-residency signal remains logical. The optional
+`VLLM_AGENTRIX_DP_KV_EVENTS=1` path consumes vLLM GPU events for supported
+plain-token requests; it does not use LMCache events as GPU residency evidence.
+`agentrix_history_tokens` supplies an additional lower-bound check in both modes.
 
 ## Test System
 
