@@ -170,6 +170,36 @@ Async mode may attach a bounded backup to a model-bearing step, permitting D2H
 to overlap forward execution without moving CUDA work to a Python executor
 thread.
 
+## Restore feedback and prefetch budget
+
+Restore metadata carries destination block IDs, generations, and chunk hashes.
+After a successful GPU load, each worker verifies the chunk's continued presence
+in the local CPU backend. Only blocks validated by every model worker are
+reported as CPU-backed; MLA passive workers acknowledge the leader's broadcast.
+The scheduler rejects old generations and applies CPU eviction feedback after
+restore acknowledgements. A remote load without a CPU copy never sets CPU
+residency. Restored generations join the same hash-to-block invalidation index
+as proactive stores.
+
+The ordinary LMCache load-error path remains independent of this optional
+feedback. Partial or malformed results report missing physical blocks for
+vLLM's `kv_load_failure_policy: recompute`. Failed loads cannot turn an old
+logical hit into successful residency feedback.
+
+`kv_connector_extra_config: {"lmcache.max_tokens_per_load": 512}` bounds each
+request's external prefix before lookup/prefetch submission, as well as before
+GPU allocation. The cap is chunk-aligned and allocation counts account for an
+unaligned locally cached prefix. The remaining context is recomputed. LMCache's
+existing `enable_async_loading: true` path provides remote-to-CPU prefetch;
+the connector does not add a second transfer executor.
+
+The server regression suite passed 79 LMCache tests (2 skipped) and 35 vLLM
+residency/placement tests. The reusable server-only pressure replay is
+`benchmark/scripts/profile_kv_restore.py`: 96 GPU blocks, six 857-token prompts
+in P/A/B/C/D/A order, and a 512-token load cap. The final A restored 512 tokens
+and reproduced the initial deterministic output. Results remain under
+`benchmark/results/restore_generation_verified` on the profiling server.
+
 ## Configuration
 
 ```bash
