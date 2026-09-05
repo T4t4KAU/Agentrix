@@ -496,6 +496,7 @@ def run(args):
                     "torch_profiler_with_stack": False,
                     "ignore_frontend": True,
                     "max_iterations": 12,
+                    "delay_iterations": args.profile_delay,
                 }
             ),
         ]
@@ -533,6 +534,7 @@ def run(args):
                         ROOT / "benchmark/scripts/profile_tracelab.py",
                         ROOT / "vllm/vllm/v1/engine/prefix_router.py",
                         ROOT / "vllm/vllm/v1/attention/backends/fork_attn.py",
+                        ROOT / "vllm/vllm/v1/worker/gpu/cudagraph_utils.py",
                     )
                 },
             },
@@ -576,5 +578,6 @@ if __name__ == "__main__":
     parser.add_argument("--cases", default="")
     parser.add_argument("--eager", action="store_true")
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--profile-delay", type=int, default=0)
     args = parser.parse_args()
     prepare(args) if args.prepare else run(args)
