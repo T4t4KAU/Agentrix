@@ -143,6 +143,14 @@ pressure falls after registration, candidates are released within the same
 per-step scan budget. A candidate already owned by another backup is also
 released instead of being requeued indefinitely.
 
+Admission is proportional to pressure rather than all-or-nothing per request.
+The scheduler converts the number of occupied blocks above the watermark into
+whole LMCache chunks, subtracts chunks already retained, and admits only that
+prefix of a finished request. The existing batch-block limit is the per-step
+transfer budget, while the retained-block limit remains an atomic request-level
+backpressure guard. This keeps all work bounded without adding a second
+candidate index.
+
 The default D2H path remains synchronous. Setting
 `VLLM_AGENTRIX_KV_PROACTIVE_ASYNC=1` instead enqueues the copy on LMCache's
 connector-owned store stream after waiting for current-stream KV writes. A
@@ -353,3 +361,12 @@ A separate 96-GPU-block pressure test ran prompts in A/B/C/D/A order. The last
 A request reloaded 768 tokens from LMCache after GPU recycling and reproduced
 the first request's deterministic output exactly. Its server log is under
 `benchmark/results/proactive_async_forced_reload`.
+
+Pressure-proportional admission was checked with a 96-GPU-block P/A/B/C/D/A
+sequence at the production 0.8 watermark. Requests above the watermark stored
+512 rather than all 768 eligible tokens. The final A request reloaded those 512
+tokens from LMCache and reproduced its first deterministic output. With the
+ordinary 8-case workload, KV occupancy stayed below 0.8 and correctly issued
+no backup. A forced-watermark-zero control retained the previous 5,120-token
+backup volume and measured 3,545.51 ms end-to-end. Artifacts are under
+`benchmark/results/proactive_pressure_admission_*` on the test server.
