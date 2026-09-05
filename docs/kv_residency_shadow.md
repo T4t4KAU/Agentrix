@@ -88,11 +88,18 @@ When active placement is enabled, the planner subtracts uncached free blocks
 and the current request's not-yet-touched, window-resident cache hits from
 allocation demand. Local-attention hits outside the current window remain
 valid eviction candidates.
-It ranks candidates as follows:
+It ranks candidates by bounded reclaim cost as follows:
 
-1. blocks with an existing CPU or remote copy;
-2. cold blocks that have never been reused;
-3. remaining non-shared blocks, discarded as a progress-preserving fallback.
+1. blocks with an existing CPU copy, then blocks with only a remote copy;
+2. non-shared blocks that have never been reused, from cold to warm;
+3. previously reused non-shared blocks, again from cold to warm.
+
+Age within each lifecycle segment remains the final stable tie-breaker. The
+hot path reads an integer tier mask and computes a fixed integer priority; it
+does not allocate tier objects or evaluate a configurable model per block.
+Shadow mode marks unbacked candidates for CPU backup, while active mode can
+discard them only when backed candidates and cheap cold discards are
+insufficient.
 
 The final category may require recomputation on a future hit, but prevents an
 unbacked warm cache from stalling admission. Proactive backup reduces how
@@ -370,3 +377,11 @@ ordinary 8-case workload, KV occupancy stayed below 0.8 and correctly issued
 no backup. A forced-watermark-zero control retained the previous 5,120-token
 backup volume and measured 3,545.51 ms end-to-end. Artifacts are under
 `benchmark/results/proactive_pressure_admission_*` on the test server.
+
+The tier-aware reclaim ordering was profiled over 2,000 active planning steps,
+scanning 64 of 8,192 blocks per step. It measured 941.3 ns per scanned block,
+61.2 microseconds median and 64.8 microseconds P99 per step. The previous
+workspace implementation measured 918.8 ns per block; the approximately 2.4%
+difference is small, while an earlier object-based tier implementation at
+2,103.3 ns per block was rejected. The retained artifact is
+`benchmark/results/kv_placement_cost_aware_fast.json` on the test server.
