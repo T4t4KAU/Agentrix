@@ -1,259 +1,97 @@
-# Building and Benchmarking Agentrix on AutoDL
+# AutoDL 环境、构建与清理
 
-This guide reproduces the CUDA 12.8 build used on an AutoDL host with two
-NVIDIA GeForce RTX 5090 GPUs. It keeps all environments, caches, source
-dependencies, build outputs, models, and benchmark results under
-`/root/autodl-tmp`.
+## 当前服务器
 
-## Validated Host
+`ssh -p 50887 root@connect.bjb2.seetacloud.com`。
+推理、测试、profiling 仅在此服务器执行；本机负责编辑和传文件。
 
-- Ubuntu 22.04
-- NVIDIA driver 595.71.05
-- CUDA toolkit 12.8.93 at `/usr/local/cuda-12.8`
-- 2 x RTX 5090, 32 GiB each, compute capability 12.0
-- 208 logical CPUs and 754 GiB RAM
-- Python 3.12 from `/root/miniconda3`
-- Qwen3-8B at `/root/autodl-tmp/models/Qwen3-8B`
+| 路径/配置 | 当前用途 |
+| --- | --- |
+| `/root/autodl-tmp/Agentrix` | 部署源码；当前为文件同步目录，没有父仓库 .git |
+| `benchmark/.venv` | 唯一项目 Python 环境，Python 3.12.3 / Torch 2.11.0+cu128 |
+| `vllm/.venv` | 指向 `../benchmark/.venv` 的兼容 symlink，不是第二套环境 |
+| `/usr/local/cuda-12.8` | 当前编译 toolkit，SM120 |
+| `vllm/cmake-build-cu128` | 保留的增量构建目录 |
+| `/root/autodl-tmp/deps/vllm` | CMake 正在引用的依赖源码，不可当临时文件删除 |
+| `/root/autodl-tmp/models` | 用户模型；当前使用 Qwen3-VL-8B-Instruct |
+| `benchmark/results/upstream_vllm_0_25_0` | 独立原始 vLLM baseline，不能被 Agentrix editable install 覆盖 |
+| `/root/autodl-tmp/uv-cache` | 可再下载的安装缓存，不是运行环境 |
 
-The host can access PyPI mirrors but cannot reliably access GitHub. Source
-repositories and CMake `FetchContent` dependencies therefore need to be
-transferred from a development machine.
+服务器有 4 张 RTX 5090（每张约 32 GiB）。当前 matched DP=2 使用 GPUs 0/1，
+不是固定占用全部 GPU。父仓库及子模块版本见 [TraceLab 来源](tracelab_timeline_replay.md#provenance)；
+不要依赖生成后未更新的 vLLM version 字符串。
 
-## Synchronize the Repository Without GitHub
+## 环境
 
-On the development machine, create and transfer a Git bundle:
-
-```bash
-cd /path/to/Agentrix
-git bundle create /tmp/agentrix-main.bundle main
-scp -P <autodl-ssh-port> /tmp/agentrix-main.bundle \
-  root@<autodl-ssh-host>:/root/autodl-tmp/
-```
-
-On the AutoDL host:
+从服务器仓库根目录设置：
 
 ```bash
 cd /root/autodl-tmp/Agentrix
-git config --global --add safe.directory "$PWD"
-git config --global --add safe.directory "$PWD/vllm"
-git config --global --add safe.directory "$PWD/LMCache"
-git fetch /root/autodl-tmp/agentrix-main.bundle \
-  main:refs/remotes/dev/main
-git checkout -B main refs/remotes/dev/main
-git submodule update --init --recursive
-git submodule status
-```
-
-The validated revisions were Agentrix `b98cf22`, vLLM `173016d22`, and
-LMCache `b84945ca`.
-
-## Configure uv and the Mirror
-
-Install uv with the base Python and place its cache on the data disk. The
-PyTorch CUDA wheels still come from the PyTorch CUDA 12.8 index; all regular
-Python packages use the Tsinghua mirror.
-
-```bash
-export PATH=/root/miniconda3/bin:$PATH
-python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple uv
-
-export UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
-export UV_CACHE_DIR=/root/autodl-tmp/uv-cache
-export UV_HTTP_TIMEOUT=300
-mkdir -p "$UV_CACHE_DIR"
-```
-
-Do not leave the uv cache under `/root/.cache` on this image. That path is on
-the container overlay and extracting large PyTorch and Triton wheels there is
-much slower than using `/root/autodl-tmp`.
-
-## Install the CUDA 12.8 Python Environment
-
-```bash
-cd /root/autodl-tmp/Agentrix/vllm
-uv venv --python /root/miniconda3/bin/python .venv
-uv pip install --python .venv/bin/python --torch-backend=cu128 \
-  -r requirements/build/cuda.txt \
-  -r requirements/cuda.txt
-```
-
-Verify that the environment did not resolve a CUDA 13 wheel:
-
-```bash
-.venv/bin/python - <<'PY'
-import torch
-
-print(torch.__version__, torch.version.cuda)
-for index in range(torch.cuda.device_count()):
-    print(index, torch.cuda.get_device_name(index),
-          torch.cuda.get_device_capability(index))
-PY
-```
-
-The validated output reports `torch 2.11.0+cu128`, CUDA `12.8`, and capability
-`(12, 0)` for both GPUs.
-
-## Transfer CMake Source Dependencies
-
-vLLM fetches several projects from GitHub during CMake configuration. Reuse
-the sources from an existing development build and transfer them without Git
-history. The source directories used by the validated build were:
-
-```text
-cutlass v4.4.2
-DeepGEMM
-FlashMLA
-MSA/fmha_sm100
-QUTLASS
-vLLM FlashAttention
-Triton kernels v3.5.1
-```
-
-For example, transfer a prepared dependency directory with:
-
-```bash
-tar -C /path/to/prepared-vllm-deps --exclude='*/.git' -cf - . \
-  | pigz -p 16 -3 \
-  | ssh -p <autodl-ssh-port> root@<autodl-ssh-host> \
-      'mkdir -p /root/autodl-tmp/deps/vllm && \
-       gzip -dc | tar -C /root/autodl-tmp/deps/vllm -xf -'
-```
-
-The local Triton override must point to the Python package directory, not the
-Triton repository root:
-
-```text
-/root/autodl-tmp/deps/vllm/triton_kernels-src/python/triton_kernels/triton_kernels
-```
-
-Pointing it at the repository root incorrectly starts an LLVM/MLIR compiler
-build.
-
-## Configure and Build vLLM
-
-Set the CUDA toolkit explicitly because `nvcc` is not in the default `PATH`:
-
-```bash
-cd /root/autodl-tmp/Agentrix/vllm
-export PATH="$PWD/.venv/bin:/usr/local/cuda-12.8/bin:/root/miniconda3/bin:$PATH"
+export PATH="$PWD/benchmark/.venv/bin:/usr/local/cuda-12.8/bin:/root/.local/bin:$PATH"
 export CUDA_HOME=/usr/local/cuda-12.8
-export TORCH_CUDA_ARCH_LIST=12.0
-export VLLM_TARGET_DEVICE=cuda
-export NVCC_THREADS=4
-
-export VLLM_CUTLASS_SRC_DIR=/root/autodl-tmp/deps/cutlass-v4.4.2
-export DEEPGEMM_SRC_DIR=/root/autodl-tmp/deps/vllm/deepgemm-src
-export FLASH_MLA_SRC_DIR=/root/autodl-tmp/deps/vllm/flashmla-src
-export FMHA_SM100_SRC_DIR=/root/autodl-tmp/deps/vllm/fmha_sm100-src
-export QUTLASS_SRC_DIR=/root/autodl-tmp/deps/vllm/qutlass-src
-export VLLM_FLASH_ATTN_SRC_DIR=/root/autodl-tmp/deps/vllm/vllm-flash-attn-src
-export TRITON_KERNELS_SRC_DIR=/root/autodl-tmp/deps/vllm/triton_kernels-src/python/triton_kernels/triton_kernels
-
-.venv/bin/python tools/generate_cmake_presets.py --force-overwrite
-sed -i 's#cmake-build-release#cmake-build-cu128#g' CMakeUserPresets.json
-.venv/bin/cmake --preset release -DNVCC_THREADS=4
-.venv/bin/cmake --build --preset release --target install --parallel 48
-```
-
-The persistent incremental build directory is `vllm/cmake-build-cu128`.
-Successful configuration must include both of these lines:
-
-```text
-CUDA target architectures: 12.0
-Building experimental ForkAttention for archs: 12.0
-```
-
-Generate Python package metadata without rebuilding the CUDA extensions:
-
-```bash
-.venv/bin/python setup.py egg_info
-```
-
-Create the CLI wrapper used by the benchmark scripts:
-
-```bash
-cat >.venv/bin/vllm <<'EOF'
-#!/usr/bin/env bash
-export PYTHONPATH=/root/autodl-tmp/Agentrix/vllm${PYTHONPATH:+:$PYTHONPATH}
-exec /root/autodl-tmp/Agentrix/vllm/.venv/bin/python \
-  -m vllm.entrypoints.cli.main "$@"
-EOF
-chmod +x .venv/bin/vllm
-.venv/bin/vllm --version
-```
-
-Create a reusable environment file outside the Git checkout:
-
-```bash
-cat >/root/autodl-tmp/agentrix-cu128-env.sh <<'EOF'
-export AGENTRIX_ROOT=/root/autodl-tmp/Agentrix
-export CUDA_HOME=/usr/local/cuda-12.8
-export PATH=$AGENTRIX_ROOT/vllm/.venv/bin:$CUDA_HOME/bin:/root/miniconda3/bin:$PATH
-export PYTHONPATH=$AGENTRIX_ROOT/vllm:$AGENTRIX_ROOT/benchmark/src${PYTHONPATH:+:$PYTHONPATH}
-export UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
+export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6
+export UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple
 export UV_CACHE_DIR=/root/autodl-tmp/uv-cache
+export UV_LINK_MODE=copy
 export TORCH_CUDA_ARCH_LIST=12.0
-EOF
-```
-
-## Install and Validate the Benchmark Environment
-
-```bash
-cd /root/autodl-tmp/Agentrix/benchmark
-uv venv --python /root/miniconda3/bin/python .venv
-uv pip install --python .venv/bin/python -e ".[data,test]"
-.venv/bin/python -m pytest tests -q
-```
-
-The validated benchmark suite has 23 passing tests. For focused GPU coverage,
-install `pytest` and `tblib` in the vLLM environment and run:
-
-```bash
-cd /root/autodl-tmp/Agentrix/vllm
-uv pip install --python .venv/bin/python pytest tblib
-CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m pytest \
-  tests/kernels/test_fork_attention.py -q \
-  -k 'masks_partial_suffix_block or interleaved_kv_cache_suffix_page_stride'
-```
-
-The checked-in `requirements/test/cuda.txt` was generated for cu130. Do not
-install that lock file unchanged into this cu128 environment. Install the
-focused test dependencies as above or regenerate the test lock for cu128.
-
-## Run the Three-Way DP Benchmark
-
-The following command runs FlashAttention with ordinary internal DP,
-ForkAttention with ordinary internal DP, and ForkAttention with prefix-aware
-internal DP. It does not enable KV offloading.
-
-```bash
-source /root/autodl-tmp/agentrix-cu128-env.sh
 export VLLM_USE_FLASHINFER_SAMPLER=0
-export STARTUP_TIMEOUT=900
-cd /root/autodl-tmp/Agentrix/benchmark
-
-MODEL_PATH=/root/autodl-tmp/models/Qwen3-8B \
-SERVED_MODEL_NAME=qwen3-8b-dp \
-VLLM_BIN=/root/autodl-tmp/Agentrix/vllm/.venv/bin/vllm \
-DATASET=agencybench \
-DATA_PATH=/root/autodl-tmp/Agentrix/benchmark/data/agencybench_v2.jsonl \
-OUTPUT_ROOT=results/dp_agencybench_qwen3_8b_cu128_r1 \
-DP_REPLICAS=2 \
-GPU_IDS=0,1 \
-CASE_COUNT=8 \
-BRANCHES=8 \
-PREFIX_TOKENS=8192 \
-CONCURRENCY=64 \
-SUFFIX_MEAN=128 \
-OUTPUT_TOKENS=64 \
-MAX_NUM_SEQS=32 \
-MAX_MODEL_LEN=16384 \
-GPU_MEMORY_UTILIZATION=0.80 \
-RUN_PRESSURE=0 \
-PROFILE_FORK=1 \
-./scripts/run_vllm_dp_full_dataset.sh
 ```
 
-Use a distinct `OUTPUT_ROOT` for each repetition. The runner restarts the
-server between variants, so model state and GPU KV cache contents are not
-shared across configurations.
+仅在使用 Agentrix 源码时设置 `PYTHONPATH="$PWD/vllm:$PWD/LMCache"`。
+原始 vLLM 对照用 harness 的 `--runtime-root` 选择，不能通过带源码路径的
+`vllm` wrapper 启动。现有 wrapper 是 `benchmark/scripts/vllm_source_cli.py` 的链接。
+
+不要为每次实验创建新的 .venv，也不要直接安装 CUDA 13 的 test lock 覆盖 cu128。
+必要依赖使用 `uv pip install --python benchmark/.venv/bin/python ...`；
+升级 Torch/CUDA 需要另行评估 native extension ABI，不是清理操作的一部分。
+
+LMCache 当前缺少可选 `lmcache.cuda_ops`，沿用 Torch fallback；清理前的 tiered
+实验日志已有该警告。本次只归档移除了旧 Python 3.11、旧 `c_ops` 和
+`native_storage_ops` 二进制，保留现行 Python 3.12 的 common C++ 扩展。
+没有为补扩展安装 CUDA 13，也没有把环境清理当作 offload 恢复故障的修复。
+
+## 同步与增量构建
+
+GitHub 下载慢时在本机使用代理 `127.0.0.1:7897`，再将源码传至服务器。
+主路径需要 vLLM、LMCache、Mooncake；子模块 URL 以根目录 .gitmodules 为准。
+保留服务器 .venv、CMake 输出、依赖、模型和 results，不从本机覆盖这些平台相关产物。
+在没有 .git 的服务器部署目录中，不使用 `git checkout` 或 `git submodule update`。
+
+C++/CUDA 变更后，复用已配置的 build tree：
+
+```bash
+cd /root/autodl-tmp/Agentrix
+benchmark/.venv/bin/cmake --build vllm/cmake-build-cu128 \
+  --target install --parallel 16 --verbose
+```
+
+并行数按 CPU/内存余量调整；现有配置的编译器、Python、依赖路径保存在
+`CMakeCache.txt`，重配前先核对，不在同一个 build tree 混用 cu128/cu130。
+CMake FetchContent 的 Triton override 应指向 Python package，不是需要 LLVM 构建的仓库根。
+Python-only 变更不需要重编译 vLLM CUDA 扩展。
+
+## 检查与实验入口
+
+```bash
+cd /root/autodl-tmp/Agentrix/benchmark
+LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6 \
+  .venv/bin/python -m pytest tests/test_tracelab.py -q
+```
+
+当前协议、模型、容量、baseline 和完整运行命令统一见
+[TraceLab 对照](tracelab_timeline_replay.md)。每次使用新的输出目录，结束后确认
+进程和 GPU 已释放。CPU/Mooncake 恢复仍暂停，不要为环境 smoke 自动开启完整 offload。
+
+## 清理与归档规则
+
+- 保留当前环境、兼容 symlink、增量构建和被 CMake 引用的依赖。
+- 保留原始 baseline、TraceLab 数据/manifest、最近有效对照及失败原始日志。
+- 旧 smoke/microprofile 打包到 `/root/autodl-tmp/agentrix-archive/cleanup-20260905/`，
+  保持相对目录结构；先校验归档并备份到本机，再移除散件。
+- 重复安装包只有在校验本机备份 hash 后才从服务器删除。
+- 下载缓存用 `uv cache clean --cache-dir <已核对的缓存目录>` 清理；
+  缓存不可原样恢复，但可重新下载，不卸载已安装环境。
+- 不清理用户模型、其他项目（如 InfiniCore/InfiniLM）、共享服务或用途不明的 checkout。
+- 不执行针对仓库根、模型根、home 的递归删除，不用整个部署目录的盲目 rsync --delete。
+
+完整旧文档的恢复位置见 [历史索引](historical_experiments.md)。

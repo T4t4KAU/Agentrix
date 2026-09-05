@@ -2,12 +2,11 @@
 
 ## Status and Scope
 
-This document defines the repository coding-agent workload that will serve as
-the primary end-to-end Agentrix experiment. The existing experiments in
-`main_experiment_results.md` and `dp_experiment_results.md` remain vLLM service
-and mechanism benchmarks. They explain ForkAttention, prefix-aware routing,
-KV-cache capacity, and scheduling behavior, but do not by themselves measure a
-complete Agentrix agent workflow.
+This document defines the repository's separate coding-agent workload.
+Current serving-load measurements use the [TraceLab protocol](tracelab_timeline_replay.md);
+older system/mechanism benchmarks are catalogued in the
+[historical index](historical_experiments.md). Neither those benchmarks nor a
+TraceLab serving replay alone measures a complete executable agent workflow.
 
 The coding-agent workload has a validated multi-round trace workload and 12
 executable functional tasks: four each for Django, SQLite, and FFmpeg.

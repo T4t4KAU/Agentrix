@@ -8,43 +8,29 @@ LMCache integration, and the end-to-end benchmark suite in one repository:
 - `llama.cpp/` is a Git submodule pinned to the CUDA/MUSA ForkAttention implementation.
 - `benchmark/` contains simulation, API, and local vLLM benchmarks.
 
-## Validated Results
+## Current Status
 
-Agentrix combines prefix-aware request placement, shared-prefix execution, and
-lifecycle-aware KV management. The main paired results cover task quality,
-physical GPU memory, live KV capacity, reload traffic, and serving latency:
+The current server comparison is official vLLM 0.25.0 versus Agentrix GPU-only,
+using TraceLab observed-time arrivals with 4x offered load (92 sessions).
+Agentrix took 259.79 s versus 218.23 s: **19.05% slower**, with 34 scheduler
+preemptions versus zero. This is one run per arm; feature attribution remains open.
 
-| Evidence | Baseline | Agentrix | Result |
-|---|---:|---:|---:|
-| LongBench exact match, Qwen3-32B on 4x H20 | 5.88% | 5.88% | unchanged |
-| LongBench token F1 | 40.53% | 40.42% | -0.11 percentage points |
-| LongBench peak process HBM | 84,926 MiB | 81,822 MiB | **-3,104 MiB (-3.66%)** |
-| LongBench mean TTFT | 44.01 s | 29.52 s | **1.49x faster** |
-| Coding-Agent DP=8 mean live KV | 432,139 tokens | 261,245 tokens | **-39.17%** |
-| Tool-wait peak live KV | 3.500 GiB | 1.750 GiB | **-50.00%** |
-| Lifecycle-aware CPU-to-GPU reload | 521.5 MiB | 73.5 MiB | **-85.91%** |
-
-The lifecycle scheduler and bounded query join form one closed loop: shared
-roots remain resident across Agent turn boundaries, concurrent reloads are
-coalesced, and ready siblings are regrouped into one physical ForkAttention
-cohort. In the controlled revisit experiment this reduced P95 TTFT from
-272.4 ms to 54.4 ms (**-80.05%**) and increased goodput from 291.6 to
-481.7 tok/s (**+65.20%**).
+CPU/Mooncake full-path validation is paused after two KV-restore failures.
+Historical synthetic shared-prefix gains are not current production guarantees.
+Protocol, provenance, caveats and raw-data locations are maintained in the
+[TraceLab report](docs/tracelab_timeline_replay.md).
 
 ## Documentation
 
-- [Agentrix system overview](docs/agentrix_system_overview.md)
-- [AutoDL CUDA 12.8 build and benchmark guide](docs/autodl_build_and_benchmark.md)
-- [llama.cpp CUDA/MUSA ForkAttention build and runtime guide](docs/llama_cpp_forkattention_usage.md)
-- [llama.cpp EulerOS and CentOS adaptation notes](docs/llama_cpp_forkattention_hce_centos_adaptation.md)
-- [Prefix-aware data parallel experiment results](docs/dp_experiment_results.md)
-- [Main shared-prefix experiment results](docs/main_experiment_results.md)
-- [HotpotQA Agentrix long-prefix experiment](docs/hotpot_agentrix_experiment.md)
-- [Branch-aware GPU KV lifecycle and reload experiment](docs/kv_lifecycle_reload_experiment.md)
-- [Executable Coding-Agent quality A/B](docs/coding_agent_quality_ab.md)
-- [ForkAttention CUDA operator profile](docs/forkattention_operator_profile.md)
-- [Main experiment procedures](docs/main_experiment_matrix.md)
-- [ForkAttention TP model compatibility](docs/tp_model_compatibility.md)
+Start with the [documentation index](docs/README.md).
+Core references: [server environment](docs/autodl_build_and_benchmark.md),
+[DP routing](docs/dp_routing.md), [KV memory](docs/kv_memory_optimization_status.md),
+[profiling](docs/forkattention_operator_profile.md).
+Superseded reports are summarized in the [historical index](docs/historical_experiments.md).
+
+The generic build and experimental recipes below include older runtime paths.
+For the existing profiling server, use the server guide above; do not recreate
+its environment or enable the paused offload path by following an old recipe.
 
 ## System Requirements
 
@@ -68,7 +54,7 @@ nvidia-smi
 
 ## Clone the Repository
 
-Initialize all three submodules when cloning:
+Initialize the submodules required by the selected runtime when cloning:
 
 ```bash
 git clone --recurse-submodules <agentrix-repository-url> agentrix
@@ -84,9 +70,9 @@ git submodule sync --recursive
 git submodule update --init --recursive
 ```
 
-All three submodules track their `fork-attn` branches. Agentrix records exact commit
-IDs, so verify that the pinned commits are available from the remotes in
-`.gitmodules` before publishing the parent repository.
+Submodule URLs and branch hints are recorded in `.gitmodules`; they are not all
+on the same branch. Agentrix records exact commit IDs. Verify those commits are
+available from the remotes before publishing the parent repository.
 
 ## Install uv
 
@@ -444,10 +430,10 @@ MODE=tp_accuracy MODEL_SPECS='qwen3-14b|/path/to/Qwen3-14B' \
 ./scripts/run_main_experiment.sh
 ```
 
-The current DP validation compares ordinary ForkAttention DP with the final
-capacity-aware router using separate Warm8K and Pressure16K workloads. Use the
-commands in [the current DP results](docs/dp_experiment_results.md); the old
-generic DP defaults no longer represent the routing implementation.
+The historical DP matrices used separate warm-cache and capacity-pressure
+workloads; their provenance is in the [historical index](docs/historical_experiments.md#dp).
+For the current implementation and matched serving comparison, use the
+[DP guide](docs/dp_routing.md) and [TraceLab protocol](docs/tracelab_timeline_replay.md).
 
 Override `PREFIX_LENGTHS`, `BRANCH_COUNTS`, `DATASETS`, `CASE_COUNT`,
 `MAX_DATASET_RECORDS`, `GPU_IDS`, `DP_REPLICAS`, `TP_SIZE`, and
