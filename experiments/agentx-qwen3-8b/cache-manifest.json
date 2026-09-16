@@ -1,0 +1,12 @@
+{
+  "source_sha256": "29b6a19e751ff5230771519aab755f80a0f43a4ba9cf96b72d3a6a437ec99276",
+  "dataset_revision": "23f152f6f0f9399a85901b89a6458def0ef16729",
+  "rows": 393,
+  "cache_sha256": {
+    "datasets/semianalysisai___cc-traces-weka-062126/default/0.0.0/23f152f6f0f9399a85901b89a6458def0ef16729/cc-traces-weka-062126-train-00003-of-00004.arrow": "73526443fc9b4b5a4d958f9728025ae63d4083fca9cb71066f58b1be201d8b11",
+    "datasets/semianalysisai___cc-traces-weka-062126/default/0.0.0/23f152f6f0f9399a85901b89a6458def0ef16729/cc-traces-weka-062126-train-00001-of-00004.arrow": "2fd7c2bbdb50712ada9b40a7c90e8f78f3e4a7ae5211cfb44cfb0b53d3d99e09",
+    "datasets/semianalysisai___cc-traces-weka-062126/default/0.0.0/23f152f6f0f9399a85901b89a6458def0ef16729/dataset_info.json": "428a5cf5eac96659dcc99e53488d34017cbdb18a3c37e6f3bc3519dd67ac1c26",
+    "datasets/semianalysisai___cc-traces-weka-062126/default/0.0.0/23f152f6f0f9399a85901b89a6458def0ef16729/cc-traces-weka-062126-train-00002-of-00004.arrow": "4899e882ba93d81bc47968024224687f9036c8029edf4416637a05bf9e73c761",
+    "datasets/semianalysisai___cc-traces-weka-062126/default/0.0.0/23f152f6f0f9399a85901b89a6458def0ef16729/cc-traces-weka-062126-train-00000-of-00004.arrow": "97da0d89137e75c9a90043cb02a69ce06de0e477e18b28e76f15f7ca74a9487b"
+  }
+}

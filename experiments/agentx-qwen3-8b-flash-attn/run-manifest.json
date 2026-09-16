@@ -1,0 +1,35 @@
+{
+  "article": "https://vllm.ai/blog/2026-09-08-vllm-agentx",
+  "methodology": "https://inferencex.semianalysis.com/agentx/methodology",
+  "harness_commit": "56a0cf70f4c0359454ee4bd15a17770b541a3e3e",
+  "dataset": "semianalysisai/cc-traces-weka-062126",
+  "dataset_revision": "23f152f6f0f9399a85901b89a6458def0ef16729",
+  "vllm_version": "0.28.0+agentrix.g8bba39c674",
+  "gpu_indices": [
+    1
+  ],
+  "gpu_count": 1,
+  "model": "Qwen3-8B",
+  "attention_backend": "FLASH_ATTN",
+  "max_model_len": 131072,
+  "rope_scaling": {
+    "rope_type": "yarn",
+    "factor": 4.0,
+    "original_max_position_embeddings": 32768
+  },
+  "context_filter": "official harness whole-trace peak input+output <= 131072; no request truncation",
+  "concurrency": [
+    1,
+    4,
+    8
+  ],
+  "measurement_seconds_per_point": 3600,
+  "trajectory_start_ratios": [
+    0.25,
+    0.75
+  ],
+  "warmup_requests_per_lane": 10,
+  "seed": 20260707,
+  "scope": "Same 82/393 whole-trace 128K subset, model, GPU, harness, seed and parameters as ForkAttention; only attention backend changed.",
+  "comparison_baseline": "../agentx-qwen3-8b"
+}
