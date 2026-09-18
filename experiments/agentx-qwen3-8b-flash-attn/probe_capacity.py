@@ -1,4 +1,9 @@
-"""AgentX capacity observations and scheduling comparisons on the server."""
+"""AgentX capacity observations and experimental policy comparisons on the server.
+
+Policy sweeps explicitly opt in to default-off candidates. A successful run means
+the measurement passed validation, not that the candidate improved performance.
+Adaptive-prefill runs shorter than 900 seconds are non-submission screening only.
+"""
 
 import argparse
 import fcntl
@@ -12,6 +17,7 @@ import signal
 import subprocess
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 _last_sample = 0.0
@@ -19,6 +25,103 @@ _failures = 0
 _stored = {}
 _evicted = {}
 _lookup_seen = {}
+
+
+def install_agent_hints():
+    """Forward existing runtime tree IDs, without changing replay or prompts."""
+    from aiperf.endpoints.openai_chat import ChatEndpoint
+
+    original = ChatEndpoint.format_payload
+    if getattr(original, "_agentrix_session_hints", False):
+        return
+
+    def format_payload(self, request_info):
+        payload = original(self, request_info)
+        sid = request_info.x_correlation_id
+        root = request_info.root_correlation_id or sid
+        parent = request_info.parent_correlation_id
+        if not sid or not root or (parent and not request_info.root_correlation_id):
+            raise ValueError("AgentX request is missing its runtime session tree")
+        payload["session_id"] = sid
+        params = dict(payload.get("kv_transfer_params") or {})
+        params["agentrix_session"] = {"root_session_id": root}
+        if parent:
+            params["agentrix_session"]["parent_session_id"] = parent
+        payload["kv_transfer_params"] = params
+        audit = Path(os.environ["AGENTRIX_SESSION_HINT_AUDIT"])
+        with (audit / f"hints-{os.getpid()}.jsonl").open("a") as stream:
+            stream.write(
+                json.dumps(
+                    {
+                        "request_id": request_info.x_request_id,
+                        "session_id": sid,
+                        "root_session_id": root,
+                        "parent_session_id": parent,
+                    }
+                )
+                + "\n"
+            )
+        return payload
+
+    format_payload._agentrix_session_hints = True
+    ChatEndpoint.format_payload = format_payload
+
+
+def validate_agent_hints(part):
+    sent = {}
+    for path in (part / "hints").glob("hints-*.jsonl"):
+        for line in path.read_text().splitlines():
+            record = json.loads(line)
+            sent[record["request_id"]] = record
+    checked = 0
+    children = 0
+    for line in (part / "bench/profile_export.jsonl").read_text().splitlines():
+        meta = json.loads(line)["metadata"]
+        expected = meta.get("root_correlation_id") or meta["x_correlation_id"]
+        actual = sent.get(meta["x_request_id"])
+        if (
+            actual is None
+            or actual["session_id"] != meta["x_correlation_id"]
+            or actual["root_session_id"] != expected
+        ):
+            raise RuntimeError("AgentX session hints do not match replay metadata")
+        checked += 1
+        children += meta.get("agent_depth", 0) > 0
+    if not checked or not children:
+        raise RuntimeError("Session comparison did not exercise Agent branches")
+    (part / "hints-validated.json").write_text(
+        json.dumps({"requests": checked, "child_requests": children}) + "\n"
+    )
+
+
+def install_policy_source(staged, root):
+    """Install reviewed Python files only after the preceding run releases its lock."""
+    manifest = json.loads((staged / "manifest.json").read_text())
+    replacements = []
+    for name, hashes in manifest["files"].items():
+        rel = Path(name)
+        if rel.is_absolute() or ".." in rel.parts or rel.parts[:2] != ("vllm", "vllm"):
+            raise ValueError("Policy stage may only replace vLLM Python modules")
+        target = root / rel
+        data = (staged / "files" / rel).read_bytes()
+        if hashlib.sha256(data).hexdigest() != hashes["after"]:
+            raise RuntimeError(f"Staged source changed: {name}")
+        current = hashlib.sha256(target.read_bytes()).hexdigest()
+        if current not in (hashes["before"], hashes["after"]):
+            raise RuntimeError(f"Server source diverged: {name}")
+        compile(data, str(target), "exec")
+        replacements.append((target, rel, data, current == hashes["after"]))
+    for target, rel, data, installed in replacements:
+        if installed:
+            continue
+        backup = staged / "original" / rel
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        if not backup.exists():
+            backup.write_bytes(target.read_bytes())
+        temporary = target.with_suffix(".py.agentrix-stage")
+        temporary.write_bytes(data)
+        temporary.replace(target)
+    return {name: entry["after"] for name, entry in manifest["files"].items()}
 
 
 def cache_history(manager, request, cached):
@@ -185,6 +288,56 @@ def stop_server(pid):
     raise RuntimeError("Benchmark server did not stop")
 
 
+def cleanup_offload_cache(part):
+    """Remove only this stopped server's unreferenced CPU offload mmap files."""
+    log = part / "server.log"
+    if not log.exists():
+        return
+    content = log.read_text(errors="replace")
+    paths = {
+        Path(name)
+        for name in re.findall(
+            r"Created mmap file (/dev/shm/vllm_offload_[0-9a-f-]+\.mmap)",
+            content,
+        )
+        if Path(name).exists()
+    }
+    if not paths:
+        return
+    pid_file = part / "server.pid"
+    pids = set(re.findall(r"\((?:EngineCore\S*|Worker\S*) pid=(\d+)\)", content))
+    if pid_file.exists():
+        pids.add(pid_file.read_text().strip())
+    for pid in pids:
+        stat = Path("/proc") / pid / "stat"
+        if stat.exists() and not stat.read_text().split(") ", 1)[1].startswith("Z"):
+            raise RuntimeError("Cannot remove offload cache of a running server")
+    targets = {str(path) for path in paths}
+    for proc in Path("/proc").iterdir():
+        try:
+            if not proc.name.isdigit() or proc.stat().st_uid != os.getuid():
+                continue
+            maps = (proc / "maps").read_text()
+            if any(name in maps for name in targets):
+                raise RuntimeError(f"Offload cache is still in use by PID {proc.name}")
+            for fd in (proc / "fd").iterdir():
+                try:
+                    target = os.readlink(fd)
+                except FileNotFoundError:
+                    continue
+                if target in targets:
+                    raise RuntimeError(
+                        f"Offload cache is still in use by PID {proc.name}"
+                    )
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+    for path in paths:
+        if path.is_symlink() or path.stat().st_uid != os.getuid():
+            raise RuntimeError(f"Unexpected offload cache owner: {path}")
+        path.unlink()
+        print("REMOVED stopped server cache", path, flush=True)
+
+
 def run():
     root = Path("/mnt/sda1/hwx/Agentrix")
     baseline = root / "experiments/agentx-qwen3-8b-flash-attn"
@@ -287,7 +440,7 @@ def run():
     print("DONE", run_dir, flush=True)
 
 
-def check_offload_roundtrip(part):
+def check_offload_roundtrip(part, mixed=False, reset_after=False):
     def post(path, body):
         request = urllib.request.Request(
             "http://127.0.0.1:18000" + path,
@@ -320,6 +473,10 @@ def check_offload_roundtrip(part):
         "seed": 20260707,
         "max_tokens": 32,
         "ignore_eos": True,
+        "session_id": "agentrix-offload-smoke",
+        "kv_transfer_params": {
+            "agentrix_session": {"root_session_id": "agentrix-offload-smoke"}
+        },
     }
     initial = metrics()
     first = post("/v1/completions", payload)
@@ -332,6 +489,13 @@ def check_offload_roundtrip(part):
         time.sleep(1)
     else:
         raise RuntimeError("CPU offload did not store KV data during smoke check")
+    gpu_hit = post("/v1/completions", payload)
+    same_gpu_output = first["choices"][0]["text"] == gpu_hit["choices"][0]["text"]
+    gpu_cached_tokens = gpu_hit["usage"]["prompt_tokens_details"]["cached_tokens"]
+    after_gpu_hit = metrics()
+    gpu_load_bytes = counter(after_gpu_hit, load_name) - counter(stored, load_name)
+    if not same_gpu_output or gpu_cached_tokens <= 0 or gpu_load_bytes != 0:
+        raise RuntimeError("GPU prefix reuse changed output or missed the cache")
     for _ in range(30):
         if post("/reset_prefix_cache?reset_external=false", {})["success"]:
             break
@@ -348,15 +512,41 @@ def check_offload_roundtrip(part):
     else:
         raise RuntimeError("CPU offload did not restore KV data after GPU cache reset")
     same = first["choices"][0]["text"] == second["choices"][0]["text"]
+    mixed_result = None
+    if mixed:
+        cold_payload = dict(
+            payload,
+            prompt="A separate cold session.\n" + payload["prompt"] * 8,
+            max_tokens=128,
+            session_id="agentrix-smoke-cold",
+            kv_transfer_params={
+                "agentrix_session": {"root_session_id": "agentrix-smoke-cold"}
+            },
+        )
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            cold = pool.submit(post, "/v1/completions", cold_payload)
+            # Let the cold prefill enter the engine before its cached neighbor.
+            time.sleep(0.05)
+            warm = pool.submit(post, "/v1/completions", payload).result(timeout=120)
+            cold_result = cold.result(timeout=120)
+        mixed_result = {
+            "same_output": first["choices"][0]["text"] == warm["choices"][0]["text"],
+            "warm": warm,
+            "cold": cold_result,
+        }
     (part / "roundtrip.json").write_text(
         json.dumps(
             {
                 "first": first,
                 "restored": second,
                 "same_output": same,
+                "same_gpu_output": same_gpu_output,
+                "gpu_cached_tokens": gpu_cached_tokens,
+                "gpu_hit_cpu_load_bytes": gpu_load_bytes,
                 "loaded_bytes": loaded_bytes,
                 "stored_bytes": counter(stored, store_name)
                 - counter(initial, store_name),
+                "mixed": mixed_result,
             },
             indent=2,
         )
@@ -366,13 +556,63 @@ def check_offload_roundtrip(part):
     (part / "metrics-after.prom").write_text(restored)
     if not same:
         raise RuntimeError("Output changed after CPU KV cache roundtrip")
+    if mixed_result is not None and (
+        not mixed_result["same_output"]
+        or mixed_result["warm"]["usage"]["prompt_tokens_details"]["cached_tokens"] <= 0
+    ):
+        raise RuntimeError("Mixed cold/warm smoke changed output or missed the cache")
+    if reset_after:
+        for _ in range(30):
+            if post("/reset_prefix_cache?reset_external=true", {})["success"]:
+                break
+            time.sleep(1)
+        else:
+            raise RuntimeError("Could not clear GPU/CPU caches after smoke check")
+        path = part / "roundtrip.json"
+        result = json.loads(path.read_text())
+        result["cache_reset_after_smoke"] = True
+        path.write_text(json.dumps(result, indent=2) + "\n")
 
 
-def finish_prefill_after(previous, arm):
-    """Finish the selected arms and retire the original four-arm controller."""
+def validate_comparison_result(part, screening=False):
+    profile = json.loads((part / "bench/profile_export_aiperf.json").read_text())
+    if (
+        (part / "bench.exit").read_text().strip() != "0"
+        or profile["error_summary"]
+        or profile["was_cancelled"]
+    ):
+        raise RuntimeError(f"{part.name} benchmark has errors or was cancelled")
+    metadata = profile["metadata"]
+    if screening:
+        # AgentX requires >=900 seconds for submissions. Short screening keeps
+        # the explicit invalid-submission stamp; only the duration lock may differ.
+        logs = (part / "bench.log").read_text() + (
+            part / "bench/logs/aiperf.log"
+        ).read_text()
+        violations = set(
+            re.findall(r"Scenario violation \(override active\): ([^:]+):", logs)
+        )
+        if (
+            metadata.get("submission_valid") is not False
+            or set(metadata.get("submission_invalid_reasons", []))
+            != {"unsafe_override"}
+            or violations != {"--benchmark-duration"}
+        ):
+            raise RuntimeError(f"{part.name} screening violated more than duration")
+    elif not metadata.get("submission_valid"):
+        raise RuntimeError(f"{part.name} benchmark failed scenario validation")
+    return profile
+
+
+def finish_comparison_after(previous, arm):
+    """Keep completed arms and retire later arms of an owned comparison."""
     baseline = previous.parent
-    if Path((baseline / "prefill-sweep-latest").read_text().strip()) != previous:
-        raise RuntimeError("The selected prefill run is no longer current")
+    match = re.fullmatch(r"(prefill-sweep|offload-sweep)-\d{8}-\d{6}", previous.name)
+    if match is None:
+        raise ValueError("Only prefill and offload comparisons can be shortened")
+    mode = match[1]
+    if Path((baseline / f"{mode}-latest").read_text().strip()) != previous:
+        raise RuntimeError("The selected comparison is no longer current")
     manifest_path = previous / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
     order = manifest["order"]
@@ -389,6 +629,15 @@ def finish_prefill_after(previous, arm):
         time.sleep(0.25)
     for name in selected:
         part = previous / name
+        if name in manifest.get("smoke_arms", []):
+            smoke = json.loads((part / "roundtrip.json").read_text())
+            if (
+                (part / "status").read_text().strip() != "success"
+                or not smoke["same_output"]
+                or smoke["loaded_bytes"] <= 0
+            ):
+                raise RuntimeError(f"Cannot finish run: {name} smoke check failed")
+            continue
         profile = json.loads((part / "bench/profile_export_aiperf.json").read_text())
         if (
             (part / "bench.exit").read_text().strip() != "0"
@@ -398,14 +647,17 @@ def finish_prefill_after(previous, arm):
         ):
             raise RuntimeError(f"Cannot finish run: {name} has invalid results")
 
-    pid = int((baseline / "prefill-sweep-controller.pid").read_text())
+    controller_pid = previous / "controller.pid"
+    if not controller_pid.exists():
+        controller_pid = baseline / f"{mode}-controller.pid"
+    pid = int(controller_pid.read_text())
     command = Path(f"/proc/{pid}/cmdline")
     if command.exists() and command.read_bytes():
         args = command.read_bytes().split(b"\0")
-        if b"--prefill-sweep" not in args or not any(
+        if ("--" + mode).encode() not in args or not any(
             arg.endswith(b"/probe_capacity.py") for arg in args
         ):
-            raise RuntimeError("PID is not the preceding prefill controller")
+            raise RuntimeError("PID is not the preceding comparison controller")
         os.kill(pid, signal.SIGTERM)
         for _ in range(180):
             stat = Path(f"/proc/{pid}/stat")
@@ -413,7 +665,7 @@ def finish_prefill_after(previous, arm):
                 break
             time.sleep(1)
         else:
-            raise RuntimeError("Preceding prefill controller did not stop")
+            raise RuntimeError("Preceding comparison controller did not stop")
     for name in order:
         pid_file = previous / name / "server.pid"
         if pid_file.exists():
@@ -435,6 +687,25 @@ def finish_prefill_after(previous, arm):
     print("FINISHED selected arms", selected, "SKIPPED", skipped, flush=True)
 
 
+def verify_upstream_runtime(runtime):
+    """Check the separately installed official wheel before each benchmark arm."""
+    manifest = json.loads((runtime / "release-manifest.json").read_text())
+    if (
+        manifest["version"] != "0.28.0+cu129"
+        or manifest["upstream_commit"] != "2cf0a6915ce544dc493a0990f2ea38d81601128a"
+        or manifest["wheel_sha256"]
+        != "8ec943b66a0c6b4351d0778e99d7bacfca5788dd8eedd49425092bacb61c4397"
+    ):
+        raise RuntimeError("Baseline must use the official v0.28.0 CUDA 12.9 wheel")
+    for name, expected in manifest["file_sha256"].items():
+        path = runtime / name
+        with path.open("rb") as stream:
+            actual = hashlib.file_digest(stream, "sha256").hexdigest()
+        if actual != expected:
+            raise RuntimeError(f"Official release file changed: {name}")
+    return manifest
+
+
 def run_comparison(
     duration,
     mode="capacity-ab",
@@ -442,17 +713,27 @@ def run_comparison(
     kv_cache_bytes=None,
     after_run=None,
     after_arm=None,
+    policy_source=None,
+    include_arc=False,
+    upstream_env=None,
+    resume_run=None,
+    warmup_requests_per_lane=10,
 ):
     root = Path("/mnt/sda1/hwx/Agentrix")
     baseline = root / "experiments/agentx-qwen3-8b-flash-attn"
     source = root / "vllm/vllm/v1/core/sched/scheduler.py"
+    upstream = verify_upstream_runtime(upstream_env) if upstream_env else None
+    if upstream is not None:
+        source = upstream_env / upstream["package_root"] / "v1/core/sched/scheduler.py"
     source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    adapter_hash = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    expected_kv_tokens = None
     if after_run is not None:
         previous = Path(after_run).resolve()
         if previous.parent != baseline or not (previous / "status").is_file():
             raise ValueError("--after-run must name an existing benchmark run")
         if after_arm is not None:
-            finish_prefill_after(previous, after_arm)
+            finish_comparison_after(previous, after_arm)
         print("WAIT", previous, flush=True)
         while True:
             status = (previous / "status").read_text().strip()
@@ -461,8 +742,34 @@ def run_comparison(
             if status == "failed":
                 raise RuntimeError("Preceding benchmark failed; comparison not started")
             time.sleep(30)
+        if upstream_env is not None:
+            reference = json.loads((previous / "manifest.json").read_text())
+            if (
+                reference["kv_cache_memory_bytes"] != kv_cache_bytes
+                or reference["duration_seconds"] != duration
+                or reference["concurrency"] != 8
+                or reference["seed"] != 20260707
+            ):
+                raise RuntimeError("Official baseline and reference settings differ")
+            capacities = {
+                int((previous / name / "kv-cache-tokens").read_text())
+                for name in reference["order"]
+            }
+            if len(capacities) != 1:
+                raise RuntimeError("Reference has inconsistent GPU KV cache capacity")
+            expected_kv_tokens = capacities.pop()
     prefix = mode
-    run_dir = baseline / (prefix + "-" + time.strftime("%Y%m%d-%H%M%S"))
+    run_dir = (
+        resume_run.resolve()
+        if resume_run
+        else baseline / (prefix + "-" + time.strftime("%Y%m%d-%H%M%S"))
+    )
+    if resume_run and (
+        run_dir.parent != baseline
+        or re.fullmatch(prefix + r"-\d{8}-\d{6}", run_dir.name) is None
+        or not (run_dir / "manifest.json").is_file()
+    ):
+        raise ValueError("--resume-run must name an existing run of the same mode")
     arms = [("baseline", False, 0, 0), ("bypass", True, 0, 0)]
     if mode == "prefill-sweep":
         arms = [("baseline", False, 0, 0)] + [
@@ -472,54 +779,203 @@ def run_comparison(
         arms = [("smoke_cpu32", False, 0, 32), ("baseline", False, 0, 0)] + [
             (f"cpu{gib}", False, 0, gib) for gib in (32, 64)
         ]
+    elif mode == "session-sweep":
+        arms = [
+            ("smoke_session", False, 0, 32),
+            ("lru", False, 0, 32),
+            ("session_lru", False, 0, 32),
+        ]
+        if include_arc:
+            arms.insert(2, ("arc", False, 0, 32))
+    elif mode == "gpu-session-sweep":
+        arms = [
+            ("smoke_gpu_session", False, 0, 32),
+            ("lru", False, 0, 32),
+            ("gpu_session", False, 0, 32),
+        ]
+    elif mode == "adaptive-prefill-sweep":
+        arms = [
+            ("lru", False, 0, 32),
+            ("adaptive", False, 0, 32),
+        ]
+    elif mode == "upstream-sweep":
+        arms = [
+            ("smoke_upstream_cpu32", False, 0, 32),
+            ("upstream_gpu", False, 0, 0),
+            ("upstream_lru_cpu32", False, 0, 32),
+        ]
+    session_sweep = mode == "session-sweep"
+    gpu_session_sweep = mode == "gpu-session-sweep"
+    adaptive_sweep = mode == "adaptive-prefill-sweep"
+    screening = adaptive_sweep and duration < 900
+    agent_hints = (
+        session_sweep or gpu_session_sweep or adaptive_sweep or mode == "upstream-sweep"
+    )
+    policies = {
+        name: ("session_lru" if name == "smoke_session" else name)
+        if session_sweep
+        else "lru"
+        for name, _, _, _ in arms
+    }
+    policy_config = {"retention_seconds": 120, "protected_fraction": 0.5}
+    gpu_retention_config = {
+        "protected_fraction": 0.25,
+        "default_seconds": 15.0,
+        "min_seconds": 2.0,
+        "max_seconds": 30.0,
+        "max_sessions": 256,
+    }
     if reverse:
-        arms.reverse()
+        arms = [arm for arm in arms if arm[0].startswith("smoke_")] + [
+            arm for arm in reversed(arms) if not arm[0].startswith("smoke_")
+        ]
     # Share the original matrix lock so two experiments cannot own GPU 1.
     with (baseline / "matrix.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | (0 if after_run else fcntl.LOCK_NB))
-        run_dir.mkdir()
+        run_dir.mkdir(exist_ok=bool(resume_run))
+        if resume_run:
+            pid = int((run_dir / "controller.pid").read_text())
+            stat = Path(f"/proc/{pid}/stat")
+            if stat.exists() and not stat.read_text().split(") ", 1)[1].startswith("Z"):
+                raise RuntimeError("Comparison controller is still running")
+        (run_dir / "controller.pid").write_text(str(os.getpid()))
         (baseline / (prefix + "-latest")).write_text(str(run_dir))
-        (run_dir / "manifest.json").write_text(
-            json.dumps(
+        policy_hashes = {}
+        if policy_source is not None:
+            stop_server(int((baseline / "server.pid").read_text()))
+            try:
+                policy_hashes = install_policy_source(policy_source, root)
+                source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+            except BaseException:
+                (run_dir / "status").write_text("failed")
+                raise
+        manifest = {
+            "duration_seconds": duration,
+            "grace_seconds": 300,
+            "concurrency": 8,
+            "warmup_requests_per_lane": warmup_requests_per_lane,
+            "inline_smoke": adaptive_sweep,
+            "screening_only": screening,
+            "seed": 20260707,
+            "order": [name for name, _, _, _ in arms],
+            "smoke_arms": [name for name, _, _, _ in arms if name.startswith("smoke_")],
+            "scheduler_sha256": source_hash,
+            "kv_cache_memory_bytes": kv_cache_bytes,
+            "long_prefill_token_thresholds": {name: cap for name, _, cap, _ in arms},
+            "capacity_bypass": {name: enabled for name, enabled, _, _ in arms},
+            "cpu_offload_gib": {name: gib for name, _, _, gib in arms},
+            "offload_policy": policies,
+            "session_policy_config": policy_config if session_sweep else None,
+            "gpu_session_retention": gpu_retention_config
+            if gpu_session_sweep
+            else None,
+            "adaptive_prefill": {
+                "mixed_prefill_tokens": 2048,
+                "short_request_tokens": 1024,
+                "max_full_prefix_probes": 2,
+                "max_deferred_steps": 4,
+                "lookahead": 8,
+                "enabled": {name: name != "lru" for name, _, _, _ in arms},
+            }
+            if adaptive_sweep
+            else None,
+            "policy_source_sha256": policy_hashes,
+            "agent_tree_hints": agent_hints,
+            "upstream_release": {
+                key: value for key, value in upstream.items() if key != "file_sha256"
+            }
+            if upstream is not None
+            else None,
+            "harness_adapter_sha256": adapter_hash,
+            "offload_prompt_only": True,
+            "offload_blocks_per_chunk": 1,
+            "offload_store_threshold": 0,
+            "after_run": str(after_run) if after_run else None,
+            "after_arm": after_arm,
+            "lookahead": 8,
+            "max_overtakes_per_request": 4,
+            "observation_hooks": False,
+        }
+        if resume_run:
+            previous = json.loads((run_dir / "manifest.json").read_text())
+            for key in manifest.keys() - {
+                "harness_adapter_sha256",
+                "after_run",
+                "after_arm",
+                "upstream_release",
+            }:
+                if previous.get(key) != manifest[key]:
+                    raise RuntimeError(f"Cannot resume with changed settings: {key}")
+            previous.setdefault("resume_history", []).append(
                 {
-                    "duration_seconds": duration,
-                    "grace_seconds": 300,
-                    "concurrency": 8,
-                    "seed": 20260707,
-                    "order": [name for name, _, _, _ in arms],
-                    "smoke_arms": [
-                        name for name, _, _, _ in arms if name.startswith("smoke_")
-                    ],
-                    "scheduler_sha256": source_hash,
-                    "kv_cache_memory_bytes": kv_cache_bytes,
-                    "long_prefill_token_thresholds": {
-                        name: cap for name, _, cap, _ in arms
-                    },
-                    "capacity_bypass": {name: enabled for name, enabled, _, _ in arms},
-                    "cpu_offload_gib": {name: gib for name, _, _, gib in arms},
-                    "offload_policy": "lru",
-                    "offload_prompt_only": True,
-                    "offload_blocks_per_chunk": 1,
-                    "offload_store_threshold": 0,
-                    "after_run": str(after_run) if after_run else None,
-                    "after_arm": after_arm,
-                    "lookahead": 8,
-                    "max_overtakes_per_request": 4,
-                    "observation_hooks": False,
-                },
-                indent=2,
+                    "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "controller_sha256": adapter_hash,
+                    "pid": os.getpid(),
+                }
             )
-            + "\n"
-        )
+            manifest = previous
+        (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        (run_dir / "status").write_text("resuming" if resume_run else "starting")
         print("RUN", run_dir, flush=True)
         serve_template = (baseline / "serve.sh").read_text()
+        if upstream_env is not None:
+            (run_dir / "release-manifest.json").write_text(
+                json.dumps(upstream, indent=2) + "\n"
+            )
+            serve_template = (
+                serve_template.replace(
+                    "export PYTHONPATH=$ROOT/vllm",
+                    "unset PYTHONPATH\nexport VLLM_CACHE_ROOT="
+                    + shlex.quote(str(upstream_env / "cache")),
+                )
+                .replace('cd "$ROOT/vllm"', "cd " + shlex.quote(str(upstream_env)))
+                .replace(
+                    "exec .venv/bin/vllm serve ",
+                    "exec " + shlex.quote(str(upstream_env / "bin/vllm")) + " serve ",
+                )
+                .replace("$ROOT/vllm/.venv/bin", str(upstream_env / "bin"))
+            )
         matrix_template = (baseline / "run-matrix.sh").read_text()
-        expected_kv_tokens = None
         try:
             stop_server(int((baseline / "server.pid").read_text()))
             for name, enabled, cap, cpu_gib in arms:
+                if (
+                    upstream_env is not None
+                    and verify_upstream_runtime(upstream_env) != upstream
+                ):
+                    raise RuntimeError("Official runtime changed between arms")
+                if (
+                    hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+                    != adapter_hash
+                ):
+                    raise RuntimeError("Benchmark adapter changed during comparison")
                 if hashlib.sha256(source.read_bytes()).hexdigest() != source_hash:
                     raise RuntimeError("Scheduler source changed during comparison")
+                for path, expected in policy_hashes.items():
+                    if (
+                        hashlib.sha256((root / path).read_bytes()).hexdigest()
+                        != expected
+                    ):
+                        raise RuntimeError(f"Policy source changed: {path}")
+                part = run_dir / name
+                if resume_run and part.exists():
+                    if (part / "status").read_text().strip() != "success":
+                        raise RuntimeError(f"Cannot reuse incomplete arm: {name}")
+                    if name.startswith("smoke_"):
+                        smoke = json.loads((part / "roundtrip.json").read_text())
+                        if not smoke["same_output"] or smoke["loaded_bytes"] <= 0:
+                            raise RuntimeError("Cannot reuse failed smoke check")
+                    else:
+                        validate_comparison_result(part, screening)
+                        if agent_hints:
+                            validate_agent_hints(part)
+                    tokens = int((part / "kv-cache-tokens").read_text())
+                    if expected_kv_tokens is not None and expected_kv_tokens != tokens:
+                        raise RuntimeError("Completed arms have different KV capacity")
+                    expected_kv_tokens = tokens
+                    cleanup_offload_cache(part)
+                    print("REUSE completed arm", name, flush=True)
+                    continue
                 if cpu_gib:
                     available = (
                         int(
@@ -539,7 +995,6 @@ def run_comparison(
                         raise RuntimeError(
                             "Insufficient shared memory for CPU KV cache"
                         )
-                part = run_dir / name
                 part.mkdir()
                 (run_dir / "status").write_text(f"{name}: starting_server")
                 (part / "status").write_text("starting_server")
@@ -547,7 +1002,14 @@ def run_comparison(
                     "RUN=$ROOT/experiments/agentx-qwen3-8b-flash-attn",
                     f"RUN={part}",
                 ).rstrip()
-                config = json.dumps({"agentrix_capacity_bypass": enabled})
+                additional_config = {"agentrix_capacity_bypass": enabled}
+                if adaptive_sweep:
+                    additional_config["agentrix_adaptive_prefill"] = name != "lru"
+                if gpu_session_sweep and name != "lru":
+                    additional_config["agentrix_gpu_session_retention"] = (
+                        gpu_retention_config
+                    )
+                config = json.dumps(additional_config)
                 serve += f" --long-prefill-token-threshold {cap}"
                 if kv_cache_bytes is not None:
                     serve += f" --kv-cache-memory-bytes {kv_cache_bytes}"
@@ -558,19 +1020,27 @@ def run_comparison(
                         "kv_connector_extra_config": {
                             "cpu_bytes_to_use": cpu_gib * 2**30,
                             "blocks_per_chunk": 1,
-                            "eviction_policy": "lru",
+                            "eviction_policy": policies[name],
                             "store_threshold": 0,
                             "offload_prompt_only": True,
                         },
                     }
+                    if policies[name] == "session_lru":
+                        transfer["kv_connector_extra_config"]["cache_policy_config"] = (
+                            policy_config
+                        )
                     serve += " --kv-transfer-config " + shlex.quote(
                         json.dumps(transfer)
                     )
-                serve += " --additional-config " + shlex.quote(config) + "\n"
+                if upstream_env is None:
+                    serve += " --additional-config " + shlex.quote(config)
+                serve += "\n"
                 (part / "serve.sh").write_text(serve)
                 env = dict(os.environ)
                 env.pop("AGENTRIX_CAPACITY_PROBE", None)
-                env["VLLM_SERVER_DEV_MODE"] = "1" if name.startswith("smoke_") else "0"
+                env["VLLM_SERVER_DEV_MODE"] = (
+                    "1" if adaptive_sweep or name.startswith("smoke_") else "0"
+                )
                 server = None
                 bench = None
                 try:
@@ -613,13 +1083,44 @@ def run_comparison(
                     elif kv_tokens != expected_kv_tokens:
                         raise RuntimeError("KV cache capacity changed between arms")
                     print("READY", name, "kv_tokens", kv_tokens, flush=True)
+                    if (
+                        adaptive_sweep
+                        and name != "lru"
+                        and "Adaptive prefill enabled:"
+                        not in (part / "server.log").read_text()
+                    ):
+                        raise RuntimeError("Adaptive prefill was not activated")
+                    if (
+                        gpu_session_sweep
+                        and name != "lru"
+                        and "GPU session retention enabled:"
+                        not in (part / "server.log").read_text()
+                    ):
+                        raise RuntimeError("GPU session retention was not activated")
+                    if upstream_env is not None:
+                        server_log = (part / "server.log").read_text()
+                        if any(
+                            marker not in server_log
+                            for marker in (
+                                "Using V2 Model Runner",
+                                "Using FlashAttention version 3",
+                            )
+                        ):
+                            raise RuntimeError(
+                                "Official baseline runner/backend differs"
+                            )
                     if name.startswith("smoke_"):
                         (run_dir / "status").write_text(f"{name}: checking_roundtrip")
                         (part / "status").write_text("checking_roundtrip")
-                        check_offload_roundtrip(part)
+                        check_offload_roundtrip(part, mixed=adaptive_sweep)
                         (part / "status").write_text("success")
                         print("DONE", name, flush=True)
                         continue
+                    if adaptive_sweep:
+                        (run_dir / "status").write_text(f"{name}: checking_roundtrip")
+                        (part / "status").write_text("checking_roundtrip")
+                        check_offload_roundtrip(part, mixed=True, reset_after=True)
+                        print("CHECKED", name, "GPU/CPU and mixed outputs", flush=True)
                     (run_dir / "status").write_text(f"{name}: warmup_and_profiling")
                     (part / "status").write_text("warmup_and_profiling")
                     command = next(
@@ -634,8 +1135,38 @@ def run_comparison(
                             f"--benchmark-duration {duration} --benchmark-grace-period 300",
                         )
                         .replace('"$RUN/c${concurrency}"', str(part / "bench"))
+                        .replace(
+                            "--warmup-requests-per-lane 10",
+                            f"--warmup-requests-per-lane {warmup_requests_per_lane}",
+                        )
                     )
+                    if screening:
+                        command += " --unsafe-override"
                     (part / "command.txt").write_text(command + "\n")
+                    bench_setup = f"cd {baseline}; source ./bench-env.sh; "
+                    if agent_hints:
+                        hooks = part / "hints"
+                        hooks.mkdir()
+                        (hooks / "sitecustomize.py").write_text(
+                            "import os, traceback\n"
+                            "try:\n"
+                            "    from probe_capacity import install_agent_hints\n"
+                            "    install_agent_hints()\n"
+                            "except Exception:\n"
+                            "    traceback.print_exc()\n"
+                            "    os._exit(70)\n"
+                        )
+                        bench_setup += (
+                            "export PYTHONPATH="
+                            + shlex.quote(
+                                str(hooks)
+                                + os.pathsep
+                                + str(Path(__file__).resolve().parent)
+                            )
+                            + " AGENTRIX_SESSION_HINT_AUDIT="
+                            + shlex.quote(str(hooks))
+                            + "; "
+                        )
                     with urllib.request.urlopen(
                         "http://127.0.0.1:18000/metrics", timeout=10
                     ) as response:
@@ -645,7 +1176,7 @@ def run_comparison(
                             [
                                 "bash",
                                 "-c",
-                                f"cd {baseline}; source ./bench-env.sh; exec {command}",
+                                bench_setup + f"exec {command}",
                             ],
                             stdout=output,
                             stderr=subprocess.STDOUT,
@@ -657,19 +1188,7 @@ def run_comparison(
                         "http://127.0.0.1:18000/metrics", timeout=10
                     ) as response:
                         (part / "metrics-after.prom").write_bytes(response.read())
-                    if bench.returncode:
-                        raise RuntimeError(f"Benchmark exited: {bench.returncode}")
-                    profile = json.loads(
-                        (part / "bench/profile_export_aiperf.json").read_text()
-                    )
-                    if profile["error_summary"] or profile["was_cancelled"]:
-                        raise RuntimeError(
-                            f"{name} benchmark has errors or was cancelled"
-                        )
-                    if not profile["metadata"].get("submission_valid"):
-                        raise RuntimeError(
-                            f"{name} benchmark failed scenario validation"
-                        )
+                    validate_comparison_result(part, screening)
                     phase = re.search(
                         r"Phase profiling \(profiling\) complete \| "
                         r"completed=(\d+), cancelled=(\d+), errors=(\d+)",
@@ -677,6 +1196,8 @@ def run_comparison(
                     )
                     if phase is None or int(phase[2]) or int(phase[3]):
                         raise RuntimeError(f"{name} profiling incomplete or has errors")
+                    if agent_hints:
+                        validate_agent_hints(part)
                     (part / "status").write_text("success")
                 except BaseException:
                     (part / "status").write_text("failed")
@@ -694,6 +1215,7 @@ def run_comparison(
                         if server is not None and server.poll() is None:
                             stop_server(server.pid)
                             server.wait(timeout=10)
+                        cleanup_offload_cache(part)
                 print("DONE", name, flush=True)
             (run_dir / "status").write_text("success")
         except BaseException:
@@ -708,30 +1230,91 @@ if __name__ == "__main__":
     mode.add_argument("--ab", action="store_true")
     mode.add_argument("--prefill-sweep", action="store_true")
     mode.add_argument("--offload-sweep", action="store_true")
+    mode.add_argument("--session-sweep", action="store_true")
+    mode.add_argument("--gpu-session-sweep", action="store_true")
+    mode.add_argument("--adaptive-prefill-sweep", action="store_true")
+    mode.add_argument("--upstream-sweep", action="store_true")
+    parser.add_argument("--policy-source", type=Path)
+    parser.add_argument("--upstream-env", type=Path)
+    parser.add_argument("--resume-run", type=Path)
     parser.add_argument("--after-run", type=Path)
     parser.add_argument("--after-arm", choices=["baseline", "cap512", "cap1024"])
     parser.add_argument("--kv-cache-bytes", type=int)
-    parser.add_argument("--duration", type=int, default=3600)
     parser.add_argument(
-        "--reverse", action="store_true", help="Run bypass before baseline"
+        "--warmup-requests-per-lane",
+        type=int,
+        default=10,
+        help="Warmup turns per lane; use 2 for adaptive-prefill screening",
+    )
+    parser.add_argument(
+        "--duration",
+        type=int,
+        default=900,
+        help="Measured seconds per arm; default 900, or >=300 for adaptive screening",
+    )
+    parser.add_argument(
+        "--include-arc",
+        action="store_true",
+        help="Add ARC to the session-policy comparison after initial screening",
+    )
+    parser.add_argument(
+        "--reverse",
+        action="store_true",
+        help="Reverse measured arms after smoke checks",
     )
     args = parser.parse_args()
-    comparison = args.ab or args.prefill_sweep or args.offload_sweep
-    if args.reverse and not args.ab:
-        parser.error("--reverse requires --ab")
-    if (args.prefill_sweep or args.offload_sweep) and args.kv_cache_bytes is None:
+    comparison = (
+        args.ab
+        or args.prefill_sweep
+        or args.offload_sweep
+        or args.session_sweep
+        or args.gpu_session_sweep
+        or args.adaptive_prefill_sweep
+        or args.upstream_sweep
+    )
+    if args.reverse and not (
+        args.ab or args.gpu_session_sweep or args.adaptive_prefill_sweep
+    ):
+        parser.error(
+            "--reverse requires --ab, --gpu-session-sweep or --adaptive-prefill-sweep"
+        )
+    if (
+        args.prefill_sweep
+        or args.offload_sweep
+        or args.session_sweep
+        or args.gpu_session_sweep
+        or args.adaptive_prefill_sweep
+        or args.upstream_sweep
+    ) and args.kv_cache_bytes is None:
         parser.error("Sweeps require --kv-cache-bytes")
+    if (
+        args.session_sweep or args.gpu_session_sweep or args.adaptive_prefill_sweep
+    ) != (args.policy_source is not None):
+        parser.error("Policy sweeps and --policy-source must be supplied together")
+    if args.upstream_sweep != (args.upstream_env is not None):
+        parser.error("--upstream-sweep and --upstream-env must be supplied together")
+    if args.include_arc and not args.session_sweep:
+        parser.error("--include-arc requires --session-sweep")
     if args.after_run is not None and not comparison:
         parser.error("--after-run requires a comparison")
+    if args.resume_run is not None and (not comparison or args.after_run is not None):
+        parser.error("--resume-run requires a comparison without --after-run")
     if args.after_arm is not None and (
-        args.after_run is None or not args.offload_sweep
+        args.after_run is None or not (args.offload_sweep or args.session_sweep)
     ):
-        parser.error("--after-arm requires --offload-sweep and --after-run")
+        parser.error("--after-arm requires --after-run and an offload/session sweep")
     if args.kv_cache_bytes is not None and (args.kv_cache_bytes <= 0 or not comparison):
         parser.error("--kv-cache-bytes must be positive and requires a comparison")
+    if args.warmup_requests_per_lane < 1 or (
+        args.warmup_requests_per_lane != 10 and not args.adaptive_prefill_sweep
+    ):
+        parser.error(
+            "Shorter warmup requires --adaptive-prefill-sweep and must be positive"
+        )
     if comparison:
-        if args.duration < 900:
-            parser.error("Comparison runs require at least 900 seconds per arm")
+        min_duration = 300 if args.adaptive_prefill_sweep else 900
+        if args.duration < min_duration:
+            parser.error(f"Comparison requires at least {min_duration} seconds per arm")
 
         def terminate(signum, frame):
             raise SystemExit(128 + signum)
@@ -742,6 +1325,14 @@ if __name__ == "__main__":
             mode = "prefill-sweep"
         elif args.offload_sweep:
             mode = "offload-sweep"
+        elif args.session_sweep:
+            mode = "session-sweep"
+        elif args.gpu_session_sweep:
+            mode = "gpu-session-sweep"
+        elif args.adaptive_prefill_sweep:
+            mode = "adaptive-prefill-sweep"
+        elif args.upstream_sweep:
+            mode = "upstream-sweep"
         run_comparison(
             args.duration,
             mode=mode,
@@ -749,6 +1340,11 @@ if __name__ == "__main__":
             kv_cache_bytes=args.kv_cache_bytes,
             after_run=args.after_run,
             after_arm=args.after_arm,
+            policy_source=args.policy_source,
+            include_arc=args.include_arc,
+            upstream_env=args.upstream_env,
+            resume_run=args.resume_run,
+            warmup_requests_per_lane=args.warmup_requests_per_lane,
         )
     else:
         run()
