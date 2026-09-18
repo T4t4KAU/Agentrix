@@ -16,9 +16,7 @@ The policy is disabled by default. When enabled, it:
 5. lets vLLM use prefix cache or a KV connector on resume, with recomputation
    as the correctness fallback.
 
-Historical Qwen3-0.6B measurements are retained through the
-[historical index](historical_experiments.md#memory), not repeated as current
-performance claims here. Releasing live KV returns blocks to vLLM's reserved
+Releasing live KV returns blocks to vLLM's reserved
 pool; it does not necessarily reduce physical memory shown by `nvidia-smi`.
 
 ## Problem
@@ -184,24 +182,6 @@ classifiers. The label is recorded whether or not the request was trimmed, so
 the learner does not train only on policy-selected samples. State is a
 versioned JSON object and can be saved and restored atomically with
 `predictor.save(path)` and `OnlineHorizonTTLPredictor.load(path)`.
-
-Predictor accuracy is evaluated separately from the memory experiment. A
-controlled dataset contains 2,000 read, search, network, public-test, and build
-events; each of five seeds uses a 70/30 held-out split:
-
-| Predictor metric | Five-seed mean | Min-max |
-|---|---:|---:|
-| Macro six-horizon accuracy | 95.25% | 94.67%-95.78% |
-| Macro Brier score, lower is better | 0.0349 | 0.0327-0.0370 |
-| Shorten/fallback decision accuracy | 92.73% | 91.50%-93.67% |
-| Exact TTL-bucket accuracy | 90.33% | 88.67%-91.83% |
-| TTL within one adjacent bucket | 99.90% | 99.67%-100.00% |
-
-The historical tool trace used in that evaluation contained only short
-`paragraph_search` events, so its 100% fallback accuracy was not evidence of
-cross-tool generalization. This is separate from the later TraceLab dataset.
-Detailed historical calibration records are recoverable through the
-[historical index](historical_experiments.md#memory).
 
 ### Shadow and Active Modes
 
@@ -392,12 +372,7 @@ This hook is useful only when the application keeps one vLLM streaming-input
 session alive across the tool call. A conventional OpenAI request that ends at
 the tool call already releases its request KV and has nothing to trim.
 
-## Historical experiments and current status
-
-Per-run Qwen3-0.6B, LangGraph, fanout-lifecycle and reload results have moved to
-the [historical experiment index](historical_experiments.md#memory).
-Those results do not validate the current CPU/Mooncake restore path, which is
-paused after two TraceLab failures; see [KV memory status](kv_memory_optimization_status.md).
+## Predictor evaluation
 
 The standalone TTL predictor evaluates controlled synthetic tool-duration
 samples, not production tool accuracy. Its mechanism and fallback are described

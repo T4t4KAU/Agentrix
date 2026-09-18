@@ -221,18 +221,6 @@ The CUDA host compiler selected by CMake was GCC 10.2.1 from `devtoolset-10`.
 
 ## 6. Validation on CentOS 7
 
-The transferred model was:
-
-```text
-/root/Qwen3-0.6B-UD-IQ1_S.gguf
-```
-
-Its SHA-256 checksum matched the local source file:
-
-```text
-fcb165efedaee2cfbdefe02bd3bbf22c80cfdb728915fbbe54fa809a8556710a
-```
-
 ### 6.1 CUDA backend correctness
 
 ```bash
@@ -242,15 +230,6 @@ build-cuda-t4/bin/test-backend-ops test \
   -p 'fork=1' \
   -j 4
 ```
-
-Result:
-
-```text
-3/3 tests passed
-Backend CUDA0: OK
-```
-
-The cases included Qwen3-compatible head dimension 128, four queries, and a long shared prefix (`n_common=1024`).
 
 ### 6.2 End-to-end Qwen3 smoke test
 
@@ -269,19 +248,6 @@ build-cuda-t4/bin/llama-parallel \
   -c 4096 \
   -v
 ```
-
-Observed result:
-
-```text
-GPU:             Tesla T4
-fork_attn:       true
-parallel paths:  4
-shared prefix:   273 tokens
-saved KV reads:  819
-cache misses:    0
-```
-
-All four branches completed generation. No CUDA error, crash, or residual GPU process was observed. This was a functional smoke test, not a performance benchmark.
 
 ## 7. Non-blocking Build Warnings
 

@@ -402,35 +402,6 @@ Use deterministic decoding settings when comparing output equality rather than
 throughput. For throughput, keep the same model, dtype, context length, case
 count, branch count, output tokens, and CUDA graph settings across both runs.
 
-## Current Validation Record
-
-The following validation was run on 2026-07-15 on the local RTX 4090 host:
-
-```text
-Model: ${MODEL_PATH}
-GPU: RTX 4090, compute capability (8, 9)
-sgl-kernel extension: sgl_kernel/sm89/common_ops.abi3.so
-SGLang attention backend: fork_attn
-Page size: 16
-Page-major KV layout: enabled
-CUDA graph: disabled for bring-up validation
-```
-
-Validation commands completed successfully:
-
-- kernel registration check;
-- one-case smoke benchmark;
-- two-case, two-branch benchmark smoke.
-
-The multi-branch run logged:
-
-```text
-ForkAttention decode path is enabled.
-```
-
-No `ForkAttention decode falls back`, `Traceback`, `CUDA error`, or
-`RuntimeError` line was found in the validated server log.
-
 ## Updating the SGLang Submodule
 
 Update only when intentionally adopting a newer tested `fork-attn` commit:

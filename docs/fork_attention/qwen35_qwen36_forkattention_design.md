@@ -238,47 +238,7 @@ ForkAttention profile: ... path=eager_forest:enabled ...
 Production performance tests should cover eager and CUDA Graph configurations
 separately. The eager smoke-test throughput is not a production benchmark.
 
-## 8. Validation matrix
-
-### 8.1 CUDA operator
-
-The CUDA tests used FlashAttention as the reference on H20/SM90:
-
-| Geometry | Dtype | Result |
-|---|---|---|
-| Head-128 regression | FP16 | Pass |
-| 24 Q / 4 KV / head-256 | FP16 | Pass |
-| 24 Q / 4 KV / head-256 | BF16 | Pass |
-
-The tolerance was `atol=2e-2, rtol=2e-2`. These tests include a shared prefix,
-private suffixes, split output, and gather; they do more than check custom-op
-registration.
-
-### 8.2 Qwen3.5/Qwen3.6 end-to-end smoke tests
-
-Both models completed a single-GPU smoke test:
-
-- The checkpoints loaded successfully (51.1 GiB reported for Qwen3.5 and
-  51.75 GiB for Qwen3.6).
-- Full-attention layers selected `FORK_ATTN`.
-- ViT selected FlashAttention and GDN selected FlashInfer.
-- Multimodal warmup completed.
-- Eight concurrent requests sharing a 1,514-token prompt all succeeded.
-- The log repeatedly reported `eager_forest:enabled`.
-- Both runs reported a 45.3% prefix-cache hit rate.
-- The request-group wall times were 3.039 seconds for Qwen3.5 and approximately
-  3.04 seconds for Qwen3.6.
-
-The Qwen3.5 run additionally confirmed automatic attention-page alignment to
-784 tokens, eight HTTP 200 responses, and release of all eight H20 GPUs to 1 MiB
-reported usage after shutdown. Both models resolved to the internal architecture
-`Qwen3_5ForConditionalGeneration`, confirming that they use the shared
-head-256/GQA6 backend path without model-name branching.
-
-These are functional smoke tests, not a ForkAttention-versus-FlashAttention
-performance conclusion.
-
-### 8.3 Acceptance criteria
+## 8. Validation criteria
 
 Both models should satisfy all of the following:
 
@@ -288,10 +248,6 @@ Both models should satisfy all of the following:
 4. Two or more shared-prefix branches trigger the forest path.
 5. Output contains no CUDA error, NaN, or truncation at head coordinate 128.
 6. GPU memory is released normally after service shutdown.
-
-The WebLINX validation below supplies the real-image coverage required by
-criterion 3; the earlier single-GPU smoke tests used a synthetic shared text
-prefix.
 
 ## 9. WebLINX 8-DP workload and validation
 
@@ -373,101 +329,6 @@ branches while preventing two independent roots from residing together. The
 script writes raw request traces, CSV/Markdown summaries, server logs, and
 Prometheus metrics for each variant.
 
-### 9.4 Corrected Pressure32K/32 result
-
-The corrected experiment completed all eight multimodal bootstrap requests and
-all 256 branch requests in every arm. Each arm generated exactly 512 bootstrap
-tokens and 65,536 branch tokens. Branch prompt lengths were 29,391 to 32,124
-tokens for FlashAttention and 29,391 to 32,076 tokens for both ForkAttention
-arms, so every request remained below the 32K model limit. No arm reported an
-OOM, request failure, or server error.
-
-| Variant | Bootstrap | Branch wall | Total wall | Branch output tok/s | Total output tok/s | Mean branch latency | P50 TTFT | P95 TTFT |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| FlashAttention, ordinary DP | 14.831 s | 528.169 s | 542.999 s | 124.08 | 120.69 | 247.141 s | 231.231 s | 457.414 s |
-| ForkAttention, ordinary DP | 14.396 s | 546.274 s | 560.670 s | 119.97 | 116.89 | 256.673 s | 251.341 s | 476.821 s |
-| ForkAttention, prefix-aware DP | 14.853 s | 148.652 s | 163.505 s | 440.87 | 400.82 | 49.989 s | 37.214 s | 105.461 s |
-
-Relative to FlashAttention with ordinary DP placement, prefix-aware
-ForkAttention increased branch throughput by 3.55x, shortened the branch phase
-by 71.86%, and increased end-to-end throughput by 3.32x. Mean branch latency,
-P50 TTFT, and P95 TTFT fell by 79.77%, 83.91%, and 76.94%, respectively.
-Relative to ordinary ForkAttention placement, the branch-throughput increase
-was 3.67x. Ordinary ForkAttention was 3.31% slower than FlashAttention in
-branch throughput, confirming that the large result comes from combining
-shared-prefix execution with DP placement and residency rather than from an
-uncontrolled backend-only comparison.
-
-The server-side counters support that interpretation:
-
-| Counter | FlashAttention, ordinary DP | ForkAttention, ordinary DP | ForkAttention, prefix-aware DP |
-|---|---:|---:|---:|
-| Prompt tokens observed | 8,006,279 | 8,004,679 | 8,004,679 |
-| Prompt tokens computed locally | 5,812,647 | 5,696,583 | 869,495 |
-| Prefix-cache hit share | 27.40% | 28.83% | 89.14% |
-| Cumulative prefill time | 3,042.403 s | 3,102.548 s | 797.192 s |
-| Cumulative queue time | 55,977.823 s | 58,237.952 s | 7,530.646 s |
-| Preemptions | 57 | 64 | 27 |
-
-Against FlashAttention, the optimized arm therefore reduced locally computed
-prompt tokens by 85.04%, cumulative prefill time by 73.80%, and cumulative
-queue time by 86.55%. Its multimodal processor cache recorded 256 hits from
-264 queries; the eight misses correspond to the first bootstrap for each
-independent image. The prefix router recorded 256 affinity routes and eight
-long-prefix bootstrap routes, with exactly 33 total requests routed to every
-rank. The client supplied no rank headers.
-
-This is a single-run systems result, not a claim about model quality or pure
-attention-kernel speed. Its tight 84-block hybrid KV configuration still
-caused 27 preemptions in the optimized arm, although that was fewer than both
-ordinary-DP arms. Qwen3.6's 784-token hybrid cache pages make the capacity
-boundary coarser than in the earlier text-only experiment. The optimized
-arm's P50 time per output token also rose from 18.256 ms to 32.181 ms because
-many more branches reached decode concurrently; the much lower queue and
-prefill times dominate the end-to-end result. A capacity sweep and repeated
-runs are required for confidence intervals and a zero-preemption operating
-point.
-
-The validated artifacts are stored on the experiment server under
-`benchmark/results/weblinx_pressure32k_8dp_v1`; generated datasets and result
-files remain Git-ignored.
-
-### 9.5 Initial pinned-rank diagnostic
-
-The formal eager-mode run used 64 requests, 256 forced output tokens per
-request, and identical observed prompt lengths of 29,344 to 30,663 tokens in
-all variants. All three variants completed 64 requests and exactly 16,384
-output tokens.
-
-| Variant | Shared-state warmup | Branch wall | Total wall | Total output tok/s | Mean request latency |
-|---|---:|---:|---:|---:|---:|
-| FlashAttention, same image | 13.916 s | 18.663 s | 32.578 s | 502.91 | 16.805 s |
-| ForkAttention, same image | 13.923 s | 18.730 s | 32.652 s | 501.77 | 17.063 s |
-| ForkAttention, different images | 0.000 s | 120.848 s | 120.848 s | 135.58 | 117.117 s |
-
-The warmup is the explicit common-state phase of the agent workflow: one
-request per DP rank ingests the webpage state before its eight action branches.
-It is included in total wall time. The different-image control has no reusable
-common visual state and therefore no warmup request.
-
-Within ForkAttention, reusing the visual prefix reduced total wall time by
-72.98% and raised end-to-end output throughput by 3.70x relative to the
-different-image control. The branch phase alone was 84.50% shorter. Same-image
-ranks reported 86.4%-88.3% prefix-cache hits and up to 100% multimodal-cache
-hits; the different-image control reported 0% for both. The ForkAttention log
-contained 51 profile records reporting `eager_forest:enabled` for the
-shared-image workload and none for the control.
-
-FlashAttention and ForkAttention were effectively tied on the same-image
-workload; ForkAttention's total wall time was 0.23% higher in this single run.
-This was a useful multimodal cache diagnostic, but not a reproduction of the
-text DP result: the client pinned both backends to the correct rank, explicitly
-disabled prefix-aware routing, warmed the exact final prefix, used only eight
-branches per rank, limited each rank to 16 sequences, and ran eager mode. Those
-controls removed the routing, residency, and admission effects that dominate
-the Pressure32K/32 DP result. The corrected three-arm experiment above replaces
-that setup for DP performance claims.
-
 ## 10. Current limitations
 
 - ForkAttention currently handles causal decode only, with `q_len == 1`; prefill
@@ -478,6 +339,3 @@ that setup for DP performance claims.
 - vLLM still marks hybrid prefix caching as experimental.
 - The current WebLINX workload validates eight DP replicas only; six-DP scaling
   and larger branch-count sweeps remain separate experiments.
-- The reported WebLINX comparison is one run per arm. Capacity sweeps and
-  repeated trials are still needed to quantify variance and remove the
-  remaining optimized-arm preemptions.

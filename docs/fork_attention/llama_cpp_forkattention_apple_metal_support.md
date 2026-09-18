@@ -197,8 +197,6 @@ Each Metal threadgroup computes one `(query, head)` output row. The implementati
 
 ## Validation
 
-The Apple path was validated on an Apple M2 Max Metal backend.
-
 Shader compile checks:
 
 ```bash
@@ -222,13 +220,6 @@ Backend op test:
   test -o FLASH_ATTN_EXT -b MTL0 -j 4
 ```
 
-Expected result:
-
-```text
-4756/4756 tests passed
-Backend MTL0: OK
-```
-
 The test log should show the dedicated fork kernels being compiled, for example:
 
 ```text
@@ -246,8 +237,6 @@ End-to-end smoke test:
   -np 4 -ns 4 -pps \
   -n 16 --seed 42
 ```
-
-The validated run completed four shared-prefix parallel requests and generated 64 total tokens without runtime errors.
 
 ## Operational Guidance
 

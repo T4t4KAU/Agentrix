@@ -1,7 +1,6 @@
 # ForkAttention profiling 指南
 
-只在服务器执行推理与 profiling。本页合并原算子报告和 Cascade/Nsight 操作说明；
-旧硬件上的逐点数字见 [历史索引](../historical_experiments.md#systems)，不作为当前系统性能结论。
+本页介绍算子、Cascade 与 Nsight 的 profiling 方法。
 
 ## applicability-boundary
 
@@ -64,7 +63,7 @@ Nsys 包含模型、调度、API、CUDA Graph；Ncu 用于详细算子 counter�
 
 ## 系统级对照
 
-当前统一入口为 [TraceLab](../coding_agent/tracelab_timeline_replay.md)，报告：
+系统级对照可使用 `benchmark/scripts/profile_tracelab.py`，记录：
 
 - 到达时间、客户端提交延迟、TTFT/E2E/TPOT 和失败数。
 - 两卡 running/waiting、实际 KV 容量、抢占及下层传输。

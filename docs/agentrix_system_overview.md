@@ -1,8 +1,7 @@
 # Agentrix System Overview
 
-This overview includes historical application/backend paths, not a claim that
-all combinations pass on the current deployment. Current evidence and limitations
-are maintained in [TraceLab](coding_agent/tracelab_timeline_replay.md),
+This overview describes the application and backend integration paths.
+Configuration and limitations are covered in
 [KV memory](kv_memory_optimization_status.md) and [DP routing](dp_routing.md).
 
 ## Purpose
@@ -232,7 +231,3 @@ Routing should follow the workload, not a global backend preference:
   and eager selective recomputation -> evaluate CacheBlend;
 - repeated application-owned sections already present in history -> exact
   compaction, subject to output-quality guardrails.
-
-The historical HotpotQA end-to-end positive control, including its performance,
-memory behavior, scope, and limitations, is recorded in
-[`hotpot_agentrix_experiment.md`](historical_experiments.md#systems).

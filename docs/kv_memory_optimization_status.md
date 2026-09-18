@@ -1,25 +1,7 @@
 # KV 内存管理：设计、状态与验证边界
 
-## 当前状态
-
-截至 2026-09-05，六阶段优化已有 opt-in 实现，不等于全部路径已达到生产可用标准。
-当前只记录 GPU-only 数据：
-
-- [TraceLab 时间线对照](coding_agent/tracelab_timeline_replay.md)：Agentrix 259.79 s，
-  原始 vLLM 218.23 s，慢 19.05%；抢占 34 次对 0 次，原因待消融。
-- CPU/Mooncake 完整路径连续两次在恢复时出现失效 `MemoryObj` 和 GPU connector
-  assertion；没有有效完成汇总。按用户要求暂停，不能断言是虚拟环境导致。
-- 单机 512-token restore smoke 曾通过，但不能覆盖后续长 trace 暴露的问题。
-- 尚未建立跨主机 RDMA 性能、长期 agent 内存收益或全部功能组合的稳定加速证据。
-
-| 阶段 | 已实现范围 | 审核提交 |
-| --- | --- | --- |
-| 基线 | 异步 backup 与 residency 集成 | Agentrix `4b41ca2` |
-| 压力准入 | 按占用接纳完整 chunk，限制 retained/in-flight 工作 | Agentrix `6c3287e` |
-| 淘汰 | tier/reuse/age 排序、共享保护、generation 校验 | Agentrix `efcbd6e` |
-| Restore/prefetch | lookup 前限额、部分恢复重算、CPU 淘汰反馈 | Agentrix `3fbf77d` |
-| CPU/Mooncake | 复用传输 buffer、有界远端写、native ownership | Agentrix `4b60569` |
-| DP 联动 | GPU 驻留事件与 replica-local device 映射 | vLLM `1c9a17fd9`、LMCache `2fbdc42d` |
+可选 KV 管理功能包含驻留索引、压力准入、淘汰、backup/restore 和 DP 反馈，
+需要分别验证及按需启用。
 
 ## 结构与安全约束
 
@@ -51,7 +33,7 @@ Shadow 只观察；active 在需要回收缓存块时调整 free queue：
 
 **仍需排查的交互：** 候选不足或失效会让 allocation 返回失败，沿现有
 admission/preemption 路径处理。因此“保护共享缓存”可能挤压运行请求；
-本次高并发退化是否由此触发尚未证实，不能把这项风险描述成已解决。
+应在压力场景下验证该交互。
 
 成本目前是 tier、reuse、age 的固定整数排序，不是校准过的重算/传输延迟模型。
 `KVCacheManager.get_placement_stats()` 提供诊断计数；不能把 cached-token 增长
@@ -121,17 +103,10 @@ Python timeout 无法终止 C++ 线程；取消后必须等 native call 结束�
 Placement/proactive 自动启用所需 index。Proactive 要求 non-layerwise local CPU storage，
 不与 CacheBlend 组合。DP 配置见 [路由指南](dp_routing.md)。
 
-## 验证与后续工作
+## 验证入口
 
-历史最后一次组合 regression：93 个 vLLM 测试通过，95 个 LMCache 测试通过、2 个跳过；
-它早于 TraceLab 恢复失败，不是当前全路径通过的保证。
+`benchmark/scripts` 中提供 `profile_kv_residency_shadow.py`、
+`profile_kv_placement_shadow.py`、`profile_proactive_backup.py`、
+`profile_kv_restore.py` 和 `run_lmcache_mooncake_smoke.sh`。
 
-服务器验证入口保留在 benchmark/scripts：
-`profile_kv_residency_shadow.py`、`profile_kv_placement_shadow.py`、
-`profile_proactive_backup.py`、`profile_kv_restore.py`、
-`run_lmcache_mooncake_smoke.sh`。逐轮性能数字与旧日志位置移至
-[历史实验索引](historical_experiments.md#memory)。
-
-下一步先消融 GPU-only 的 placement、DP、attention，解释抢占和排队；
-完整 offload 恢复排障待重新开启。长期 agent trace、跨节点 RDMA、多节点 DP、
-在线成本校准和真实共享分支仍需独立验证。
+组合测试应覆盖压力准入、缓存淘汰、恢复失败、抢占和请求完成后的资源释放。

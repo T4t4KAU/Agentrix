@@ -53,31 +53,6 @@ cache group。LoRA、salt、多模态身份、embedding、hybrid group 和其他
 - [GPU 事件索引](../vllm/vllm/v1/engine/kv_routing.py)
 - [Frontend 接入](../vllm/vllm/v1/engine/core_client.py)
 
-## 实验结论
-
-2026-09-05 的[受控 Agent 场景探索](coding_agent/agent_scenario_exploration.md)验证了
-`FLASH_ATTN + prefix_aware` 在长上下文多轮与多根分支上的收益。三个源码数据集
-三次冷缓存复测中，多轮耗时降低 26–47%；同源码消融与换卡复测保持收益方向。
-分支场景仍有抢占和路由波动，12K 宽松容量对照近乎持平。该结论限定于报告的
-闭环负载、模型及容量，TraceLab 开环结果继续单独保留。
-
-当前完整系统结论见 [TraceLab](coding_agent/tracelab_timeline_replay.md)：92 会话、132 请求的
-4x 时间线回放中，组合配置慢 19.05%，不能用旧的强亲和 microbenchmark 宣称普遍提速。
-
-较早的 matched GPU-event 对照为 Qwen3-VL-8B、2 x RTX 5090、384 blocks/replica、
-12 会话、每请求输出 1 token，三轮中位数：
-
-| 指标 | 逻辑提示 | GPU 事件提示 |
-| --- | ---: | ---: |
-| 后续轮 P50 TTFT | 394.48 ms | 396.27 ms |
-| 后续轮 GPU cached-token rate | 53.00% | 53.00% |
-| Router-only P50 | 35.30 us | 72.54 us |
-
-它没有建立显著加速，router-only 不包含事件生产、序列化和消费的全部成本。
-旧 prefix/session 对照统一列在 [历史索引](historical_experiments.md#dp)。
-`dp_placement_physical` 的早期实验没有开启 dense-DP producer，不能作为事件路径证据；
-有效记录是 `dp_placement_physical_verified`。
-
 ## 验证入口
 
 仅在服务器上运行，模型与输出路径显式配置，结果目录每轮独立：
@@ -85,7 +60,3 @@ cache group。LoRA、salt、多模态身份、embedding、hybrid group 和其他
 - `benchmark/scripts/run_agent_session_dp_profile.sh`：prefix/session 策略对照。
 - `benchmark/scripts/profile_dp_kv_events.py`：router-only 成本。
 - `benchmark/scripts/profile_tracelab.py`：当前原始 vLLM/Agentrix 对照。
-
-CPU/Mooncake 集成曾完成双 replica 写入，但该 DP trace 的 external retrieval 为零，
-不能据此声称跨 replica restore 或 RDMA 加速。后来的恢复失败与当前暂停状态见
-[KV 内存管理](kv_memory_optimization_status.md)。

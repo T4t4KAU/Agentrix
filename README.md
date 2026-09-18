@@ -8,32 +8,12 @@ LMCache integration, and the end-to-end benchmark suite in one repository:
 - `llama.cpp/` is a Git submodule pinned to the CUDA/MUSA ForkAttention implementation.
 - `benchmark/` contains simulation, API, and local vLLM benchmarks.
 
-## Current Status
-
-The current server comparison is official vLLM 0.25.0 versus Agentrix GPU-only,
-using TraceLab observed-time arrivals with 4x offered load (92 sessions).
-Agentrix took 259.79 s versus 218.23 s: **19.05% slower**, with 34 scheduler
-preemptions versus zero. This is one run per arm; feature attribution remains open.
-
-CPU/Mooncake full-path validation is paused after two KV-restore failures.
-Historical synthetic shared-prefix gains are not current production guarantees.
-Protocol, provenance, caveats and raw-data locations are maintained in the
-[TraceLab report](docs/coding_agent/tracelab_timeline_replay.md).
-
-A separate [controlled Agent workload study](docs/coding_agent/agent_scenario_exploration.md)
-found gains from FlashAttention with prefix-aware DP: three cold-cache trials
-on long-context coding conversations reduced multi-turn makespan by 26–47%.
-Same-source routing ablations and a GPU swap retained the benefit. Parallel
-branches also benefited, with placement variability; single-GPU ForkAttention
-screening did not establish a stable end-to-end gain.
-
 ## Documentation
 
 Start with the [documentation index](docs/README.md).
 Core references: [server environment](docs/autodl_build_and_benchmark.md),
 [DP routing](docs/dp_routing.md), [KV memory](docs/kv_memory_optimization_status.md),
 [profiling](docs/fork_attention/forkattention_operator_profile.md).
-Superseded reports are summarized in the [historical index](docs/historical_experiments.md).
 
 The generic build and experimental recipes below include older runtime paths.
 For the existing profiling server, use the server guide above; do not recreate
@@ -437,10 +417,8 @@ MODE=tp_accuracy MODEL_SPECS='qwen3-14b|/path/to/Qwen3-14B' \
 ./scripts/run_main_experiment.sh
 ```
 
-The historical DP matrices used separate warm-cache and capacity-pressure
-workloads; their provenance is in the [historical index](docs/historical_experiments.md#dp).
-For the current implementation and matched serving comparison, use the
-[DP guide](docs/dp_routing.md) and [TraceLab protocol](docs/coding_agent/tracelab_timeline_replay.md).
+For DP configuration and validation entry points, use the
+[DP guide](docs/dp_routing.md).
 
 Override `PREFIX_LENGTHS`, `BRANCH_COUNTS`, `DATASETS`, `CASE_COUNT`,
 `MAX_DATASET_RECORDS`, `GPU_IDS`, `DP_REPLICAS`, `TP_SIZE`, and
