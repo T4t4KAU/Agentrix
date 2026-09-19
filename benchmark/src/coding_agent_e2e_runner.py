@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from openai import AsyncOpenAI
+from agentrix_application import PagedToolStore
 
 from coding_agent_tools import RepositoryTools, ToolError
 from coding_task_oracle import evaluate, load_task, prepare
@@ -60,6 +61,22 @@ def execute_action(tools: RepositoryTools, action: dict[str, Any]) -> dict[str, 
             str(action["path"]),
             int(action.get("start_line", 1)),
             int(action.get("end_line", 400)),
+        )
+    if name == "read_result":
+        return tools.read_result(
+            str(action["result_id"]),
+            int(action.get("offset", 0)),
+            int(action.get("limit", 4096)),
+        )
+    if name == "list_results":
+        return tools.list_results(
+            int(action.get("offset", 0)), int(action.get("limit", 16))
+        )
+    if name == "search_result":
+        return tools.search_result(
+            str(action["result_id"]),
+            str(action["needle"]),
+            int(action.get("offset", 0)),
         )
     if name == "apply_patch":
         return tools.apply_patch(str(action["patch"]))
@@ -117,17 +134,13 @@ def summarize_request_metrics(metrics: list[dict[str, Any]]) -> dict[str, Any]:
     """Return quality-adjusted performance inputs from one executable task."""
     latencies = [float(item["latency_ms"]) for item in metrics]
     ttfts = [
-        float(item["ttft_ms"])
-        for item in metrics
-        if item.get("ttft_ms") is not None
+        float(item["ttft_ms"]) for item in metrics if item.get("ttft_ms") is not None
     ]
     return {
         "request_count": len(metrics),
         "input_tokens": sum(int(item["input_tokens"]) for item in metrics),
         "output_tokens": sum(int(item["output_tokens"]) for item in metrics),
-        "request_latency_mean_ms": (
-            statistics.fmean(latencies) if latencies else None
-        ),
+        "request_latency_mean_ms": (statistics.fmean(latencies) if latencies else None),
         "ttft_mean_ms": statistics.fmean(ttfts) if ttfts else None,
     }
 
@@ -151,13 +164,18 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     seeded = prepare(task_path, args.repo, workspace)
 
     client = AsyncOpenAI(api_key="local", base_url=args.base_url, timeout=900)
-    runtime = Runtime(client, args.model, 1, {
-        round_index: sum(
-            min(len(branch.get("trajectory", [])) or 1, args.rounds) >= round_index
-            for branch in selected["branches"]
-        )
-        for round_index in range(1, args.rounds + 1)
-    })
+    runtime = Runtime(
+        client,
+        args.model,
+        1,
+        {
+            round_index: sum(
+                min(len(branch.get("trajectory", [])) or 1, args.rounds) >= round_index
+                for branch in selected["branches"]
+            )
+            for round_index in range(1, args.rounds + 1)
+        },
+    )
     graph = build_graph(
         runtime,
         args.branch_output_tokens,
@@ -187,7 +205,32 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             ),
         },
     ]
-    tools = RepositoryTools(workspace, task, max_output_bytes=args.max_tool_output_bytes)
+    paging = getattr(args, "tool_result_paging", False)
+    result_directory = tempfile.TemporaryDirectory(prefix="agentrix-coding-results-")
+    result_store = (
+        PagedToolStore(Path(result_directory.name) / "results.sqlite")
+        if paging
+        else None
+    )
+    if result_store is not None:
+        result_store.open_session("root")
+        base_messages.append(
+            {
+                "role": "user",
+                "content": "Large read/search results are immutable snapshots. Retrieve "
+                'evidence with {"action":"search_result","result_id":"...",'
+                '"needle":"literal text"} or {"action":"read_result",'
+                '"result_id":"...","offset":0,"limit":4096}. '
+                'Find earlier handles with {"action":"list_results",'
+                '"offset":0,"limit":16}; the catalog includes original paths and order.',
+            }
+        )
+    tools = RepositoryTools(
+        workspace,
+        task,
+        max_output_bytes=args.max_tool_output_bytes,
+        result_store=result_store,
+    )
     actions = []
     history: list[dict[str, str]] = []
     final_summary = ""
@@ -195,78 +238,93 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     seen_actions: set[str] = set()
     patch_applied = False
     passing_public_test = False
-    for step in range(args.max_tool_steps):
-        compact_summary = []
-        if len(history) > 4:
-            compact_summary.append(
-                {
-                    "role": "user",
-                    "content": "Earlier actions: "
-                    + ", ".join(str(action["action"]) for action in actions[:-2]),
-                }
+    try:
+        for step in range(args.max_tool_steps):
+            compact_summary = []
+            if len(history) > 4:
+                compact_summary.append(
+                    {
+                        "role": "user",
+                        "content": "Earlier actions: "
+                        + ", ".join(str(action["action"]) for action in actions[:-2]),
+                    }
+                )
+            if step >= args.max_tool_steps // 2:
+                compact_summary.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Only {args.max_tool_steps - step} actions remain. "
+                            "Stop broad or repeated reading. Locate the exact symbol, "
+                            "apply the smallest patch, then run public_test."
+                        ),
+                    }
+                )
+            messages = [*base_messages, *compact_summary, *history[-4:]]
+            text, _ = await runtime.complete(
+                case_id=selected["case_id"],
+                stage="parent_decision",
+                branch_id=None,
+                round_index=step + 1,
+                messages=messages,
+                max_tokens=args.parent_output_tokens,
             )
-        if step >= args.max_tool_steps // 2:
-            compact_summary.append(
-                {
-                    "role": "user",
-                    "content": (
-                        f"Only {args.max_tool_steps - step} actions remain. "
-                        "Stop broad or repeated reading. Locate the exact symbol, "
-                        "apply the smallest patch, then run public_test."
-                    ),
-                }
-            )
-        messages = [*base_messages, *compact_summary, *history[-4:]]
-        text, _ = await runtime.complete(
-            case_id=selected["case_id"],
-            stage="parent_decision",
-            branch_id=None,
-            round_index=step + 1,
-            messages=messages,
-            max_tokens=args.parent_output_tokens,
-        )
-        history.append({"role": "assistant", "content": text})
-        try:
-            action = parse_action(text)
-        except (ValueError, json.JSONDecodeError) as error:
-            parse_failures += 1
-            history.append(
-                {"role": "user", "content": f"Invalid action JSON: {error}. Return one valid action."}
-            )
-            continue
-        actions.append(action)
-        if action["action"] == "final":
-            blocker = finalization_blocker(
-                patch_applied=patch_applied,
-                passing_public_test=passing_public_test,
-            )
-            if blocker:
-                history.append({"role": "user", "content": blocker})
-                continue
-            final_summary = str(action.get("summary", ""))
-            break
-        signature = json.dumps(action, sort_keys=True, ensure_ascii=False)
-        if signature in seen_actions:
-            observation = "Tool error: identical action already executed. Choose a different, more targeted action."
-        else:
-            seen_actions.add(signature)
+            history.append({"role": "assistant", "content": text})
             try:
-                event = execute_action(tools, action)
-                observation = event["content"]
-                if action["action"] == "apply_patch":
-                    patch_applied = True
-                    passing_public_test = False
-                elif action["action"] == "public_test" and patch_applied:
-                    passing_public_test = public_test_passed(event)
-            except (ToolError, KeyError, ValueError) as error:
-                observation = f"Tool error: {error}"
-        history.append(
-            {
-                "role": "user",
-                "content": f"Tool result for `{action['action']}`:\n{observation}\nChoose the next action.",
-            }
-        )
-    await client.close()
+                action = parse_action(text)
+            except (ValueError, json.JSONDecodeError) as error:
+                parse_failures += 1
+                history.append(
+                    {
+                        "role": "user",
+                        "content": f"Invalid action JSON: {error}. Return one valid action.",
+                    }
+                )
+                continue
+            actions.append(action)
+            if action["action"] == "final":
+                blocker = finalization_blocker(
+                    patch_applied=patch_applied,
+                    passing_public_test=passing_public_test,
+                )
+                if blocker:
+                    history.append({"role": "user", "content": blocker})
+                    continue
+                final_summary = str(action.get("summary", ""))
+                break
+            signature = json.dumps(action, sort_keys=True, ensure_ascii=False)
+            if signature in seen_actions:
+                observation = "Tool error: identical action already executed. Choose a different, more targeted action."
+            else:
+                seen_actions.add(signature)
+                try:
+                    event = execute_action(tools, action)
+                    observation = event["content"]
+                    if action["action"] == "apply_patch":
+                        patch_applied = True
+                        passing_public_test = False
+                    elif action["action"] == "public_test" and patch_applied:
+                        passing_public_test = public_test_passed(event)
+                except (ToolError, KeyError, ValueError) as error:
+                    observation = f"Tool error: {error}"
+            history.append(
+                {
+                    "role": "user",
+                    "content": f"Tool result for `{action['action']}`:\n{observation}\nChoose the next action.",
+                }
+            )
+    finally:
+        try:
+            await client.close()
+        finally:
+            try:
+                if result_store is not None:
+                    try:
+                        result_store.release_session("root")
+                    finally:
+                        result_store.close()
+            finally:
+                result_directory.cleanup()
     score = evaluate(task_path, workspace)
     request_metrics = [asdict(metric) for metric in runtime.metrics]
     total_wall_time_ms = (time.perf_counter() - started) * 1000
@@ -291,6 +349,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "requests": request_metrics,
         "request_summary": summarize_request_metrics(request_metrics),
         "prompt_compaction": args.prompt_compaction,
+        "tool_result_paging": paging,
     }
 
 
@@ -308,6 +367,7 @@ def main() -> None:
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--trajectory-mode", choices=("live", "replay"), default="live")
     parser.add_argument("--prompt-compaction", action="store_true")
+    parser.add_argument("--tool-result-paging", action="store_true")
     parser.add_argument("--branch-output-tokens", type=int, default=128)
     parser.add_argument("--parent-output-tokens", type=int, default=512)
     parser.add_argument("--max-tool-steps", type=int, default=14)

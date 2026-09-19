@@ -7,6 +7,7 @@ import pytest
 
 from agentrix_application import (
     ToolResultBackingStore,
+    PagedToolStore,
     ToolResultCompactionConfig,
     PromptSection,
     compact_json,
@@ -33,6 +34,73 @@ def test_compactor_removes_only_empty_and_same_id_exact_duplicates() -> None:
     assert result.report.removed_empty_sections == 1
     assert result.report.removed_duplicate_sections == 1
     assert result.report.saved_chars > 0
+
+
+def test_disk_pages_preserve_unicode_and_search_across_page_boundaries(tmp_path):
+    store = PagedToolStore(tmp_path / "results.sqlite")
+    store.open_session("root")
+    content = "中" * 4093 + "cross-page-needle" + "尾" * 9000
+    digest = store.put("root", content)
+    result = store.search("root", digest, "cross-page-needle", limit=300)
+    assert result["match_offset"] == 4093
+    assert "cross-page-needle" in result["content"]
+    assert (
+        store.read("root", digest, offset=4080, limit=6000)["content"]
+        == content[4080:10080]
+    )
+    assert store.read("root", digest, offset=len(content))["eof"]
+    assert store.search("root", digest, "missing")["match_offset"] is None
+    store.close()
+
+
+def test_branch_snapshots_share_storage_and_reclaim_only_last_owner(tmp_path):
+    path = tmp_path / "results.sqlite"
+    store = PagedToolStore(path)
+    store.open_session("parent")
+    original = "original snapshot\n" * 10000
+    digest = store.put("parent", original)
+    original_size = store.stats()["stored_bytes"]
+    for child in ("left", "right"):
+        store.open_session(child, parent="parent")
+        assert store.put(child, original) == digest
+    assert store.stats()["stored_bytes"] == original_size
+    changed = store.put("left", "modified snapshot")
+    assert store.read("right", digest)["content"] == original[:4096]
+    with pytest.raises(KeyError):
+        store.read("right", changed)
+    occupied = path.stat().st_size
+    store.release_session("parent")
+    store.release_session("left")
+    assert store.stats()["stored_bytes"] == original_size
+    assert store.read("right", digest)["content"] == original[:4096]
+    store.release_session("right")
+    assert store.stats() == dict(objects=0, stored_bytes=0, sessions=0, references=0)
+    assert path.stat().st_size < occupied
+    store.close()
+
+
+def test_store_quota_is_atomic_and_sessions_are_isolated_after_reopen(tmp_path):
+    path = tmp_path / "results.sqlite"
+    store = PagedToolStore(path, max_bytes=16)
+    store.open_session("a")
+    digest = store.put("a", "0123456789")
+    store.open_session("b")
+    with pytest.raises(ValueError, match="budget"):
+        store.put("b", "another ten bytes")
+    with pytest.raises(KeyError):
+        store.read("b", digest)
+    assert store.stats()["objects"] == 1
+    store.close()
+    store = PagedToolStore(path, max_bytes=16)
+    assert store.read("a", digest)["content"] == "0123456789"
+    with pytest.raises(ValueError):
+        store.read("a", digest, limit=1000000)
+    with pytest.raises(KeyError):
+        store.open_session("orphan", parent="absent")
+    assert store.stats()["sessions"] == 2
+    store.release_session("a")
+    assert store.put("b", "another value")
+    store.close()
 
 
 def test_delta_removes_exact_section_already_in_context() -> None:

@@ -56,6 +56,118 @@ export AGENTRIX_PROMPT_COMPACTION_MIN_AGE_TURNS=4
 export AGENTRIX_PROMPT_COMPACTION_RECOVERABLE_TOOLS=read,read_file
 ```
 
+## Paged tool snapshots and branch lifetimes
+
+`PagedToolStore` stores immutable tool results in SQLite, split into 4,096-character
+pages. Agents receive handles and fetch a bounded range or search for a literal
+string. Identical results occupy one copy; a fork inherits references, while a
+new result in a branch creates a separate snapshot. Releasing the final owning
+session deletes the object and reclaims its database pages. Retrieval reads the
+historical result even if the original file has changed.
+
+```python
+from pathlib import Path
+from agentrix_application import PagedToolStore
+
+store = PagedToolStore(Path("/tmp/tool-results.sqlite"), max_bytes=256 << 20)
+store.open_session("parent")
+handle = store.put("parent", large_tool_output)
+store.open_session("branch", parent="parent")
+store.release_session("parent")
+try:
+    evidence = store.search("branch", handle, "failed test", limit=1024)
+finally:
+    store.release_session("branch")
+    store.close()
+```
+
+The quota counts stored UTF-8 payload bytes, excluding SQLite metadata and
+journals. The SQLite page cache is bounded; the currently produced tool result
+can still exist in application memory, and the OS can cache database pages.
+Calls must be serialized by the owning thread. Live snapshots are never silently
+evicted to meet the quota: a failed insertion rolls back without publishing a
+handle. Independent sessions cannot retrieve one another's objects.
+
+The coding runner accepts `--tool-result-paging`. Large `read` and `search`
+observations become handles instead of truncated output. The agent can issue
+`read_result` and `search_result` actions. `list_results` exposes a paginated
+catalog with original paths and snapshot order, so dropping old conversation
+turns does not lose access to their handles. Run completion or failure releases
+the owned snapshots. Other tools retain their existing behavior. This is application
+data sharing; vLLM's native prefix sharing and KV Copy-on-Write remain the baseline.
+
+### Reproducible closed-loop screening
+
+`benchmark/scripts/benchmark_tool_result_paging.py` generates seeded JSONL build
+and check reports. Each case ingests two immutable reports, forks three auditing
+branches, executes model-selected retrieval actions, and reduces their answers.
+Both variants expose identical reports and retrieval tools. The oracle checks
+exact revisions, scores, decisions, and the final selected job. This controlled
+synthetic workload is **not** AgentX or a real coding-task quality evaluation.
+Tools are optional: the inline agent may answer directly from its supplied
+reports. The paged agent chooses which evidence to retrieve.
+Both modes validate the public threshold rule against the model's own proposed
+score. An inconsistent decision is rejected and retried within the same step
+budget, without committing the rejected answer to history. The validator never
+reads the hidden answer; wrong evidence still fails the oracle. All retries,
+requests, and their time/token costs are included in the measurements.
+
+With `--restore-on-validation-error`, a rejected score decision can restore its
+source (the checks report) once, without copying unrelated build metadata. The
+report is restored byte-for-byte within `--max-restore-chars`; the branch retains
+its previous retrieved evidence and access to both tools. This is an explicit
+workflow dependency, not an oracle-assisted answer repair. Restoration and retries
+can increase the required context window and are included in the totals. The
+coding runner currently exposes retrieval tools, but does not implement this
+task-specific score validator or automatic restoration policy.
+
+For Qwen3-8B on the server's H100 GPU 1, launch from `/mnt/sda1/hwx/Agentrix`:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 HF_HUB_OFFLINE=1 VLLM_SERVER_DEV_MODE=1 \
+VLLM_LOG_STATS_INTERVAL=0.1 VLLM_USE_FLASHINFER_SAMPLER=0 \
+vllm/.venv/bin/vllm serve /mnt/sda1/hwx/models/Qwen3-8B \
+  --served-model-name agentrix-paging --host 127.0.0.1 --port 18000 \
+  --dtype bfloat16 --attention-config '{"backend":"FLASH_ATTN"}' \
+  --kernel-config '{"enable_flashinfer_autotune":false}' --enforce-eager \
+  --gpu-memory-utilization 0.9 --max-num-seqs 8 \
+  --max-num-batched-tokens 1024 --max-model-len 14336 \
+  --kv-cache-memory-bytes 2147483648 \
+  --enable-prefix-caching --enable-prompt-tokens-details
+```
+
+After `/health` is ready, run `inline, paged, paged, inline`, saving each result
+separately. For example:
+
+```bash
+vllm/.venv/bin/python benchmark/scripts/benchmark_tool_result_paging.py \
+  --base-url http://127.0.0.1:18000 --gpu 1 \
+  --mode inline --seed 20260923 --cases 8 --rows 128 --branches 3 \
+  --concurrency 3 --kv-cache-bytes 2147483648 \
+  --restore-on-validation-error \
+  --server-pid SERVER_PID --output /tmp/tool-paging-inline.json
+```
+
+Use the actual server PID for CPU process-tree RSS sampling. Each arm resets
+prefix caches and records hardware, server limits, source/data hashes, per-request
+tokens/timing, all model answers, errors, GPU memory samples, and final snapshot
+ownership. Report full workflow correctness as well as individual branch accuracy.
+The GPU number is sampled total board memory during the measured workload,
+including other board users; it is not an allocator-level lifetime high-water mark.
+
+For a separate capacity experiment, restart on the **same GPU and model** with
+`--kv-cache-memory-bytes 1073741824 --max-model-len 7168`. Run paged mode with the
+matching benchmark budget, then try inline mode as a capacity control. Report
+the changed serving limits explicitly: the smaller request window fits paged
+contexts but can reject full reports. Lowering the KV budget is a native setting;
+the contribution is completing the same data-dependent task with smaller inputs.
+Fixed-pool comparisons isolate paging; capacity comparisons measure whether that
+reduction permits lower physical GPU allocation. Keep model accuracy and errors
+alongside memory and latency; fewer tokens alone do not establish an Agent win.
+The prior pure-paging screening regressed in correctness, even when prompt tokens
+fell sharply. Treat this as an opt-in experiment; neither smaller-model quality
+nor real coding-task quality is established by the synthetic Qwen3-8B result.
+
 ## LangGraph integration and ablation
 
 `benchmark/src/langgraph_runner.py --prompt-compaction` applies the incremental

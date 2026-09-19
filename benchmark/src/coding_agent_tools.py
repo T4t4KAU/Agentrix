@@ -6,7 +6,10 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from agentrix_application import PagedToolStore
 
 
 class ToolError(RuntimeError):
@@ -20,11 +23,15 @@ class RepositoryTools:
         task: dict[str, Any],
         *,
         max_output_bytes: int = 32_768,
+        result_store: PagedToolStore | None = None,
+        session_id: str = "root",
     ) -> None:
         self.workspace = workspace.resolve()
         self.task = task
         self.max_output_bytes = max_output_bytes
         self.events: list[dict[str, Any]] = []
+        self.result_store = result_store
+        self.session_id = session_id
 
     def _path(self, relative: str) -> Path:
         candidate = (self.workspace / relative).resolve()
@@ -39,8 +46,32 @@ class RepositoryTools:
         original_bytes = len(full_encoded)
         content_sha256 = hashlib.sha256(full_encoded).hexdigest()
         encoded = full_encoded
-        truncated = original_bytes > self.max_output_bytes
-        if truncated:
+        truncated = original_bytes > self.max_output_bytes and tool not in {
+            "read_result",
+            "search_result",
+            "list_results",
+        }
+        paged = (
+            self.result_store is not None
+            and tool in {"read", "search"}
+            and original_bytes > self.max_output_bytes
+        )
+        if paged:
+            assert self.result_store is not None
+            result_id = self.result_store.put(self.session_id, content)
+            content = json.dumps(
+                {
+                    "result_id": result_id,
+                    "total_chars": len(content),
+                    "preview": content[:256],
+                    "retrieval": "Use search_result with a literal needle, or "
+                    "read_result with offset and limit, to read this exact snapshot.",
+                },
+                ensure_ascii=False,
+            )
+            encoded = content.encode("utf-8")
+            truncated = False
+        elif truncated:
             encoded = encoded[: self.max_output_bytes]
             content = encoded.decode("utf-8", errors="replace")
         event = {
@@ -53,10 +84,79 @@ class RepositoryTools:
             "original_bytes": original_bytes,
             "returned_bytes": len(encoded),
             "truncated": truncated,
+            "paged": paged,
             "wall_time_ms": (time.perf_counter() - started) * 1000,
         }
         self.events.append(event)
         return event
+
+    def list_results(self, offset: int = 0, limit: int = 16) -> dict[str, Any]:
+        """Find old handles even after their observations leave Agent history."""
+        started = time.perf_counter()
+        if self.result_store is None:
+            raise ToolError("tool result paging is disabled")
+        if type(offset) is not int or offset < 0:
+            raise ValueError("offset must be a nonnegative integer")
+        if type(limit) is not int or not 1 <= limit <= 32:
+            raise ValueError("limit must be in 1..32 results")
+        snapshots = [event for event in self.events if event["paged"]]
+        entries = []
+        for event in snapshots[offset : offset + limit]:
+            handle = json.loads(event["content"])
+            entries.append(
+                dict(
+                    sequence=event["sequence"],
+                    tool=event["tool"],
+                    arguments=event["arguments"],
+                    result_id=handle["result_id"],
+                    total_chars=handle["total_chars"],
+                )
+            )
+        return self._record(
+            "list_results",
+            {"offset": offset, "limit": limit},
+            json.dumps(
+                dict(
+                    results=entries,
+                    next_offset=offset + len(entries),
+                    total=len(snapshots),
+                ),
+                ensure_ascii=False,
+            ),
+            started,
+        )
+
+    def read_result(
+        self, result_id: str, offset: int = 0, limit: int = 4096
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        if self.result_store is None:
+            raise ToolError("tool result paging is disabled")
+        result = self.result_store.read(
+            self.session_id, result_id, offset=offset, limit=limit
+        )
+        return self._record(
+            "read_result",
+            {"result_id": result_id, "offset": offset},
+            json.dumps(result, ensure_ascii=False),
+            started,
+        )
+
+    def search_result(
+        self, result_id: str, needle: str, offset: int = 0
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        if self.result_store is None:
+            raise ToolError("tool result paging is disabled")
+        result = self.result_store.search(
+            self.session_id, result_id, needle, offset=offset
+        )
+        return self._record(
+            "search_result",
+            {"result_id": result_id, "needle": needle},
+            json.dumps(result, ensure_ascii=False),
+            started,
+        )
 
     def search(self, pattern: str, glob: str = "*") -> dict[str, Any]:
         started = time.perf_counter()
@@ -85,7 +185,9 @@ class RepositoryTools:
             "search", {"pattern": pattern, "glob": glob}, result.stdout, started
         )
 
-    def read(self, path: str, start_line: int = 1, end_line: int = 400) -> dict[str, Any]:
+    def read(
+        self, path: str, start_line: int = 1, end_line: int = 400
+    ) -> dict[str, Any]:
         started = time.perf_counter()
         source = self._path(path)
         if not source.is_file():
@@ -142,9 +244,7 @@ class RepositoryTools:
             timeout=30,
             check=True,
         )
-        return self._record(
-            "apply_patch", {"paths": paths}, "patch applied", started
-        )
+        return self._record("apply_patch", {"paths": paths}, "patch applied", started)
 
     def diff(self) -> dict[str, Any]:
         started = time.perf_counter()
@@ -163,9 +263,7 @@ class RepositoryTools:
         for command in self.task.get("build", []):
             result = subprocess.run(
                 tuple(
-                    value.format(
-                        python=sys.executable, workspace=str(self.workspace)
-                    )
+                    value.format(python=sys.executable, workspace=str(self.workspace))
                     for value in command["argv"]
                 ),
                 cwd=self._path(command.get("cwd", ".")),
@@ -183,9 +281,7 @@ class RepositoryTools:
                 )
         result = subprocess.run(
             tuple(
-                value.format(
-                    python=sys.executable, workspace=str(self.workspace)
-                )
+                value.format(python=sys.executable, workspace=str(self.workspace))
                 for value in self.task["public_test_command"]
             ),
             cwd=self.workspace,

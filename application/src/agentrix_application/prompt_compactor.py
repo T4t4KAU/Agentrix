@@ -4,8 +4,10 @@ import copy
 import hashlib
 import json
 import os
+import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 
@@ -154,7 +156,9 @@ class ToolResultBackingStore:
         try:
             return self._content[digest]
         except KeyError as error:
-            raise KeyError(f"tool result {digest} is not present in backing store") from error
+            raise KeyError(
+                f"tool result {digest} is not present in backing store"
+            ) from error
 
     def __contains__(self, digest: object) -> bool:
         return digest in self._content
@@ -165,6 +169,200 @@ class ToolResultBackingStore:
     @property
     def stored_chars(self) -> int:
         return sum(len(content) for content in self._content.values())
+
+
+class PagedToolStore:
+    """Immutable tool snapshots with bounded reads and session-owned references.
+
+    Forking copies references, never result bodies. New branch results create
+    new immutable objects; releasing the last session reclaims their disk pages.
+    One owner thread must serialize calls (for example an Agent event loop).
+    """
+
+    PAGE_CHARS = 4096
+
+    def __init__(self, path: Path, *, max_bytes: int = 1 << 30) -> None:
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.max_bytes = max_bytes
+        self.db = sqlite3.connect(path)
+        self.db.executescript("""
+            PRAGMA foreign_keys=ON;
+            PRAGMA auto_vacuum=FULL;
+            PRAGMA cache_size=-2048;
+            PRAGMA mmap_size=0;
+            CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS objects (
+                id TEXT PRIMARY KEY, chars INTEGER NOT NULL, bytes INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS pages (
+                object_id TEXT REFERENCES objects(id) ON DELETE CASCADE,
+                number INTEGER, content TEXT NOT NULL,
+                PRIMARY KEY (object_id, number)
+            );
+            CREATE TABLE IF NOT EXISTS refs (
+                session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+                object_id TEXT REFERENCES objects(id),
+                PRIMARY KEY (session_id, object_id)
+            );
+            CREATE INDEX IF NOT EXISTS refs_object ON refs(object_id);
+        """)
+
+    def open_session(self, session_id: str, *, parent: str | None = None) -> None:
+        if not isinstance(session_id, str) or not 0 < len(session_id) <= 128:
+            raise ValueError("session_id must contain 1..128 characters")
+        with self.db:
+            if parent is not None:
+                self._require_session(parent)
+            self.db.execute("INSERT INTO sessions VALUES (?)", (session_id,))
+            if parent is not None:
+                self.db.execute(
+                    "INSERT INTO refs SELECT ?, object_id FROM refs WHERE session_id=?",
+                    (session_id, parent),
+                )
+
+    def _require_session(self, session_id: str) -> None:
+        if (
+            self.db.execute(
+                "SELECT 1 FROM sessions WHERE id=?", (session_id,)
+            ).fetchone()
+            is None
+        ):
+            raise KeyError(f"unknown tool-result session {session_id!r}")
+
+    def put(self, session_id: str, content: str) -> str:
+        hasher = hashlib.sha256()
+        size = 0
+        for start in range(0, len(content), self.PAGE_CHARS):
+            data = content[start : start + self.PAGE_CHARS].encode("utf-8")
+            hasher.update(data)
+            size += len(data)
+        digest = hasher.hexdigest()
+        with self.db:
+            self._require_session(session_id)
+            exists = self.db.execute(
+                "SELECT 1 FROM objects WHERE id=?", (digest,)
+            ).fetchone()
+            if exists is None:
+                if self.stats()["stored_bytes"] + size > self.max_bytes:
+                    raise ValueError("tool-result storage budget exceeded")
+                self.db.execute(
+                    "INSERT INTO objects VALUES (?, ?, ?)",
+                    (digest, len(content), size),
+                )
+                self.db.executemany(
+                    "INSERT INTO pages VALUES (?, ?, ?)",
+                    (
+                        (
+                            digest,
+                            start // self.PAGE_CHARS,
+                            content[start : start + self.PAGE_CHARS],
+                        )
+                        for start in range(0, len(content), self.PAGE_CHARS)
+                    ),
+                )
+            self.db.execute(
+                "INSERT OR IGNORE INTO refs VALUES (?, ?)", (session_id, digest)
+            )
+        return digest
+
+    def read(
+        self, session_id: str, result_id: str, *, offset: int = 0, limit: int = 4096
+    ) -> dict[str, Any]:
+        """Read a character range from an owned historical snapshot."""
+        if type(offset) is not int or offset < 0:
+            raise ValueError("offset must be a nonnegative integer")
+        if type(limit) is not int or not 1 <= limit <= 16384:
+            raise ValueError("limit must be in 1..16384 characters")
+        row = self.db.execute(
+            "SELECT chars FROM objects JOIN refs ON objects.id=refs.object_id "
+            "WHERE session_id=? AND objects.id=?",
+            (session_id, result_id),
+        ).fetchone()
+        if row is None:
+            raise KeyError("result is not owned by this session")
+        total = row[0]
+        if offset > total:
+            raise ValueError("offset exceeds result length")
+        end = min(total, offset + limit)
+        pages = self.db.execute(
+            "SELECT content FROM pages WHERE object_id=? AND number BETWEEN ? "
+            "AND ? ORDER BY number",
+            (
+                result_id,
+                offset // self.PAGE_CHARS,
+                max(offset, end - 1) // self.PAGE_CHARS,
+            ),
+        )
+        content = "".join(page[0] for page in pages)
+        begin = offset % self.PAGE_CHARS
+        return dict(
+            result_id=result_id,
+            offset=offset,
+            next_offset=end,
+            total_chars=total,
+            eof=end == total,
+            content=content[begin : begin + end - offset],
+        )
+
+    def search(
+        self,
+        session_id: str,
+        result_id: str,
+        needle: str,
+        *,
+        offset: int = 0,
+        limit: int = 4096,
+    ) -> dict[str, Any]:
+        """Find a literal string without materializing the complete result."""
+        if not isinstance(needle, str) or not 1 <= len(needle) <= 256:
+            raise ValueError("needle must contain 1..256 characters")
+        # Validate the response bounds even when the search has no match.
+        page = self.read(session_id, result_id, offset=offset, limit=limit)
+        while True:
+            scan = self.read(
+                session_id, result_id, offset=offset, limit=self.PAGE_CHARS
+            )
+            index = scan["content"].find(needle)
+            if index >= 0:
+                position = offset + index
+                return self.read(
+                    session_id,
+                    result_id,
+                    offset=max(0, position - min(128, max(0, limit - len(needle)))),
+                    limit=limit,
+                ) | {"match_offset": position}
+            if scan["eof"]:
+                return dict(
+                    result_id=result_id,
+                    match_offset=None,
+                    total_chars=page["total_chars"],
+                    content="",
+                )
+            offset = scan["next_offset"] - len(needle) + 1
+
+    def release_session(self, session_id: str) -> None:
+        with self.db:
+            self.db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+            self.db.execute(
+                "DELETE FROM objects WHERE NOT EXISTS "
+                "(SELECT 1 FROM refs WHERE refs.object_id=objects.id)"
+            )
+
+    def stats(self) -> dict[str, int]:
+        count, size = self.db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(bytes), 0) FROM objects"
+        ).fetchone()
+        return dict(
+            objects=count,
+            stored_bytes=size,
+            sessions=self.db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0],
+            references=self.db.execute("SELECT COUNT(*) FROM refs").fetchone()[0],
+        )
+
+    def close(self) -> None:
+        self.db.close()
 
 
 def _digest(value: str) -> str:
@@ -307,7 +505,9 @@ def _tool_calls_by_id(messages: Sequence[Mapping[str, Any]]) -> dict[str, _ToolC
                     parsed_arguments = {}
             else:
                 parsed_arguments = raw_arguments
-            arguments = parsed_arguments if isinstance(parsed_arguments, Mapping) else {}
+            arguments = (
+                parsed_arguments if isinstance(parsed_arguments, Mapping) else {}
+            )
             call = _ToolCall(
                 name=name,
                 arguments=arguments,
@@ -315,7 +515,9 @@ def _tool_calls_by_id(messages: Sequence[Mapping[str, Any]]) -> dict[str, _ToolC
             )
             previous = calls.get(call_id)
             if previous is not None and previous != call:
-                raise ValueError(f"tool call ID {call_id!r} has conflicting definitions")
+                raise ValueError(
+                    f"tool call ID {call_id!r} has conflicting definitions"
+                )
             calls[call_id] = call
     return calls
 
@@ -341,7 +543,9 @@ def _later_user_turns(messages: Sequence[Mapping[str, Any]]) -> list[int]:
 def _has_later_assistant(
     messages: Sequence[Mapping[str, Any]], message_index: int
 ) -> bool:
-    return any(message.get("role") == "assistant" for message in messages[message_index + 1 :])
+    return any(
+        message.get("role") == "assistant" for message in messages[message_index + 1 :]
+    )
 
 
 def _looks_like_error(message: Mapping[str, Any], content: str) -> bool:
@@ -366,9 +570,7 @@ def _looks_like_error(message: Mapping[str, Any], content: str) -> bool:
     )
 
 
-def _resource_identity(
-    call: _ToolCall, argument_names: Sequence[str]
-) -> str | None:
+def _resource_identity(call: _ToolCall, argument_names: Sequence[str]) -> str | None:
     for name in argument_names:
         value = call.arguments.get(name)
         if isinstance(value, str) and value.strip():
