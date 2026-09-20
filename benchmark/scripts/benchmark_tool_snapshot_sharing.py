@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Measure exact tool-snapshot revisions in isolated processes, without a model.
+"""Measure tool-data storage and host memory in isolated processes, without a model.
 
-Compare an earlier prompt_compactor.py with today's streamed page sharing. Both
-arms retain the same parent and branch versions and verify every byte by hash.
-This measures application storage and host memory, not GPU KV or Agent quality.
+Compare snapshot page sharing, stage reclamation or the repository file-read
+tool. Each comparison checks exact retained data or returned output. These
+measurements do not evaluate GPU KV occupancy or Agent quality.
 """
 
 from __future__ import annotations
@@ -27,11 +27,14 @@ ROOT = Path(__file__).resolve().parents[2]
 CURRENT = ROOT / "application/src/agentrix_application/prompt_compactor.py"
 
 
-def report_pages(count):
+def report_pages(count, stage=None):
     # Unique deterministic ASCII pages prevent repeated padding from creating
     # an artificial within-snapshot deduplication advantage.
     for index in range(count):
-        token = hashlib.sha256(f"tool-report-page-{index}".encode()).hexdigest()
+        key = f"tool-report-page-{index}"
+        if stage is not None:
+            key = f"stage-{stage}/{key}"
+        token = hashlib.sha256(key.encode()).hexdigest()
         yield (f"report-page-{index:08d}\n" + token * 64)[:4096]
 
 
@@ -64,6 +67,10 @@ def worker(args):
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    if args.worker in {"read_full", "read_stream"}:
+        return read_worker(args, module.RepositoryTools)
+    if args.worker in {"session", "stage"}:
+        return lifecycle_worker(args, module.PagedToolStore)
     page_count = args.size_mib * 256
     chars = page_count * 4096
     with tempfile.TemporaryDirectory(prefix="agentrix-snapshot-sharing-") as directory:
@@ -130,6 +137,7 @@ def worker(args):
             snapshot_bytes=chars,
             branches=args.branches,
             stats=stats,
+            peak_stored_bytes=stats["stored_bytes"],
             database_bytes=disk_bytes,
             peak_branch_python_bytes=peak_python_bytes,
             process_peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
@@ -140,6 +148,233 @@ def worker(args):
         )
 
 
+def lifecycle_worker(args, store_type):
+    """Keep durable state while a delayed branch still consumes prior raw data.
+
+    Raw reports are explicitly intermediate: after the verifier completes, the
+    next stage needs only the durable checksum state. Both arms use page sharing
+    and identical data/consumers; only the parent's release policy differs.
+    """
+    page_count = args.size_mib * 256
+    chars = page_count * 4096
+    with tempfile.TemporaryDirectory(prefix="agentrix-stage-lifetime-") as directory:
+        path = Path(directory) / "snapshots.sqlite"
+        store = store_type(path)
+        store.open_session("workflow")
+        config = store.put(
+            "workflow", "Verify each complete report; retain the checksum chain."
+        )
+        state = store.put("workflow", json.dumps(dict(stage=-1, chain="initial")))
+        pending = None
+        expected_chain = "initial"
+        verified, samples = [], []
+        write_seconds = 0
+
+        def sample(stage, phase):
+            samples.append(
+                dict(
+                    stage=stage,
+                    phase=phase,
+                    **store.stats(),
+                    database_bytes=path.stat().st_size,
+                )
+            )
+
+        def consume(session, handle):
+            hasher = hashlib.sha256()
+            for offset in range(0, chars, 16384):
+                hasher.update(
+                    store.read(session, handle, offset=offset, limit=16384)[
+                        "content"
+                    ].encode()
+                )
+            assert hasher.hexdigest() == handle
+            verified.append(handle)
+
+        tracemalloc.start()
+        for stage in range(args.stages):
+            previous = json.loads(store.read("workflow", state)["content"])
+            assert previous == dict(stage=stage - 1, chain=expected_chain)
+            oracle = hashlib.sha256()
+            for page in report_pages(page_count, stage):
+                oracle.update(page.encode())
+            began = time.perf_counter()
+            report = store.put_stream("workflow", report_pages(page_count, stage))
+            assert report == oracle.hexdigest()
+            sample(stage, "produced")
+            expected_chain = hashlib.sha256(
+                (previous["chain"] + report).encode()
+            ).hexdigest()
+            state = store.put(
+                "workflow", json.dumps(dict(stage=stage, chain=expected_chain))
+            )
+            reviewer = f"review-{stage}"
+            store.open_session(reviewer, parent="workflow")
+            # The verifier needs one report; its liveness is identical in both arms.
+            store.checkpoint_session(reviewer, keep_results=[report])
+            sample(stage, "forked")
+            if args.worker == "stage":
+                store.checkpoint_session("workflow", keep_results=[config, state])
+            sample(stage, "checkpointed")
+            write_seconds += time.perf_counter() - began
+            if pending:
+                # The preceding branch outlives its parent's checkpoint. It must
+                # still read every byte, and only then release its ownership.
+                consume(*pending)
+                began = time.perf_counter()
+                store.release_session(pending[0])
+                write_seconds += time.perf_counter() - began
+            sample(stage, "joined_previous")
+            pending = (reviewer, report)
+        if pending:
+            consume(*pending)
+            store.release_session(pending[0])
+        assert (
+            json.loads(store.read("workflow", state)["content"])["chain"]
+            == expected_chain
+        )
+        assert store.read("workflow", config)["content"].startswith("Verify")
+        _, peak_python_bytes = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        stats = store.stats()
+        store.release_session("workflow")
+        final = store.stats()
+        assert final == dict(objects=0, stored_bytes=0, sessions=0, references=0)
+        store.close()
+        return dict(
+            mode=args.worker,
+            stages=args.stages,
+            snapshot_bytes=chars,
+            source_sha256=hashlib.sha256(args.source.read_bytes()).hexdigest(),
+            stats=stats,
+            peak_stored_bytes=max(s["stored_bytes"] for s in samples),
+            database_bytes=max(s["database_bytes"] for s in samples),
+            peak_branch_python_bytes=peak_python_bytes,
+            process_peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+            write_seconds=write_seconds,
+            verified_sha256=verified,
+            final_chain=expected_chain,
+            occupancy_samples=samples,
+            final=final,
+            final_database_bytes=path.stat().st_size,
+        )
+
+
+def read_worker(args, tools_type):
+    """Measure the real repository read tool, keeping its output unchanged."""
+    source = args.read_file.resolve()
+    tools = tools_type(source.parent, {})
+    started = time.perf_counter()
+    first = tools.read(source.name, args.start_line, args.end_line)
+    elapsed = time.perf_counter() - started
+    # Capture RSS before tracing: allocation tracking itself adds memory,
+    # especially in the baseline that creates an object for every file line.
+    peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    tracemalloc.start()
+    try:
+        result = tools.read(source.name, args.start_line, args.end_line)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert first["content_sha256"] == result["content_sha256"]
+    return dict(
+        mode=args.worker,
+        input_file_bytes=source.stat().st_size,
+        source_sha256=hashlib.sha256(args.source.read_bytes()).hexdigest(),
+        read_seconds_unprofiled=elapsed,
+        peak_read_python_bytes=peak,
+        process_peak_rss_kib=peak_rss,
+        content_sha256=result["content_sha256"],
+        returned_sha256=result["returned_sha256"],
+        original_bytes=result["original_bytes"],
+        returned_bytes=result["returned_bytes"],
+        truncated=result["truncated"],
+        paged=result["paged"],
+    )
+
+
+def read_ablation(args):
+    rows = []
+    before = hashlib.sha256()
+    with args.read_file.open("rb") as stream:
+        while data := stream.read(1 << 20):
+            before.update(data)
+    for repeat in range(args.repeats):
+        modes = ["read_full", "read_stream"]
+        for mode in modes if repeat % 2 == 0 else reversed(modes):
+            source = (
+                args.baseline_tools
+                if mode == "read_full"
+                else ROOT / "benchmark/src/coding_agent_tools.py"
+            )
+            command = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--worker",
+                mode,
+                "--source",
+                str(source),
+                "--read-file",
+                str(args.read_file.resolve()),
+                "--start-line",
+                str(args.start_line),
+                "--end-line",
+                str(args.end_line),
+            ]
+            row = json.loads(subprocess.check_output(command, text=True))
+            rows.append(row)
+            print(
+                mode,
+                "rss_kib",
+                row["process_peak_rss_kib"],
+                "python_peak",
+                row["peak_read_python_bytes"],
+                flush=True,
+            )
+    after = hashlib.sha256()
+    with args.read_file.open("rb") as stream:
+        while data := stream.read(1 << 20):
+            after.update(data)
+    assert before.digest() == after.digest(), "input changed during comparison"
+    for key in (
+        "content_sha256",
+        "returned_sha256",
+        "original_bytes",
+        "returned_bytes",
+        "truncated",
+        "paged",
+    ):
+        assert all(row[key] == rows[0][key] for row in rows), key
+    summary = {
+        mode: {
+            key: statistics.median(row[key] for row in rows if row["mode"] == mode)
+            for key in (
+                "read_seconds_unprofiled",
+                "peak_read_python_bytes",
+                "process_peak_rss_kib",
+            )
+        }
+        for mode in ("read_full", "read_stream")
+    }
+    payload = dict(
+        scope="Actual RepositoryTools.read on the same immutable file and line range; no model inference.",
+        measurement="RSS and time cover the first, unprofiled read; Python allocations cover a second read with tracemalloc.",
+        hardware=platform.uname()._asdict(),
+        python=sys.version,
+        source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        input_sha256=before.hexdigest(),
+        input_file=str(args.read_file.resolve()),
+        start_line=args.start_line,
+        end_line=args.end_line,
+        rows=rows,
+        summary=summary,
+        exact_output_match=True,
+    )
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(payload, indent=2) + "\n")
+    print(json.dumps(summary, indent=2))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline-store", type=Path)
@@ -148,20 +383,50 @@ def main():
     parser.add_argument("--branches", type=int, default=8)
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument(
-        "--worker", choices=["private", "shared"], help=argparse.SUPPRESS
+        "--read-file",
+        type=Path,
+        help="Compare the real file-read tool on this existing file.",
+    )
+    parser.add_argument(
+        "--baseline-tools",
+        type=Path,
+        help="Earlier coding_agent_tools.py for a file-read comparison.",
+    )
+    parser.add_argument("--start-line", type=int, default=1)
+    parser.add_argument("--end-line", type=int, default=32)
+    parser.add_argument(
+        "--stages",
+        type=int,
+        default=0,
+        help="Compare session-end versus stage-aware reclamation with this many stages.",
+    )
+    parser.add_argument(
+        "--worker",
+        choices=["private", "shared", "session", "stage", "read_full", "read_stream"],
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--source", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if min(args.size_mib, args.branches, args.repeats) < 1:
+    if min(args.size_mib, args.branches, args.repeats) < 1 or args.stages < 0:
         parser.error("size, branches and repeats must be positive")
     if args.worker:
         print(json.dumps(worker(args)))
         return
-    if not args.baseline_store or not args.output:
-        parser.error("--baseline-store and --output are required")
+    if args.read_file:
+        if not args.baseline_tools or not args.output or args.stages:
+            parser.error(
+                "file-read comparison needs --baseline-tools and --output, without --stages"
+            )
+        read_ablation(args)
+        return
+    if not args.output or (not args.stages and not args.baseline_store):
+        parser.error(
+            "--output is required; page-sharing comparison also needs --baseline-store"
+        )
     rows = []
+    modes = ["session", "stage"] if args.stages else ["private", "shared"]
     for repeat in range(args.repeats):
-        order = ["private", "shared"] if repeat % 2 == 0 else ["shared", "private"]
+        order = modes if repeat % 2 == 0 else list(reversed(modes))
         for mode in order:
             source = args.baseline_store if mode == "private" else CURRENT
             command = [
@@ -175,20 +440,22 @@ def main():
                 str(args.size_mib),
                 "--branches",
                 str(args.branches),
+                "--stages",
+                str(args.stages),
             ]
             row = json.loads(subprocess.check_output(command, text=True))
             rows.append(row)
             print(
                 mode,
-                "stored_bytes",
-                row["stats"]["stored_bytes"],
+                "peak_stored_bytes",
+                row["peak_stored_bytes"],
                 "branch_python_peak",
                 row["peak_branch_python_bytes"],
                 flush=True,
             )
     assert all(row["verified_sha256"] == rows[0]["verified_sha256"] for row in rows)
     summary = {}
-    for mode in ("private", "shared"):
+    for mode in modes:
         selected = [row for row in rows if row["mode"] == mode]
         summary[mode] = {
             key: statistics.median(row[key] for row in selected)
@@ -197,18 +464,26 @@ def main():
                 "peak_branch_python_bytes",
                 "process_peak_rss_kib",
                 "write_seconds",
+                "peak_stored_bytes",
             )
         } | {"stored_bytes": selected[0]["stats"]["stored_bytes"]}
     result = dict(
-        scope=__doc__,
+        scope=(
+            "Scripted tool-data lifecycle: both arms use page sharing; intermediate reports "
+            "expire after their delayed verifier finishes, durable state remains. No model inference."
+            if args.stages
+            else __doc__
+        ),
         hardware=platform.uname()._asdict(),
         python=sys.version,
         source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         rows=rows,
         summary=summary,
-        all_versions_exact=True,
+        all_required_reads_exact=True,
         all_storage_reclaimed=True,
     )
+    if not args.stages:
+        result["all_versions_exact"] = True
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(summary, indent=2))

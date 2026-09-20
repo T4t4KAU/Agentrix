@@ -194,12 +194,30 @@ class RepositoryTools:
             raise ToolError(f"not a file: {path}")
         if start_line < 1 or end_line < start_line or end_line - start_line > 2000:
             raise ToolError("invalid line range")
-        lines = source.read_text(encoding="utf-8", errors="replace").splitlines()
-        body = "\n".join(
-            f"{index}: {line}"
-            for index, line in enumerate(lines[start_line - 1 : end_line], start_line)
-        )
-        content = f"File {path} has {len(lines)} lines.\n{body}"
+        # Retain only the requested range. Still scan to EOF for the exact line
+        # count, preserving read_text().splitlines() semantics, including Unicode
+        # separators, universal newlines and an unterminated final line.
+        parts = []
+        line_number = 1
+        at_line_start = True
+        with source.open(encoding="utf-8", errors="replace") as stream:
+            while block := stream.read(64 << 10):
+                for fragment in block.splitlines(keepends=True):
+                    ended = fragment[-1] in "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+                    if start_line <= line_number <= end_line:
+                        if at_line_start:
+                            parts.append(f"{line_number}: ")
+                        parts.append(fragment[:-1] if ended else fragment)
+                        if ended:
+                            parts.append("\n")
+                    if ended:
+                        line_number += 1
+                    at_line_start = ended
+        total_lines = line_number - 1 + int(not at_line_start)
+        body = "".join(parts)
+        if body.endswith("\n"):
+            body = body[:-1]
+        content = f"File {path} has {total_lines} lines.\n{body}"
         return self._record(
             "read",
             {"path": path, "start_line": start_line, "end_line": end_line},

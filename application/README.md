@@ -120,6 +120,46 @@ The output separates stored payload, SQLite file size, process peak RSS and peak
 Python allocations during branch updates. It measures application data, without
 model inference; it provides no GPU KV or Agent quality result.
 
+### Release intermediate data at workflow boundaries
+
+`checkpoint_session` lets the workflow declare which results the next stage
+still needs. It removes the current session's other references and catalog
+entries. Other sessions retain their own ownership, so a delayed branch can
+finish reading an intermediate after its parent has advanced. The data is
+reclaimed when its last owner releases it.
+
+```python
+store.open_session("reviewer", parent="parent")
+state = store.put("parent", next_stage_state)
+store.checkpoint_session("parent", keep_results=[configuration_handle, state])
+# The reviewer can still read its inherited historical results here.
+store.release_session("reviewer")
+```
+
+The caller must supply the complete live set, including any history needed for
+later recovery or auditing. A checkpoint can permanently delete unreferenced
+data; context-budget eviction continues to preserve it for retrieval. Unknown
+or unowned keep handles abort the checkpoint without releasing anything.
+Observation sequence numbers remain monotonic after reclamation and reopening.
+This policy is opt-in and does not infer expiry from age or model output.
+
+The existing storage benchmark also compares session-end retention with stage
+reclamation, with page sharing enabled in both arms:
+
+```bash
+application/.venv/bin/python benchmark/scripts/benchmark_tool_snapshot_sharing.py \
+  --stages 16 --size-mib 2 --output /tmp/tool-stage-lifecycle.json
+```
+
+Each stage produces a unique 2 MiB report and a durable checksum state. A verifier
+branch reads the complete report one stage later; future stages consume the
+durable state. Once that verifier finishes, the raw report is explicitly no
+longer required. Both variants execute all the same reads and produce the same
+checksum chain. Occupancy samples include the overlap between consecutive
+stages, and the benchmark checks that the final session release reclaims all
+data. This is a scripted lifecycle test, not a model-quality evaluation or a
+policy for discarding arbitrary conversation history.
+
 The coding runner accepts `--tool-result-paging`. Large `read` and `search`
 observations become handles instead of truncated output. The agent can issue
 `read_result` and `search_result` actions. `list_results` exposes a paginated
@@ -127,6 +167,29 @@ catalog with original paths and snapshot order, so dropping old conversation
 turns does not lose access to their handles. Run completion or failure releases
 the owned snapshots. Other tools retain their existing behavior. This is application
 data sharing; vLLM's native prefix sharing and KV Copy-on-Write remain the baseline.
+
+### Read file ranges with bounded scan buffers
+
+The coding runner's `read` tool scans files in 65,536-character blocks and keeps
+only the selected lines. It preserves the exact text, line numbers, total line
+count and historical-snapshot behavior. It still scans the entire file to count
+lines; this reduces temporary host memory, not file I/O or GPU KV occupancy.
+Memory grows with the selected text plus the scan buffer, so selecting a very
+large line or result can still require substantial memory.
+
+Compare the real tool on an existing file, with identical inputs and output:
+
+```bash
+git show 0c1d542:benchmark/src/coding_agent_tools.py > /tmp/tool-read-before.py
+application/.venv/bin/python benchmark/scripts/benchmark_tool_snapshot_sharing.py \
+  --read-file /path/to/large.log --start-line 1001 --end-line 1032 \
+  --baseline-tools /tmp/tool-read-before.py --output /tmp/tool-read-memory.json
+```
+
+The comparison alternates fresh processes and verifies output hashes, sizes and
+truncation flags. Process RSS and time are captured before allocation profiling;
+a second call measures Python allocations separately. The result is specific to
+this tool process and selected range, without model inference.
 
 ### Bound the cumulative tool working set
 

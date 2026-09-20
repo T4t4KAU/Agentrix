@@ -193,7 +193,9 @@ class PagedToolStore:
             PRAGMA auto_vacuum=FULL;
             PRAGMA cache_size=-2048;
             PRAGMA mmap_size=0;
-            CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY, next_sequence INTEGER NOT NULL DEFAULT 0
+            );
             CREATE TABLE IF NOT EXISTS objects (
                 id TEXT PRIMARY KEY, chars INTEGER NOT NULL, bytes INTEGER NOT NULL
             );
@@ -223,6 +225,16 @@ class PagedToolStore:
         try:
             with self.db:
                 self.db.execute("BEGIN")
+                if "next_sequence" not in {
+                    row[1] for row in self.db.execute("PRAGMA table_info(sessions)")
+                }:
+                    self.db.execute(
+                        "ALTER TABLE sessions ADD COLUMN next_sequence INTEGER NOT NULL DEFAULT 0"
+                    )
+                    self.db.execute(
+                        "UPDATE sessions SET next_sequence=(SELECT COALESCE(MAX(sequence), -1) + 1 "
+                        "FROM observations WHERE session_id=sessions.id)"
+                    )
                 if "content" in {
                     row[1] for row in self.db.execute("PRAGMA table_info(pages)")
                 }:
@@ -258,7 +270,7 @@ class PagedToolStore:
         with self.db:
             if parent is not None:
                 self._require_session(parent)
-            self.db.execute("INSERT INTO sessions VALUES (?)", (session_id,))
+            self.db.execute("INSERT INTO sessions(id) VALUES (?)", (session_id,))
             if parent is not None:
                 self.db.execute(
                     "INSERT INTO refs SELECT ?, object_id FROM refs WHERE session_id=?",
@@ -268,6 +280,11 @@ class PagedToolStore:
                     "INSERT INTO observations SELECT ?, sequence, object_id, label "
                     "FROM observations WHERE session_id=?",
                     (session_id, parent),
+                )
+                self.db.execute(
+                    "UPDATE sessions SET next_sequence=(SELECT next_sequence FROM sessions "
+                    "WHERE id=?) WHERE id=?",
+                    (parent, session_id),
                 )
 
     def _require_session(self, session_id: str) -> None:
@@ -364,7 +381,7 @@ class PagedToolStore:
 
         Equal-length edits and appends reuse unchanged pages. Insertions that
         shift page boundaries may need new pages throughout the changed suffix.
-        The caller keeps both handles until the owning session is released.
+        The caller keeps both handles until a checkpoint or session release.
         """
         total = self.read(session_id, result_id, offset=offset, limit=1)["total_chars"]
         if type(delete_chars) is not int or not 0 <= delete_chars <= total - offset:
@@ -470,13 +487,64 @@ class PagedToolStore:
     def release_session(self, session_id: str) -> None:
         with self.db:
             self.db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+            self._collect_unreferenced()
+
+    def _collect_unreferenced(self) -> None:
+        self.db.execute(
+            "DELETE FROM objects WHERE NOT EXISTS "
+            "(SELECT 1 FROM refs WHERE refs.object_id=objects.id)"
+        )
+        self.db.execute(
+            "DELETE FROM chunks WHERE NOT EXISTS "
+            "(SELECT 1 FROM pages WHERE pages.chunk_id=chunks.id)"
+        )
+
+    def checkpoint_session(
+        self, session_id: str, *, keep_results: Iterable[str]
+    ) -> dict[str, int]:
+        """Release this owner's obsolete results at an explicit workflow boundary.
+
+        The workflow supplies the complete set of still-needed handles. This is
+        not context eviction: discarded results leave this owner's catalog and
+        may be deleted permanently when no other session references them. Child
+        and sibling owners remain independent. Invalid handles abort atomically.
+        """
+        if isinstance(keep_results, (str, bytes)):
+            raise ValueError("keep_results must be a collection of result handles")
+        keep = set(keep_results)
+        if any(not isinstance(handle, str) for handle in keep):
+            raise ValueError("result handles must be strings")
+        with self.db:
+            self._require_session(session_id)
+            before = self.stats()["stored_bytes"]
+            # Avoid SQLite's variable-count limit for large workflow catalogs.
             self.db.execute(
-                "DELETE FROM objects WHERE NOT EXISTS "
-                "(SELECT 1 FROM refs WHERE refs.object_id=objects.id)"
+                "CREATE TEMP TABLE IF NOT EXISTS checkpoint_keep (id TEXT PRIMARY KEY)"
             )
-            self.db.execute(
-                "DELETE FROM chunks WHERE NOT EXISTS "
-                "(SELECT 1 FROM pages WHERE pages.chunk_id=chunks.id)"
+            self.db.execute("DELETE FROM checkpoint_keep")
+            self.db.executemany(
+                "INSERT INTO checkpoint_keep VALUES (?)", ((handle,) for handle in keep)
+            )
+            if (
+                self.db.execute(
+                    "SELECT 1 FROM checkpoint_keep WHERE NOT EXISTS "
+                    "(SELECT 1 FROM refs WHERE session_id=? AND object_id=checkpoint_keep.id) LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+                is not None
+            ):
+                raise KeyError("checkpoint result is not owned by this session")
+            released = self.db.execute(
+                "DELETE FROM refs WHERE session_id=? AND NOT EXISTS "
+                "(SELECT 1 FROM checkpoint_keep WHERE id=refs.object_id)",
+                (session_id,),
+            ).rowcount
+            self._collect_unreferenced()
+            self.db.execute("DELETE FROM checkpoint_keep")
+            return dict(
+                released_references=released,
+                retained_references=len(keep),
+                reclaimed_bytes=before - self.stats()["stored_bytes"],
             )
 
     def record_observation(self, session_id: str, label: str, content: str) -> int:
@@ -486,13 +554,16 @@ class PagedToolStore:
         digest = self.put(session_id, content)
         with self.db:
             sequence = self.db.execute(
-                "SELECT COALESCE(MAX(sequence), -1) + 1 FROM observations "
-                "WHERE session_id=?",
+                "SELECT next_sequence FROM sessions WHERE id=?",
                 (session_id,),
             ).fetchone()[0]
             self.db.execute(
                 "INSERT INTO observations VALUES (?, ?, ?, ?)",
                 (session_id, sequence, digest, label),
+            )
+            self.db.execute(
+                "UPDATE sessions SET next_sequence=next_sequence+1 WHERE id=?",
+                (session_id,),
             )
         return sequence
 

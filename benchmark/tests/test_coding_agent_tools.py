@@ -1,6 +1,7 @@
 from pathlib import Path
 import json
 import runpy
+import tracemalloc
 
 import pytest
 
@@ -57,6 +58,52 @@ def test_paged_read_retrieves_original_snapshot_after_source_changes(tmp_path):
     store.release_session("root")
     assert store.stats()["stored_bytes"] == 0
     store.close()
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"",
+        b"\n",
+        b"one\n\n",
+        b"one\r\ntwo\rthree\nlast",
+        "中\v文\f😀\x1cnext\x1dmore\x1eend\x85ls\u2028ps\u2029tail".encode(),
+        b"invalid \xff\xfe\nnext",
+        b"x" * 65535 + b"\r\nsecond\nthird",
+        b"x" * 65535 + "中\u2028tail".encode(),
+    ],
+)
+def test_streamed_file_read_preserves_existing_text_and_line_numbers(tmp_path, data):
+    source = tmp_path / "input.txt"
+    source.write_bytes(data)
+    lines = source.read_text(encoding="utf-8", errors="replace").splitlines()
+    for start, end in [(1, 10), (2, 2), (5, 10), (100, 110)]:
+        event = RepositoryTools(tmp_path, {}, max_output_bytes=1 << 20).read(
+            "input.txt", start, end
+        )
+        expected = f"File input.txt has {len(lines)} lines.\n" + "\n".join(
+            f"{index}: {line}"
+            for index, line in enumerate(lines[start - 1 : end], start)
+        )
+        assert event["content"] == expected
+        assert event["original_bytes"] == len(expected.encode())
+
+
+def test_narrow_read_does_not_materialize_an_unselected_large_line(tmp_path):
+    source = tmp_path / "large.log"
+    with source.open("wb") as stream:
+        stream.write(b"wanted\n")
+        for _ in range(128):
+            stream.write(b"x" * (64 << 10))
+        stream.write(b"\nlast\n")
+    tracemalloc.start()
+    try:
+        event = RepositoryTools(tmp_path, {}).read("large.log", 1, 1)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert event["content"] == "File large.log has 3 lines.\n1: wanted"
+    assert peak < 1 << 20
 
 
 def test_paging_benchmark_handles_parallel_calls_and_checks_only_proposed_score():

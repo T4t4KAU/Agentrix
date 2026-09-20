@@ -221,6 +221,91 @@ def test_existing_private_page_database_migrates_without_changing_handles(tmp_pa
     store.close()
 
 
+def test_checkpoint_reclaims_only_results_without_live_branch_owners(tmp_path):
+    store = PagedToolStore(tmp_path / "stages.sqlite")
+    store.open_session("workflow")
+    shared = store.put("workflow", "shared history")
+    obsolete = store.put("workflow", "obsolete intermediate" * 4096)
+    store.open_session("reviewer", parent="workflow")
+    next_state = store.put("workflow", "next stage state")
+    result = store.checkpoint_session("workflow", keep_results=[shared, next_state])
+    assert result == dict(
+        released_references=1, retained_references=2, reclaimed_bytes=0
+    )
+    with pytest.raises(KeyError):
+        store.read("workflow", obsolete)
+    assert store.read("reviewer", obsolete)["content"].startswith(
+        "obsolete intermediate"
+    )
+    assert store.read("workflow", next_state)["content"] == "next stage state"
+    with pytest.raises(KeyError):
+        store.read("reviewer", next_state)
+    occupied = store.stats()["stored_bytes"]
+    store.release_session("reviewer")
+    assert store.stats()["stored_bytes"] < occupied
+    assert store.stats()["objects"] == 2
+    assert (
+        store.checkpoint_session("workflow", keep_results=[shared, next_state])[
+            "released_references"
+        ]
+        == 0
+    )
+    store.release_session("workflow")
+    assert store.stats()["stored_bytes"] == 0
+    store.close()
+
+
+def test_checkpoint_is_atomic_and_catalog_ids_survive_reclamation_and_reopen(tmp_path):
+    path = tmp_path / "checkpoint.sqlite"
+    store = PagedToolStore(path)
+    store.open_session("agent")
+    store.open_session("other")
+    foreign = store.put("other", "private data")
+    for index in range(3):
+        assert store.record_observation("agent", "read", f"body {index}") == index
+    catalog = store.list_observations("agent")
+    before = store.stats()
+    with pytest.raises(KeyError, match="not owned"):
+        store.checkpoint_session(
+            "agent", keep_results=[catalog[-1]["result_id"], foreign]
+        )
+    assert store.stats() == before
+    assert store.list_observations("agent") == catalog
+    reclaimed = store.checkpoint_session("agent", keep_results=[])
+    assert reclaimed["released_references"] == 3
+    assert reclaimed["reclaimed_bytes"] > 0
+    assert store.list_observations("agent") == []
+    store.close()
+    store = PagedToolStore(path)
+    store.open_session("child", parent="agent")
+    assert store.record_observation("agent", "new", "new parent data") == 3
+    assert store.record_observation("child", "new", "new child data") == 3
+    assert store.list_observations("agent", offset=3)[0]["sequence"] == 3
+    assert store.read("other", foreign)["content"] == "private data"
+    for session in ("agent", "child", "other"):
+        store.release_session(session)
+    assert store.db.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert store.stats()["stored_bytes"] == 0
+    store.close()
+
+
+def test_checkpoint_migrates_existing_observation_sequence_counter(tmp_path):
+    path = tmp_path / "sequence.sqlite"
+    store = PagedToolStore(path)
+    store.open_session("agent")
+    for index in range(4):
+        store.record_observation("agent", "old", f"old body {index}")
+    # Recreate the previous schema: sequence was derived from surviving rows.
+    store.db.execute("ALTER TABLE sessions DROP COLUMN next_sequence")
+    store.db.commit()
+    store.close()
+    store = PagedToolStore(path)
+    store.checkpoint_session("agent", keep_results=[])
+    assert store.record_observation("agent", "new", "new body") == 4
+    store.release_session("agent")
+    store.close()
+
+
 def test_tool_context_budget_bounds_long_history_and_allows_cold_recovery(tmp_path):
     store = PagedToolStore(tmp_path / "context.sqlite")
     store.open_session("agent")
