@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import random
+import re
 import resource
 import statistics
 import subprocess
@@ -144,6 +145,15 @@ def restore_reports(store, session_id, handles, max_chars):
 
 async def run(args):
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    count_tokens = None
+    if args.tokenizer:
+        from tokenizers import Tokenizer
+
+        tokenizer = Tokenizer.from_file(str(args.tokenizer / "tokenizer.json"))
+
+        def count_tokens(text):
+            return len(tokenizer.encode(text, add_special_tokens=False).ids)
+
     client = AsyncOpenAI(
         base_url=args.base_url.rstrip("/") + "/v1",
         api_key="local",
@@ -153,6 +163,7 @@ async def run(args):
     requests, branches, reducers, memory = [], [], [], []
     transcripts, corpus_hashes, lifecycle = [], [], []
     semaphore = asyncio.Semaphore(args.concurrency)
+    workflow_semaphore = asyncio.Semaphore(args.workflow_concurrency)
     stop = asyncio.Event()
     start = time.perf_counter()
     errors = []
@@ -171,14 +182,6 @@ async def run(args):
             while not stop.is_set():
                 record = {"elapsed": time.perf_counter() - start}
                 try:
-                    record["gpus"] = await asyncio.to_thread(sample_gpu, {args.gpu})
-                    if args.server_pid:
-                        record["server_rss_kib"] = await asyncio.to_thread(
-                            process_tree_rss_kib, args.server_pid
-                        )
-                    record["application_rss_kib"] = resource.getrusage(
-                        resource.RUSAGE_SELF
-                    ).ru_maxrss
                     async with http.get(
                         args.base_url.rstrip("/") + "/metrics",
                         timeout=aiohttp.ClientTimeout(total=3),
@@ -192,13 +195,41 @@ async def run(args):
                         ),
                         default=0,
                     )
+                    for name in ("num_requests_running", "num_requests_waiting"):
+                        record[name] = sum(
+                            float(line.rsplit(" ", 1)[1])
+                            for line in metrics.splitlines()
+                            if line.startswith(f"vllm:{name}{{")
+                        )
                 except Exception as error:
                     record["error"] = str(error)
                 memory.append(record)
                 try:
-                    await asyncio.wait_for(stop.wait(), timeout=0.1)
+                    await asyncio.wait_for(stop.wait(), timeout=0.05)
                 except asyncio.TimeoutError:
                     pass
+
+    async def monitor_processes():
+        # Driver and /proc queries can take a second. Keep them off the KV
+        # sampling path so they do not hide short-lived working-set peaks.
+        while not stop.is_set():
+            record = {"elapsed": time.perf_counter() - start}
+            try:
+                record["gpus"] = await asyncio.to_thread(sample_gpu, {args.gpu})
+                if args.server_pid:
+                    record["server_rss_kib"] = await asyncio.to_thread(
+                        process_tree_rss_kib, args.server_pid
+                    )
+                record["application_rss_kib"] = resource.getrusage(
+                    resource.RUSAGE_SELF
+                ).ru_maxrss
+            except Exception as error:
+                record["error"] = str(error)
+            memory.append(record)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=1)
+            except asyncio.TimeoutError:
+                pass
 
     async def complete(messages, identity):
         async with semaphore:
@@ -250,6 +281,7 @@ async def run(args):
         store.open_session(root)
         handles = {name: store.put(root, body) for name, body in bodies.items()}
         original_bytes = store.stats()["stored_bytes"]
+        peak_stored_bytes = original_bytes
         targets = [
             f"job-{int((branch + 1) * args.rows / (args.branches + 1)):04d}"
             for branch in range(args.branches)
@@ -275,11 +307,11 @@ async def run(args):
         ]
         del evidence
 
-        async def branch(index, target):
-            sid = root + f"/branch-{index}"
-            store.open_session(sid, parent=root)
+        async def audit_stage(index, target, sid, stage):
+            nonlocal peak_stored_bytes
             messages = [
                 *shared,
+                *([{"role": "user", "content": ""}] if count_tokens else []),
                 {
                     "role": "user",
                     "content": f"Audit {target}. Find its revision in builds and its score in checks, then decide.",
@@ -289,10 +321,21 @@ async def run(args):
             tool_calls = 0
             validation_retries = 0
             context_restorations = 0
+            context_samples = []
             began = time.perf_counter()
             try:
                 for step in range(args.max_steps):
-                    content = await complete(messages, f"{sid}/turn-{step}")
+                    if count_tokens:
+                        context = store.render_context(
+                            sid,
+                            count_tokens=count_tokens,
+                            max_tokens=args.tool_context_tokens,
+                        )
+                        messages[2] = {"role": "user", "content": context.pop("text")}
+                        context_samples.append(context)
+                    content = await complete(
+                        messages, f"{sid}/stage-{stage}/turn-{step}"
+                    )
                     messages.append({"role": "assistant", "content": content})
                     try:
                         actions = parse_actions(content)
@@ -330,12 +373,37 @@ async def run(args):
                             break
                         observations = []
                         for action in actions:
+                            if action["action"] == "list_observations":
+                                observation = {
+                                    "catalog": store.list_observations(
+                                        sid, offset=action.get("offset", 0), limit=8
+                                    )
+                                }
+                                tool_calls += 1
+                                observations.append(observation)
+                                continue
+                            if action["action"] == "read_observation":
+                                observation = store.read(
+                                    sid,
+                                    action["result_id"],
+                                    offset=action.get("offset", 0),
+                                    limit=action.get("limit", 768),
+                                )
+                                tool_calls += 1
+                                observations.append(observation)
+                                continue
                             source = handles[action["source"]]
                             if action["action"] == "search":
                                 observation = store.search(
-                                    sid, source, action["needle"], limit=768
+                                    sid,
+                                    source,
+                                    action["needle"],
+                                    limit=args.search_excerpt_chars or 768,
                                 )
-                                if observation["match_offset"] is not None:
+                                if (
+                                    not args.search_excerpt_chars
+                                    and observation["match_offset"] is not None
+                                ):
                                     relative = (
                                         observation["match_offset"]
                                         - observation["offset"]
@@ -363,16 +431,23 @@ async def run(args):
                                 {"source": action["source"], **observation}
                             )
                         feedback = json.dumps(observations)
+                        if count_tokens:
+                            store.record_observation(
+                                sid, f"{target} step {step}", feedback
+                            )
+                            peak_stored_bytes = max(
+                                peak_stored_bytes, store.stats()["stored_bytes"]
+                            )
+                            feedback = "Tool observations are in recent_results above. Choose the next action."
                     except (ValueError, KeyError, TypeError) as error:
                         feedback = "Tool/action error: " + str(error)
                     messages.append({"role": "user", "content": feedback})
             except Exception as error:
                 errors.append(dict(identity=sid, error=str(error)))
-            finally:
-                store.release_session(sid)
             result = dict(
                 case=case_id,
                 branch=index,
+                stage=stage,
                 target=target,
                 answer=answer,
                 correct=answer is not None
@@ -381,15 +456,35 @@ async def run(args):
                 tool_calls=tool_calls,
                 validation_retries=validation_retries,
                 context_restorations=context_restorations,
+                tool_context_samples=context_samples,
                 wall_seconds=time.perf_counter() - began,
             )
             branches.append(result)
             return result
 
+        async def branch(index, target):
+            sid = root + f"/branch-{index}"
+            store.open_session(sid, parent=root)
+            try:
+                result = None
+                for stage in range(args.context_rounds):
+                    # Revisit the first job after older evidence has left the
+                    # resident set. The model must choose how to recover it.
+                    current = (
+                        target
+                        if stage == args.context_rounds - 1
+                        else (f"job-{(int(target[4:]) + stage * 7) % args.rows:04d}")
+                    )
+                    result = await audit_stage(index, current, sid, stage)
+                return result
+            finally:
+                store.release_session(sid)
+
+        branch_tasks = [
+            asyncio.create_task(branch(i, target)) for i, target in enumerate(targets)
+        ]
         try:
-            decisions = await asyncio.gather(
-                *(branch(i, target) for i, target in enumerate(targets))
-            )
+            decisions = await asyncio.gather(*branch_tasks)
             summary = [
                 {"job": row["target"], "answer": row["answer"]} for row in decisions
             ]
@@ -417,18 +512,39 @@ async def run(args):
                 errors.append(dict(identity=root + "/reduce", error=str(error)))
                 reducers.append(dict(case=case_id, correct=False))
         finally:
+            for task in branch_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*branch_tasks, return_exceptions=True)
             store.release_session(root)
             lifecycle.append(
                 dict(
                     case=case_id,
                     original_bytes=original_bytes,
+                    peak_stored_bytes=peak_stored_bytes,
                     final=store.stats(),
                     disk_bytes=(directory / f"case-{case_id}.sqlite").stat().st_size,
                 )
             )
             store.close()
 
-    sampler = None
+    async def run_case(case_id, directory):
+        async with workflow_semaphore:
+            await case(case_id, directory)
+            print(
+                args.mode,
+                "completed cases",
+                len(lifecycle),
+                "/",
+                args.cases,
+                "correct branches",
+                sum(row["correct"] for row in branches),
+                "/",
+                len(branches),
+                flush=True,
+            )
+
+    samplers = []
     try:
         # Unrelated warmup is identical for every arm and excluded from metrics.
         await client.chat.completions.create(
@@ -458,29 +574,46 @@ async def run(args):
                     raise ValueError(
                         "benchmark KV budget differs from server configuration"
                     )
-        start = time.perf_counter()
-        sampler = asyncio.create_task(monitor())
-        with tempfile.TemporaryDirectory(prefix="agentrix-tool-pages-") as temporary:
-            for case_id in range(args.cases):
-                await case(case_id, Path(temporary))
-                print(
-                    args.mode,
-                    "case",
-                    case_id + 1,
-                    "/",
-                    args.cases,
-                    "correct",
-                    sum(row["correct"] for row in branches),
-                    "/",
-                    len(branches),
-                    flush=True,
+                gpu_blocks = re.search(r'num_gpu_blocks="(\d+)"', cache_config)
+                num_gpu_blocks = int(gpu_blocks.group(1)) if gpu_blocks else None
+                preemptions_before = sum(
+                    float(line.rsplit(" ", 1)[1])
+                    for line in metrics.splitlines()
+                    if line.startswith("vllm:num_preemptions_total{")
                 )
+        start = time.perf_counter()
+        samplers = [
+            asyncio.create_task(monitor()),
+            asyncio.create_task(monitor_processes()),
+        ]
+        with tempfile.TemporaryDirectory(prefix="agentrix-tool-pages-") as temporary:
+            tasks = [
+                asyncio.create_task(run_case(case_id, Path(temporary)))
+                for case_id in range(args.cases)
+            ]
+            try:
+                await asyncio.gather(*tasks)
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                # Let each workflow release its snapshots before removing the
+                # temporary directory, including when a sibling has failed.
+                await asyncio.gather(*tasks, return_exceptions=True)
     finally:
         elapsed = time.perf_counter() - start
         stop.set()
-        if sampler is not None:
-            await sampler
+        await asyncio.gather(*samplers)
         await client.close()
+    async with aiohttp.ClientSession() as http:
+        async with http.get(args.base_url.rstrip("/") + "/metrics") as response:
+            response.raise_for_status()
+            metrics = await response.text()
+    preemptions_after = sum(
+        float(line.rsplit(" ", 1)[1])
+        for line in metrics.splitlines()
+        if line.startswith("vllm:num_preemptions_total{")
+    )
     payload = dict(
         schema_version=1,
         workload="seeded build-report tool workflow; scripted ingestion, model-selected retrieval, fanout and reduction",
@@ -493,6 +626,15 @@ async def run(args):
         cases=args.cases,
         branches_per_case=args.branches,
         concurrency=args.concurrency,
+        workflow_concurrency=args.workflow_concurrency,
+        context_rounds=args.context_rounds,
+        tool_context_tokens=args.tool_context_tokens,
+        search_excerpt_chars=args.search_excerpt_chars,
+        tokenizer_sha256=(
+            hashlib.sha256((args.tokenizer / "tokenizer.json").read_bytes()).hexdigest()
+            if args.tokenizer
+            else None
+        ),
         kv_cache_bytes=args.kv_cache_bytes,
         restore_on_validation_error=args.restore_on_validation_error,
         validation_restore_sources=["checks"],
@@ -535,6 +677,22 @@ async def run(args):
         tool_calls=sum(row["tool_calls"] for row in branches),
         validation_retries=sum(row["validation_retries"] for row in branches),
         context_restorations=sum(row["context_restorations"] for row in branches),
+        peak_tool_context_tokens=max(
+            (
+                sample["tokens"]
+                for row in branches
+                for sample in row["tool_context_samples"]
+            ),
+            default=None,
+        ),
+        peak_archived_observations=max(
+            (
+                sample["archived_observations"]
+                for row in branches
+                for sample in row["tool_context_samples"]
+            ),
+            default=0,
+        ),
         mean_ttft=statistics.mean(row["ttft"] for row in requests)
         if requests
         else None,
@@ -548,6 +706,21 @@ async def run(args):
         peak_application_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
         sampled_peak_live_kv_bytes=args.kv_cache_bytes
         * max((row.get("kv_usage", 0) for row in memory), default=0),
+        sampled_peak_live_kv_blocks=(
+            round(
+                (num_gpu_blocks - 1)
+                * max((row.get("kv_usage", 0) for row in memory), default=0)
+            )
+            if num_gpu_blocks is not None
+            else None
+        ),
+        sampled_peak_running_requests=max(
+            (row.get("num_requests_running", 0) for row in memory), default=0
+        ),
+        sampled_peak_waiting_requests=max(
+            (row.get("num_requests_waiting", 0) for row in memory), default=0
+        ),
+        preemptions=preemptions_after - preemptions_before,
         all_snapshots_reclaimed=all(
             row["final"]["objects"] == 0 and row["final"]["sessions"] == 0
             for row in lifecycle
@@ -570,7 +743,35 @@ def main():
     parser.add_argument("--branches", type=int, default=3)
     parser.add_argument("--rows", type=int, default=128)
     parser.add_argument("--concurrency", type=int, default=3)
+    parser.add_argument(
+        "--workflow-concurrency",
+        type=int,
+        default=1,
+        help="Concurrent workflows; --concurrency still caps in-flight model requests.",
+    )
     parser.add_argument("--max-steps", type=int, default=8)
+    parser.add_argument(
+        "--context-rounds",
+        type=int,
+        default=1,
+        help="Sequential audits per branch; the final stage revisits its first job.",
+    )
+    parser.add_argument(
+        "--tool-context-tokens",
+        type=int,
+        help="Cumulative tool observation budget; omit for an unbounded baseline.",
+    )
+    parser.add_argument(
+        "--tokenizer",
+        type=Path,
+        help="Model directory containing tokenizer.json; enables archived observations.",
+    )
+    parser.add_argument(
+        "--search-excerpt-chars",
+        type=int,
+        default=0,
+        help="Return an excerpt instead of just the matched JSON row (0).",
+    )
     parser.add_argument("--restore-on-validation-error", action="store_true")
     parser.add_argument("--max-restore-chars", type=int, default=131072)
     parser.add_argument("--gpu", type=int, default=0)
@@ -583,7 +784,9 @@ def main():
             args.branches,
             args.rows,
             args.concurrency,
+            args.workflow_concurrency,
             args.max_steps,
+            args.context_rounds,
             args.max_restore_chars,
             args.kv_cache_bytes,
         )
@@ -591,6 +794,29 @@ def main():
         or args.branches >= args.rows
     ):
         parser.error("positive bounds and rows > branches are required")
+    if (
+        args.context_rounds > 1 or args.tool_context_tokens is not None
+    ) and not args.tokenizer:
+        parser.error(
+            "--tokenizer is required for context budgets or multi-stage audits"
+        )
+    if args.tool_context_tokens is not None and args.tool_context_tokens < 1:
+        parser.error("--tool-context-tokens must be positive")
+    if not 0 <= args.search_excerpt_chars <= 16384:
+        parser.error("--search-excerpt-chars must be in 0..16384")
+    if args.tokenizer:
+        if args.mode != "paged" or args.restore_on_validation_error:
+            parser.error(
+                "archived context requires --mode paged without full-report restoration"
+            )
+        global SYSTEM
+        SYSTEM += """
+Tool history is a bounded recent_results catalog. Old observations remain on disk.
+Retrieve their metadata with {"action":"list_observations","offset":0} and exact
+content with {"action":"read_observation","result_id":"...","offset":0,"limit":768}.
+Partial entries contain only an exact prefix; next_offset is the next unread character.
+You can also search either original report again. Each stage audits only its current job.
+"""
     asyncio.run(run(args))
 
 

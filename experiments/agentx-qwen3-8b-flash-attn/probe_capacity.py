@@ -1,8 +1,7 @@
 """AgentX capacity observations and experimental policy comparisons on the server.
 
-Policy sweeps explicitly opt in to default-off candidates. A successful run means
-the measurement passed validation, not that the candidate improved performance.
-Adaptive-prefill runs shorter than 900 seconds are non-submission screening only.
+A successful run means the measurement passed validation, not that the candidate
+improved performance. Runs shorter than 900 seconds are screening only.
 """
 
 import argparse
@@ -714,7 +713,6 @@ def run_comparison(
     after_run=None,
     after_arm=None,
     policy_source=None,
-    include_arc=False,
     upstream_env=None,
     resume_run=None,
     warmup_requests_per_lane=10,
@@ -779,52 +777,15 @@ def run_comparison(
         arms = [("smoke_cpu32", False, 0, 32), ("baseline", False, 0, 0)] + [
             (f"cpu{gib}", False, 0, gib) for gib in (32, 64)
         ]
-    elif mode == "session-sweep":
-        arms = [
-            ("smoke_session", False, 0, 32),
-            ("lru", False, 0, 32),
-            ("session_lru", False, 0, 32),
-        ]
-        if include_arc:
-            arms.insert(2, ("arc", False, 0, 32))
-    elif mode == "gpu-session-sweep":
-        arms = [
-            ("smoke_gpu_session", False, 0, 32),
-            ("lru", False, 0, 32),
-            ("gpu_session", False, 0, 32),
-        ]
-    elif mode == "adaptive-prefill-sweep":
-        arms = [
-            ("lru", False, 0, 32),
-            ("adaptive", False, 0, 32),
-        ]
     elif mode == "upstream-sweep":
         arms = [
             ("smoke_upstream_cpu32", False, 0, 32),
             ("upstream_gpu", False, 0, 0),
             ("upstream_lru_cpu32", False, 0, 32),
         ]
-    session_sweep = mode == "session-sweep"
-    gpu_session_sweep = mode == "gpu-session-sweep"
-    adaptive_sweep = mode == "adaptive-prefill-sweep"
-    screening = adaptive_sweep and duration < 900
-    agent_hints = (
-        session_sweep or gpu_session_sweep or adaptive_sweep or mode == "upstream-sweep"
-    )
-    policies = {
-        name: ("session_lru" if name == "smoke_session" else name)
-        if session_sweep
-        else "lru"
-        for name, _, _, _ in arms
-    }
-    policy_config = {"retention_seconds": 120, "protected_fraction": 0.5}
-    gpu_retention_config = {
-        "protected_fraction": 0.25,
-        "default_seconds": 15.0,
-        "min_seconds": 2.0,
-        "max_seconds": 30.0,
-        "max_sessions": 256,
-    }
+    screening = duration < 900
+    agent_hints = mode == "upstream-sweep"
+    policies = {name: "lru" for name, _, _, _ in arms}
     if reverse:
         arms = [arm for arm in arms if arm[0].startswith("smoke_")] + [
             arm for arm in reversed(arms) if not arm[0].startswith("smoke_")
@@ -854,7 +815,6 @@ def run_comparison(
             "grace_seconds": 300,
             "concurrency": 8,
             "warmup_requests_per_lane": warmup_requests_per_lane,
-            "inline_smoke": adaptive_sweep,
             "screening_only": screening,
             "seed": 20260707,
             "order": [name for name, _, _, _ in arms],
@@ -865,20 +825,6 @@ def run_comparison(
             "capacity_bypass": {name: enabled for name, enabled, _, _ in arms},
             "cpu_offload_gib": {name: gib for name, _, _, gib in arms},
             "offload_policy": policies,
-            "session_policy_config": policy_config if session_sweep else None,
-            "gpu_session_retention": gpu_retention_config
-            if gpu_session_sweep
-            else None,
-            "adaptive_prefill": {
-                "mixed_prefill_tokens": 2048,
-                "short_request_tokens": 1024,
-                "max_full_prefix_probes": 2,
-                "max_deferred_steps": 4,
-                "lookahead": 8,
-                "enabled": {name: name != "lru" for name, _, _, _ in arms},
-            }
-            if adaptive_sweep
-            else None,
             "policy_source_sha256": policy_hashes,
             "agent_tree_hints": agent_hints,
             "upstream_release": {
@@ -1003,12 +949,6 @@ def run_comparison(
                     f"RUN={part}",
                 ).rstrip()
                 additional_config = {"agentrix_capacity_bypass": enabled}
-                if adaptive_sweep:
-                    additional_config["agentrix_adaptive_prefill"] = name != "lru"
-                if gpu_session_sweep and name != "lru":
-                    additional_config["agentrix_gpu_session_retention"] = (
-                        gpu_retention_config
-                    )
                 config = json.dumps(additional_config)
                 serve += f" --long-prefill-token-threshold {cap}"
                 if kv_cache_bytes is not None:
@@ -1025,10 +965,6 @@ def run_comparison(
                             "offload_prompt_only": True,
                         },
                     }
-                    if policies[name] == "session_lru":
-                        transfer["kv_connector_extra_config"]["cache_policy_config"] = (
-                            policy_config
-                        )
                     serve += " --kv-transfer-config " + shlex.quote(
                         json.dumps(transfer)
                     )
@@ -1038,9 +974,7 @@ def run_comparison(
                 (part / "serve.sh").write_text(serve)
                 env = dict(os.environ)
                 env.pop("AGENTRIX_CAPACITY_PROBE", None)
-                env["VLLM_SERVER_DEV_MODE"] = (
-                    "1" if adaptive_sweep or name.startswith("smoke_") else "0"
-                )
+                env["VLLM_SERVER_DEV_MODE"] = "1" if name.startswith("smoke_") else "0"
                 server = None
                 bench = None
                 try:
@@ -1083,20 +1017,6 @@ def run_comparison(
                     elif kv_tokens != expected_kv_tokens:
                         raise RuntimeError("KV cache capacity changed between arms")
                     print("READY", name, "kv_tokens", kv_tokens, flush=True)
-                    if (
-                        adaptive_sweep
-                        and name != "lru"
-                        and "Adaptive prefill enabled:"
-                        not in (part / "server.log").read_text()
-                    ):
-                        raise RuntimeError("Adaptive prefill was not activated")
-                    if (
-                        gpu_session_sweep
-                        and name != "lru"
-                        and "GPU session retention enabled:"
-                        not in (part / "server.log").read_text()
-                    ):
-                        raise RuntimeError("GPU session retention was not activated")
                     if upstream_env is not None:
                         server_log = (part / "server.log").read_text()
                         if any(
@@ -1112,15 +1032,10 @@ def run_comparison(
                     if name.startswith("smoke_"):
                         (run_dir / "status").write_text(f"{name}: checking_roundtrip")
                         (part / "status").write_text("checking_roundtrip")
-                        check_offload_roundtrip(part, mixed=adaptive_sweep)
+                        check_offload_roundtrip(part)
                         (part / "status").write_text("success")
                         print("DONE", name, flush=True)
                         continue
-                    if adaptive_sweep:
-                        (run_dir / "status").write_text(f"{name}: checking_roundtrip")
-                        (part / "status").write_text("checking_roundtrip")
-                        check_offload_roundtrip(part, mixed=True, reset_after=True)
-                        print("CHECKED", name, "GPU/CPU and mixed outputs", flush=True)
                     (run_dir / "status").write_text(f"{name}: warmup_and_profiling")
                     (part / "status").write_text("warmup_and_profiling")
                     command = next(
@@ -1230,9 +1145,6 @@ if __name__ == "__main__":
     mode.add_argument("--ab", action="store_true")
     mode.add_argument("--prefill-sweep", action="store_true")
     mode.add_argument("--offload-sweep", action="store_true")
-    mode.add_argument("--session-sweep", action="store_true")
-    mode.add_argument("--gpu-session-sweep", action="store_true")
-    mode.add_argument("--adaptive-prefill-sweep", action="store_true")
     mode.add_argument("--upstream-sweep", action="store_true")
     parser.add_argument("--policy-source", type=Path)
     parser.add_argument("--upstream-env", type=Path)
@@ -1244,18 +1156,13 @@ if __name__ == "__main__":
         "--warmup-requests-per-lane",
         type=int,
         default=10,
-        help="Warmup turns per lane; use 2 for adaptive-prefill screening",
+        help="Warmup turns per lane; use 2 for short screening runs",
     )
     parser.add_argument(
         "--duration",
         type=int,
         default=900,
-        help="Measured seconds per arm; default 900, or >=300 for adaptive screening",
-    )
-    parser.add_argument(
-        "--include-arc",
-        action="store_true",
-        help="Add ARC to the session-policy comparison after initial screening",
+        help="Measured seconds per arm; default 900, or >=300 for screening",
     )
     parser.add_argument(
         "--reverse",
@@ -1267,52 +1174,34 @@ if __name__ == "__main__":
         args.ab
         or args.prefill_sweep
         or args.offload_sweep
-        or args.session_sweep
-        or args.gpu_session_sweep
-        or args.adaptive_prefill_sweep
         or args.upstream_sweep
     )
-    if args.reverse and not (
-        args.ab or args.gpu_session_sweep or args.adaptive_prefill_sweep
-    ):
-        parser.error(
-            "--reverse requires --ab, --gpu-session-sweep or --adaptive-prefill-sweep"
-        )
+    if args.reverse and not comparison:
+        parser.error("--reverse requires a comparison")
     if (
         args.prefill_sweep
         or args.offload_sweep
-        or args.session_sweep
-        or args.gpu_session_sweep
-        or args.adaptive_prefill_sweep
         or args.upstream_sweep
     ) and args.kv_cache_bytes is None:
         parser.error("Sweeps require --kv-cache-bytes")
-    if (
-        args.session_sweep or args.gpu_session_sweep or args.adaptive_prefill_sweep
-    ) != (args.policy_source is not None):
-        parser.error("Policy sweeps and --policy-source must be supplied together")
+    if args.policy_source is not None and (not comparison or args.upstream_sweep):
+        parser.error("--policy-source requires a fork comparison")
     if args.upstream_sweep != (args.upstream_env is not None):
         parser.error("--upstream-sweep and --upstream-env must be supplied together")
-    if args.include_arc and not args.session_sweep:
-        parser.error("--include-arc requires --session-sweep")
     if args.after_run is not None and not comparison:
         parser.error("--after-run requires a comparison")
     if args.resume_run is not None and (not comparison or args.after_run is not None):
         parser.error("--resume-run requires a comparison without --after-run")
     if args.after_arm is not None and (
-        args.after_run is None or not (args.offload_sweep or args.session_sweep)
+        args.after_run is None or not args.offload_sweep
     ):
-        parser.error("--after-arm requires --after-run and an offload/session sweep")
+        parser.error("--after-arm requires --after-run and an offload sweep")
     if args.kv_cache_bytes is not None and (args.kv_cache_bytes <= 0 or not comparison):
         parser.error("--kv-cache-bytes must be positive and requires a comparison")
-    if args.warmup_requests_per_lane < 1 or (
-        args.warmup_requests_per_lane != 10 and not args.adaptive_prefill_sweep
-    ):
-        parser.error(
-            "Shorter warmup requires --adaptive-prefill-sweep and must be positive"
-        )
+    if args.warmup_requests_per_lane < 1:
+        parser.error("--warmup-requests-per-lane must be positive")
     if comparison:
-        min_duration = 300 if args.adaptive_prefill_sweep else 900
+        min_duration = 300
         if args.duration < min_duration:
             parser.error(f"Comparison requires at least {min_duration} seconds per arm")
 
@@ -1325,12 +1214,6 @@ if __name__ == "__main__":
             mode = "prefill-sweep"
         elif args.offload_sweep:
             mode = "offload-sweep"
-        elif args.session_sweep:
-            mode = "session-sweep"
-        elif args.gpu_session_sweep:
-            mode = "gpu-session-sweep"
-        elif args.adaptive_prefill_sweep:
-            mode = "adaptive-prefill-sweep"
         elif args.upstream_sweep:
             mode = "upstream-sweep"
         run_comparison(
@@ -1341,7 +1224,6 @@ if __name__ == "__main__":
             after_run=args.after_run,
             after_arm=args.after_arm,
             policy_source=args.policy_source,
-            include_arc=args.include_arc,
             upstream_env=args.upstream_env,
             resume_run=args.resume_run,
             warmup_requests_per_lane=args.warmup_requests_per_lane,

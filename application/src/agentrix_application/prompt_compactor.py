@@ -5,7 +5,8 @@ import hashlib
 import json
 import os
 import sqlite3
-from collections.abc import Mapping
+import uuid
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -174,8 +175,8 @@ class ToolResultBackingStore:
 class PagedToolStore:
     """Immutable tool snapshots with bounded reads and session-owned references.
 
-    Forking copies references, never result bodies. New branch results create
-    new immutable objects; releasing the last session reclaims their disk pages.
+    Forking copies references, never result bodies. Changed snapshots share
+    identical pages. Releasing the last owner of a page reclaims its storage.
     One owner thread must serialize calls (for example an Agent event loop).
     """
 
@@ -196,9 +197,12 @@ class PagedToolStore:
             CREATE TABLE IF NOT EXISTS objects (
                 id TEXT PRIMARY KEY, chars INTEGER NOT NULL, bytes INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS chunks (
+                id TEXT PRIMARY KEY, content TEXT NOT NULL, bytes INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS pages (
                 object_id TEXT REFERENCES objects(id) ON DELETE CASCADE,
-                number INTEGER, content TEXT NOT NULL,
+                number INTEGER, chunk_id TEXT REFERENCES chunks(id),
                 PRIMARY KEY (object_id, number)
             );
             CREATE TABLE IF NOT EXISTS refs (
@@ -207,7 +211,46 @@ class PagedToolStore:
                 PRIMARY KEY (session_id, object_id)
             );
             CREATE INDEX IF NOT EXISTS refs_object ON refs(object_id);
+            CREATE TABLE IF NOT EXISTS observations (
+                session_id TEXT, sequence INTEGER, object_id TEXT, label TEXT,
+                PRIMARY KEY (session_id, sequence),
+                FOREIGN KEY (session_id, object_id)
+                    REFERENCES refs(session_id, object_id) ON DELETE CASCADE
+            );
         """)
+        # Preserve existing handles, sessions and catalogs when opening an old
+        # database whose pages still contain private copies of the text.
+        try:
+            with self.db:
+                self.db.execute("BEGIN")
+                if "content" in {
+                    row[1] for row in self.db.execute("PRAGMA table_info(pages)")
+                }:
+                    self.db.execute("""CREATE TABLE shared_pages (
+                        object_id TEXT REFERENCES objects(id) ON DELETE CASCADE,
+                        number INTEGER, chunk_id TEXT REFERENCES chunks(id),
+                        PRIMARY KEY (object_id, number))""")
+                    for object_id, number, content in self.db.execute(
+                        "SELECT object_id, number, content FROM pages"
+                    ):
+                        data = content.encode("utf-8")
+                        chunk_id = hashlib.sha256(data).hexdigest()
+                        self.db.execute(
+                            "INSERT OR IGNORE INTO chunks VALUES (?, ?, ?)",
+                            (chunk_id, content, len(data)),
+                        )
+                        self.db.execute(
+                            "INSERT INTO shared_pages VALUES (?, ?, ?)",
+                            (object_id, number, chunk_id),
+                        )
+                    self.db.execute("DROP TABLE pages")
+                    self.db.execute("ALTER TABLE shared_pages RENAME TO pages")
+                self.db.execute(
+                    "CREATE INDEX IF NOT EXISTS pages_chunk ON pages(chunk_id)"
+                )
+        except BaseException:
+            self.db.close()
+            raise
 
     def open_session(self, session_id: str, *, parent: str | None = None) -> None:
         if not isinstance(session_id, str) or not 0 < len(session_id) <= 128:
@@ -221,6 +264,11 @@ class PagedToolStore:
                     "INSERT INTO refs SELECT ?, object_id FROM refs WHERE session_id=?",
                     (session_id, parent),
                 )
+                self.db.execute(
+                    "INSERT INTO observations SELECT ?, sequence, object_id, label "
+                    "FROM observations WHERE session_id=?",
+                    (session_id, parent),
+                )
 
     def _require_session(self, session_id: str) -> None:
         if (
@@ -232,40 +280,116 @@ class PagedToolStore:
             raise KeyError(f"unknown tool-result session {session_id!r}")
 
     def put(self, session_id: str, content: str) -> str:
-        hasher = hashlib.sha256()
-        size = 0
-        for start in range(0, len(content), self.PAGE_CHARS):
-            data = content[start : start + self.PAGE_CHARS].encode("utf-8")
-            hasher.update(data)
-            size += len(data)
-        digest = hasher.hexdigest()
+        return self.put_stream(session_id, (content,))
+
+    def put_stream(self, session_id: str, pieces: Iterable[str]) -> str:
+        """Store a stream without assembling its complete body in host memory.
+
+        The quota charges unique UTF-8 pages. An interrupted stream or quota
+        failure rolls back every new page, mapping and session reference.
+        Producers must not mutate this store while yielding pieces.
+        """
+
+        def pages():
+            pending = ""
+            for piece in pieces:
+                if not isinstance(piece, str):
+                    raise TypeError("tool-result pieces must be strings")
+                for start in range(0, len(piece), self.PAGE_CHARS):
+                    pending += piece[start : start + self.PAGE_CHARS]
+                    if len(pending) >= self.PAGE_CHARS:
+                        yield pending[: self.PAGE_CHARS]
+                        pending = pending[self.PAGE_CHARS :]
+            if pending:
+                yield pending
+
         with self.db:
             self._require_session(session_id)
-            exists = self.db.execute(
-                "SELECT 1 FROM objects WHERE id=?", (digest,)
-            ).fetchone()
-            if exists is None:
-                if self.stats()["stored_bytes"] + size > self.max_bytes:
-                    raise ValueError("tool-result storage budget exceeded")
+            temporary = uuid.uuid4().hex
+            self.db.execute("INSERT INTO objects VALUES (?, 0, 0)", (temporary,))
+            used = self.stats()["stored_bytes"]
+            hasher, chars, size = hashlib.sha256(), 0, 0
+            for number, page in enumerate(pages()):
+                data = page.encode("utf-8")
+                hasher.update(data)
+                chars += len(page)
+                size += len(data)
+                chunk_id = hashlib.sha256(data).hexdigest()
+                if (
+                    self.db.execute(
+                        "SELECT 1 FROM chunks WHERE id=?", (chunk_id,)
+                    ).fetchone()
+                    is None
+                ):
+                    if used + len(data) > self.max_bytes:
+                        raise ValueError("tool-result storage budget exceeded")
+                    self.db.execute(
+                        "INSERT INTO chunks VALUES (?, ?, ?)",
+                        (chunk_id, page, len(data)),
+                    )
+                    used += len(data)
                 self.db.execute(
-                    "INSERT INTO objects VALUES (?, ?, ?)",
-                    (digest, len(content), size),
+                    "INSERT INTO pages VALUES (?, ?, ?)", (temporary, number, chunk_id)
                 )
-                self.db.executemany(
-                    "INSERT INTO pages VALUES (?, ?, ?)",
-                    (
-                        (
-                            digest,
-                            start // self.PAGE_CHARS,
-                            content[start : start + self.PAGE_CHARS],
-                        )
-                        for start in range(0, len(content), self.PAGE_CHARS)
-                    ),
+            digest = hasher.hexdigest()
+            if (
+                self.db.execute(
+                    "SELECT 1 FROM objects WHERE id=?", (digest,)
+                ).fetchone()
+                is None
+            ):
+                self.db.execute(
+                    "INSERT INTO objects VALUES (?, ?, ?)", (digest, chars, size)
                 )
+                self.db.execute(
+                    "UPDATE pages SET object_id=? WHERE object_id=?",
+                    (digest, temporary),
+                )
+            self.db.execute("DELETE FROM objects WHERE id=?", (temporary,))
             self.db.execute(
                 "INSERT OR IGNORE INTO refs VALUES (?, ?)", (session_id, digest)
             )
         return digest
+
+    def replace_range(
+        self,
+        session_id: str,
+        result_id: str,
+        *,
+        offset: int,
+        delete_chars: int,
+        content: str,
+    ) -> str:
+        """Create a private immutable revision using bounded host memory.
+
+        Equal-length edits and appends reuse unchanged pages. Insertions that
+        shift page boundaries may need new pages throughout the changed suffix.
+        The caller keeps both handles until the owning session is released.
+        """
+        total = self.read(session_id, result_id, offset=offset, limit=1)["total_chars"]
+        if type(delete_chars) is not int or not 0 <= delete_chars <= total - offset:
+            raise ValueError("delete_chars exceeds the available character range")
+        if not isinstance(content, str):
+            raise TypeError("replacement content must be a string")
+
+        def pieces():
+            for start in range(0, offset, self.PAGE_CHARS):
+                yield self.read(
+                    session_id,
+                    result_id,
+                    offset=start,
+                    limit=min(self.PAGE_CHARS, offset - start),
+                )["content"]
+            yield content
+            for start in range(offset + delete_chars, total, self.PAGE_CHARS):
+                yield self.read(
+                    session_id,
+                    result_id,
+                    offset=start,
+                    limit=min(self.PAGE_CHARS, total - start),
+                )["content"]
+
+        return self.put_stream(session_id, pieces())
 
     def read(
         self, session_id: str, result_id: str, *, offset: int = 0, limit: int = 4096
@@ -287,7 +411,8 @@ class PagedToolStore:
             raise ValueError("offset exceeds result length")
         end = min(total, offset + limit)
         pages = self.db.execute(
-            "SELECT content FROM pages WHERE object_id=? AND number BETWEEN ? "
+            "SELECT content FROM pages JOIN chunks ON chunks.id=pages.chunk_id "
+            "WHERE object_id=? AND number BETWEEN ? "
             "AND ? ORDER BY number",
             (
                 result_id,
@@ -349,11 +474,156 @@ class PagedToolStore:
                 "DELETE FROM objects WHERE NOT EXISTS "
                 "(SELECT 1 FROM refs WHERE refs.object_id=objects.id)"
             )
+            self.db.execute(
+                "DELETE FROM chunks WHERE NOT EXISTS "
+                "(SELECT 1 FROM pages WHERE pages.chunk_id=chunks.id)"
+            )
+
+    def record_observation(self, session_id: str, label: str, content: str) -> int:
+        """Archive a tool observation; keep its body out of in-memory history."""
+        if not isinstance(label, str) or not 1 <= len(label) <= 256:
+            raise ValueError("observation label must contain 1..256 characters")
+        digest = self.put(session_id, content)
+        with self.db:
+            sequence = self.db.execute(
+                "SELECT COALESCE(MAX(sequence), -1) + 1 FROM observations "
+                "WHERE session_id=?",
+                (session_id,),
+            ).fetchone()[0]
+            self.db.execute(
+                "INSERT INTO observations VALUES (?, ?, ?, ?)",
+                (session_id, sequence, digest, label),
+            )
+        return sequence
+
+    def list_observations(
+        self, session_id: str, *, offset: int = 0, limit: int = 16
+    ) -> list[dict[str, Any]]:
+        """Page through archived tool metadata without loading result bodies."""
+        self._require_session(session_id)
+        if type(offset) is not int or offset < 0:
+            raise ValueError("offset must be a nonnegative integer")
+        if type(limit) is not int or not 1 <= limit <= 64:
+            raise ValueError("limit must be in 1..64 observations")
+        rows = self.db.execute(
+            "SELECT sequence, object_id, label, chars FROM observations "
+            "JOIN objects ON objects.id=object_id WHERE session_id=? "
+            "AND sequence>=? ORDER BY sequence LIMIT ?",
+            (session_id, offset, limit),
+        )
+        return [
+            dict(sequence=n, result_id=key, label=label, total_chars=chars)
+            for n, key, label, chars in rows
+        ]
+
+    def render_context(
+        self,
+        session_id: str,
+        *,
+        count_tokens: Callable[[str], int],
+        max_tokens: int | None,
+    ) -> dict[str, Any]:
+        """Render recent tool evidence within a cumulative token budget.
+
+        The bound includes catalog metadata and JSON framing, using the caller's
+        model tokenizer. It excludes other messages and chat-template overhead.
+        Older observations remain discoverable with list_observations and can
+        be read again by handle. The newest oversized result is an exact prefix,
+        explicitly marked partial; nothing is summarized or silently truncated.
+        None renders all observations for the unbounded benchmark baseline.
+        """
+        self._require_session(session_id)
+        if max_tokens is not None and (type(max_tokens) is not int or max_tokens < 1):
+            raise ValueError("max_tokens must be positive or None")
+        total = self.db.execute(
+            "SELECT COUNT(*) FROM observations WHERE session_id=?", (session_id,)
+        ).fetchone()[0]
+
+        def encode(entries):
+            return json.dumps(
+                dict(
+                    observation_count=total,
+                    archived_count=total - len(entries),
+                    recent_results=list(reversed(entries)),
+                ),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+
+        entries: list[dict[str, Any]] = []
+        text = encode(entries)
+        if max_tokens is not None and count_tokens(text) > max_tokens:
+            raise ValueError("tool-context budget cannot fit catalog metadata")
+        rows = self.db.execute(
+            "SELECT sequence, object_id, label, chars FROM observations "
+            "JOIN objects ON objects.id=object_id WHERE session_id=? "
+            "ORDER BY sequence DESC",
+            (session_id,),
+        )
+        for sequence, digest, label, chars in rows:
+            # Bound temporary host memory too; large bodies stay on disk.
+            limit = chars if max_tokens is None else min(chars, 16384)
+            content = "".join(
+                self.read(
+                    session_id, digest, offset=start, limit=min(16384, limit - start)
+                )["content"]
+                for start in range(0, limit, 16384)
+            )
+            entry = dict(
+                sequence=sequence,
+                result_id=digest,
+                label=label,
+                total_chars=chars,
+                next_offset=len(content),
+                partial=len(content) < chars,
+                content=content,
+            )
+            candidate = encode([*entries, entry])
+            if max_tokens is not None and count_tokens(candidate) > max_tokens:
+                if entries:
+                    break
+                # Keep a bounded exact prefix of the most recent result.
+                # Token lengths need not be monotone; every accepted candidate
+                # is measured, so the hard bound does not depend on monotonicity.
+                low, high = 0, len(content)
+                fitted = None
+                while low <= high:
+                    middle = (low + high) // 2
+                    trial = dict(
+                        entry,
+                        content=content[:middle],
+                        next_offset=middle,
+                        partial=middle < chars,
+                    )
+                    candidate = encode([trial])
+                    if count_tokens(candidate) <= max_tokens:
+                        fitted = trial
+                        low = middle + 1
+                    else:
+                        high = middle - 1
+                if fitted is None:
+                    raise ValueError(
+                        "tool-context budget cannot fit newest result handle"
+                    )
+                entry = fitted
+            entries.append(entry)
+            text = encode(entries)
+            if entry["partial"]:
+                break
+        return dict(
+            text=text,
+            tokens=count_tokens(text),
+            resident_observations=len(entries),
+            total_observations=total,
+            archived_observations=total - len(entries),
+            partial_observations=sum(row["partial"] for row in entries),
+        )
 
     def stats(self) -> dict[str, int]:
-        count, size = self.db.execute(
-            "SELECT COUNT(*), COALESCE(SUM(bytes), 0) FROM objects"
-        ).fetchone()
+        count = self.db.execute("SELECT COUNT(*) FROM objects").fetchone()[0]
+        size = self.db.execute("SELECT COALESCE(SUM(bytes), 0) FROM chunks").fetchone()[
+            0
+        ]
         return dict(
             objects=count,
             stored_bytes=size,

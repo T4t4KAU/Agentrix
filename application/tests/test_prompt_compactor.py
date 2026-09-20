@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import random
+import hashlib
+import sqlite3
 
 import pytest
 
@@ -100,6 +102,205 @@ def test_store_quota_is_atomic_and_sessions_are_isolated_after_reopen(tmp_path):
     assert store.stats()["sessions"] == 2
     store.release_session("a")
     assert store.put("b", "another value")
+    store.close()
+
+
+def test_changed_branch_shares_pages_and_quota_counts_only_new_data(tmp_path):
+    store = PagedToolStore(tmp_path / "cow.sqlite", max_bytes=3 * 4096)
+    store.open_session("parent")
+    original = "a" * 4096 + "b" * 4096
+    handle = store.put("parent", original)
+    store.open_session("left", parent="parent")
+    store.open_session("right", parent="parent")
+    changed = store.replace_range(
+        "left", handle, offset=11, delete_chars=3, content="NEW"
+    )
+    expected = original[:11] + "NEW" + original[14:]
+    assert changed == hashlib.sha256(expected.encode()).hexdigest()
+    assert store.read("left", changed, limit=16384)["content"] == expected
+    assert store.stats()["stored_bytes"] == 3 * 4096
+    assert store.put("left", expected) == changed  # No extra quota charge.
+    with pytest.raises(KeyError):
+        store.read("right", changed)
+    before = store.stats()
+    # Both changed pages would be new; every intermediate write must roll back.
+    store.max_bytes += 4096  # The first new page fits; the second must fail.
+    with pytest.raises(ValueError, match="budget"):
+        store.replace_range("right", handle, offset=4095, delete_chars=2, content="XX")
+    assert store.stats() == before
+    assert store.db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 3
+    store.release_session("parent")
+    store.release_session("left")
+    assert store.stats()["stored_bytes"] == 2 * 4096
+    assert store.read("right", handle, limit=16384)["content"] == original
+    store.release_session("right")
+    assert store.stats()["stored_bytes"] == 0
+    assert store.db.execute("SELECT COUNT(*) FROM pages").fetchone()[0] == 0
+    assert store.db.execute("PRAGMA foreign_key_check").fetchall() == []
+    store.close()
+
+
+def test_streamed_snapshots_preserve_unicode_offsets_and_roll_back_on_error(tmp_path):
+    store = PagedToolStore(tmp_path / "stream.sqlite")
+    store.open_session("agent")
+    original = "中😀" * 5000 + "tail"
+    handle = store.put_stream(
+        "agent", (original[i : i + 13] for i in range(0, len(original), 13))
+    )
+    assert handle == hashlib.sha256(original.encode()).hexdigest()
+    assert store.put("agent", original) == handle
+    for offset, deleted, replacement in [
+        (4095, 5, "new"),
+        (0, 0, "头"),
+        (len(original), 0, "尾"),
+        (0, len(original), ""),
+    ]:
+        revised = store.replace_range(
+            "agent", handle, offset=offset, delete_chars=deleted, content=replacement
+        )
+        expected = original[:offset] + replacement + original[offset + deleted :]
+        assert revised == hashlib.sha256(expected.encode()).hexdigest()
+        assert store.read("agent", revised, limit=16384)["content"] == expected
+    before = store.stats()
+
+    def interrupted():
+        yield "private" * 1024
+        raise RuntimeError("producer failed")
+
+    with pytest.raises(RuntimeError, match="producer failed"):
+        store.put_stream("agent", interrupted())
+    assert store.stats() == before
+    assert (
+        store.db.execute(
+            "SELECT COUNT(*) FROM chunks WHERE NOT EXISTS "
+            "(SELECT 1 FROM pages WHERE pages.chunk_id=chunks.id)"
+        ).fetchone()[0]
+        == 0
+    )
+    store.release_session("agent")
+    assert store.stats()["stored_bytes"] == 0
+    store.close()
+
+
+def test_existing_private_page_database_migrates_without_changing_handles(tmp_path):
+    path = tmp_path / "old.sqlite"
+    content = "shared page".ljust(4096) * 3
+    handle = hashlib.sha256(content.encode()).hexdigest()
+    with sqlite3.connect(path) as db:
+        db.executescript("""
+            CREATE TABLE sessions (id TEXT PRIMARY KEY);
+            CREATE TABLE objects (id TEXT PRIMARY KEY, chars INTEGER, bytes INTEGER);
+            CREATE TABLE pages (object_id TEXT REFERENCES objects(id) ON DELETE CASCADE,
+                number INTEGER, content TEXT, PRIMARY KEY(object_id, number));
+            CREATE TABLE refs (session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+                object_id TEXT REFERENCES objects(id), PRIMARY KEY(session_id, object_id));
+        """)
+        db.execute("INSERT INTO sessions VALUES ('parent')")
+        db.execute(
+            "INSERT INTO objects VALUES (?, ?, ?)", (handle, len(content), len(content))
+        )
+        db.execute("INSERT INTO refs VALUES ('parent', ?)", (handle,))
+        db.executemany(
+            "INSERT INTO pages VALUES (?, ?, ?)",
+            [(handle, i, content[i * 4096 : (i + 1) * 4096]) for i in range(3)],
+        )
+    store = PagedToolStore(path)
+    assert store.stats()["stored_bytes"] == 4096
+    assert store.read("parent", handle, limit=16384)["content"] == content
+    store.open_session("child", parent="parent")
+    store.release_session("parent")
+    assert (
+        store.read("child", handle, offset=4090, limit=20)["content"]
+        == content[4090:4110]
+    )
+    store.close()
+    store = PagedToolStore(path)
+    assert store.stats()["objects"] == 1
+    store.release_session("child")
+    assert store.stats()["stored_bytes"] == 0
+    store.close()
+
+
+def test_tool_context_budget_bounds_long_history_and_allows_cold_recovery(tmp_path):
+    store = PagedToolStore(tmp_path / "context.sqlite")
+    store.open_session("agent")
+
+    def count(text):
+        return len(text.encode("utf-8"))
+
+    originals = []
+    for step in range(120):
+        body = f"step {step}: " + "原始 evidence\n" * 120
+        originals.append(body)
+        store.record_observation("agent", f"read:{step}", body)
+        context = store.render_context("agent", count_tokens=count, max_tokens=4096)
+        assert context["tokens"] == count(context["text"]) <= 4096
+        recent = json.loads(context["text"])["recent_results"]
+        assert recent[-1]["sequence"] == step
+        assert recent[-1]["content"] == body[: recent[-1]["next_offset"]]
+    assert context["archived_observations"] > 100
+    # Old results remain paginated, owned and byte-exact after prompt eviction.
+    catalog = store.list_observations("agent", offset=0, limit=1)
+    first = store.read("agent", catalog[0]["result_id"])["content"]
+    assert first == originals[0]
+    store.record_observation("agent", "revisit:first", first)
+    context = store.render_context("agent", count_tokens=count, max_tokens=4096)
+    assert json.loads(context["text"])["recent_results"][-1]["content"] == first
+    assert store.stats()["objects"] == 120  # Retrieval does not duplicate storage.
+    store.release_session("agent")
+    assert store.stats() == dict(objects=0, stored_bytes=0, sessions=0, references=0)
+    assert store.db.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 0
+    store.close()
+
+
+def test_tool_context_forks_share_archive_but_own_their_new_observations(tmp_path):
+    store = PagedToolStore(tmp_path / "branches.sqlite")
+    store.open_session("parent")
+    store.record_observation("parent", "shared", "shared content")
+    store.open_session("left", parent="parent")
+    store.open_session("right", parent="parent")
+    assert store.stats()["objects"] == 1
+    store.record_observation("left", "private", "left-only content")
+    private = store.list_observations("left", offset=1)[0]
+    assert len(store.list_observations("right")) == 1
+    with pytest.raises(KeyError):
+        store.read("right", private["result_id"])
+    store.release_session("parent")
+    store.release_session("left")
+    assert store.stats()["objects"] == 1
+    assert store.list_observations("right")[0]["label"] == "shared"
+    store.release_session("right")
+    assert store.stats()["stored_bytes"] == 0
+    store.close()
+
+
+def test_tool_context_oversized_observation_is_explicitly_partial(tmp_path):
+    path = tmp_path / "partial.sqlite"
+    store = PagedToolStore(path)
+    store.open_session("agent")
+    original = "零😀abcdef" * 10000
+    store.record_observation("agent", "large", original)
+    context = store.render_context("agent", count_tokens=len, max_tokens=600)
+    result = json.loads(context["text"])["recent_results"][0]
+    assert context["tokens"] <= 600
+    assert result["partial"] and context["partial_observations"] == 1
+    assert result["content"] == original[: result["next_offset"]]
+    assert result["total_chars"] == len(original)
+    store.close()
+    store = PagedToolStore(path)
+    assert store.list_observations("agent")[0]["result_id"] == result["result_id"]
+    remainder = store.read("agent", result["result_id"], offset=result["next_offset"])
+    assert (
+        remainder["content"]
+        == original[result["next_offset"] : result["next_offset"] + 4096]
+    )
+    unbounded = store.render_context("agent", count_tokens=len, max_tokens=None)
+    assert json.loads(unbounded["text"])["recent_results"][0]["content"] == original
+    with pytest.raises(ValueError, match="budget"):
+        store.render_context("agent", count_tokens=len, max_tokens=1)
+    with pytest.raises(ValueError):
+        store.list_observations("agent", limit=100000)
+    store.release_session("agent")
     store.close()
 
 

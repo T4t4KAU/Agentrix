@@ -60,10 +60,11 @@ export AGENTRIX_PROMPT_COMPACTION_RECOVERABLE_TOOLS=read,read_file
 
 `PagedToolStore` stores immutable tool results in SQLite, split into 4,096-character
 pages. Agents receive handles and fetch a bounded range or search for a literal
-string. Identical results occupy one copy; a fork inherits references, while a
-new result in a branch creates a separate snapshot. Releasing the final owning
-session deletes the object and reclaims its database pages. Retrieval reads the
-historical result even if the original file has changed.
+string. Identical pages occupy one copy, including pages shared by different
+versions of a result. A fork inherits references; a changed result creates a
+separate immutable snapshot that reuses its unchanged pages. Releasing the final
+owner deletes an object and reclaims pages that no other object references.
+Retrieval reads the historical result even if the original file has changed.
 
 ```python
 from pathlib import Path
@@ -81,12 +82,43 @@ finally:
     store.close()
 ```
 
-The quota counts stored UTF-8 payload bytes, excluding SQLite metadata and
+The quota and `stats()["stored_bytes"]` count unique UTF-8 page payload bytes,
+excluding SQLite metadata and
 journals. The SQLite page cache is bounded; the currently produced tool result
 can still exist in application memory, and the OS can cache database pages.
 Calls must be serialized by the owning thread. Live snapshots are never silently
 evicted to meet the quota: a failed insertion rolls back without publishing a
 handle. Independent sessions cannot retrieve one another's objects.
+
+`put_stream(session, pieces)` accepts a string iterator without assembling the
+whole result. `replace_range(session, handle, offset=..., delete_chars=...,
+content=...)` creates a new revision using bounded buffers. Equal-length edits
+and appends share unchanged pages; insertions that shift 4,096-character page
+boundaries can require new pages throughout the suffix. Both original and new
+handles remain valid. Streams must not mutate the store while yielding data.
+Stream interruption or quota failure rolls back the unpublished revision. Old
+databases are migrated transactionally while retaining their handles and owners.
+
+Existing `put` callers gain page sharing automatically. Producers must use the
+streaming/range-update API to avoid building full result strings in host memory;
+the coding runner still supplies complete strings. Range updates still scan and
+hash the complete revision to preserve its content-addressed handle.
+
+To compare storage and host-memory use against an earlier implementation:
+
+```bash
+git show 52083f0:application/src/agentrix_application/prompt_compactor.py > /tmp/tool-store-before.py
+application/.venv/bin/python benchmark/scripts/benchmark_tool_snapshot_sharing.py \
+  --baseline-store /tmp/tool-store-before.py --size-mib 8 --branches 8 \
+  --output /tmp/tool-snapshot-sharing.json
+```
+
+This controlled workload makes eight 32-character edits to independent branches
+of an 8 MiB snapshot. Each arm runs in a fresh process on the same host, retains
+all versions, verifies their full SHA-256 hashes and checks final reclamation.
+The output separates stored payload, SQLite file size, process peak RSS and peak
+Python allocations during branch updates. It measures application data, without
+model inference; it provides no GPU KV or Agent quality result.
 
 The coding runner accepts `--tool-result-paging`. Large `read` and `search`
 observations become handles instead of truncated output. The agent can issue
@@ -95,6 +127,35 @@ catalog with original paths and snapshot order, so dropping old conversation
 turns does not lose access to their handles. Run completion or failure releases
 the owned snapshots. Other tools retain their existing behavior. This is application
 data sharing; vLLM's native prefix sharing and KV Copy-on-Write remain the baseline.
+
+### Bound the cumulative tool working set
+
+Limiting each retrieval does not bound a long conversation: retrieved results
+can accumulate again. `record_observation` archives those results, and
+`render_context` selects recent evidence within a cumulative token budget.
+Pass the model's tokenizer; the bound includes serialized metadata, handles and
+tool contents. Other messages, chat-template overhead and generated tokens need
+their own allowance. This controls the tool portion of the prompt, not the size
+of vLLM's preallocated pool.
+
+```python
+store.record_observation("branch", "read:src/example.py", tool_output)
+context = store.render_context(
+    "branch",
+    count_tokens=lambda text: len(tokenizer.encode(text, add_special_tokens=False)),
+    max_tokens=2048,
+)
+messages.append({"role": "user", "content": context["text"]})
+```
+
+Replace that context message before each request; do not append every rendered
+version to the history. The agent needs access to `list_observations` and `read`
+to recover archived evidence. A result larger than the budget contains an exact
+prefix marked `partial`, with a `next_offset` for continuation. Original bodies
+remain unchanged. Forks inherit the observation catalog and shared objects;
+subsequent branch observations are private. Releasing a session also removes its
+catalog. The coding runner's existing history policy is unchanged; this API is
+currently exercised by the multi-stage benchmark below.
 
 ### Reproducible closed-loop screening
 
@@ -120,6 +181,14 @@ workflow dependency, not an oracle-assisted answer repair. Restoration and retri
 can increase the required context window and are included in the totals. The
 coding runner currently exposes retrieval tools, but does not implement this
 task-specific score validator or automatic restoration policy.
+
+For a cumulative-budget ablation, run `--mode paged --context-rounds 6
+--search-excerpt-chars 1536 --tokenizer /path/to/model` twice, with and without
+`--tool-context-tokens 2048`. Leave full-report restoration disabled. Both arms
+archive observations, use the same retrieval tools and audit the same jobs; the
+last stage revisits the first job. The model chooses searches and reads, and the
+oracle checks every stage. Compare sampled occupied KV blocks and task success,
+alongside `peak_tool_context_tokens`; token counts alone are not GPU measurements.
 
 For Qwen3-8B on the server's H100 GPU 1, launch from `/mnt/sda1/hwx/Agentrix`:
 
@@ -154,6 +223,17 @@ tokens/timing, all model answers, errors, GPU memory samples, and final snapshot
 ownership. Report full workflow correctness as well as individual branch accuracy.
 The GPU number is sampled total board memory during the measured workload,
 including other board users; it is not an allocator-level lifetime high-water mark.
+
+To measure capacity within a fixed KV pool, keep serving limits identical and
+compare `--workflow-concurrency 4 --concurrency 12` in both modes, with the
+server's `--max-num-seqs` at least 12. The first flag overlaps whole workflows;
+the second caps their combined model requests. The default remains one workflow.
+KV usage is sampled separately from slower driver/RSS queries. Results include
+occupied KV blocks, running/waiting requests, and preemptions. Occupied blocks
+exclude reclaimable prefix-cache blocks; the byte estimate multiplies usage by
+the configured pool budget and includes rounding error. Both are sampled peaks,
+not exact lifetime maxima. Lower working-set occupancy can leave room for more
+concurrent work even when the preallocated pool and board allocation stay fixed.
 
 For a separate capacity experiment, restart on the **same GPU and model** with
 `--kv-cache-memory-bytes 1073741824 --max-model-len 7168`. Run paged mode with the
