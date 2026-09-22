@@ -18,3 +18,7 @@
 	path = Mooncake
 	url = https://github.com/T4t4KAU/Mooncake.git
 	branch = main
+[submodule "vllm-ascend"]
+	path = vllm-ascend
+	url = https://github.com/vllm-project/vllm-ascend.git
+	branch = releases/v0.22.1rc

@@ -4,6 +4,7 @@ Agentrix keeps the shared-prefix attention implementation for vLLM, its
 LMCache integration, and the end-to-end benchmark suite in one repository:
 
 - `vllm/` is a Git submodule pinned to the experimental implementation.
+- `vllm-ascend/` is pinned to `v0.22.1rc1` for Ascend development with vLLM 0.22.1.
 - `LMCache/` is a Git submodule pinned to the tiered KV storage implementation.
 - `llama.cpp/` is a Git submodule pinned to the CUDA/MUSA ForkAttention implementation.
 - `benchmark/` contains simulation, API, and local vLLM benchmarks.
@@ -60,6 +61,19 @@ git submodule update --init --recursive
 Submodule URLs and branch hints are recorded in `.gitmodules`; they are not all
 on the same branch. Agentrix records exact commit IDs. Verify those commits are
 available from the remotes before publishing the parent repository.
+
+### Ascend development baseline
+
+The Ascend baseline pairs `vllm-ascend v0.22.1rc1` with upstream vLLM 0.22.1
+in a separate environment. The `vllm/` submodule contains the CUDA implementation
+based on 0.28.0; installing that checkout with this Ascend plugin is not supported.
+
+The validated single-card stack uses openEuler 24.03, Python 3.11,
+CANN 9.0.0 with the matching 910B Ops package, PyTorch/torch_npu 2.10.0,
+and Triton-Ascend 3.2.1. On the Ascend 910B1 instance, Qwen3-0.6B inference,
+ACLGraph decode, shared-prefix caching and eviction, custom Ascend C/Triton
+kernels, and pinned CPU/NPU transfers passed the environment checks.
+ForkAttention migration and multi-card validation remain future work.
 
 ## Install uv
 
