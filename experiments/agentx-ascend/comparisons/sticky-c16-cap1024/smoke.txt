@@ -1,0 +1,4 @@
+{"rank": 0, "repeat": 0, "usage": {"prompt_tokens": 8219, "total_tokens": 8221, "completion_tokens": 2, "prompt_tokens_details": {"cached_tokens": 8192}, "completion_tokens_details": null}}
+{"rank": 0, "repeat": 1, "usage": {"prompt_tokens": 8219, "total_tokens": 8221, "completion_tokens": 2, "prompt_tokens_details": {"cached_tokens": 8192}, "completion_tokens_details": null}}
+{"rank": 1, "repeat": 0, "usage": {"prompt_tokens": 8219, "total_tokens": 8221, "completion_tokens": 2, "prompt_tokens_details": null, "completion_tokens_details": null}}
+{"rank": 1, "repeat": 1, "usage": {"prompt_tokens": 8219, "total_tokens": 8221, "completion_tokens": 2, "prompt_tokens_details": {"cached_tokens": 8192}, "completion_tokens_details": null}}

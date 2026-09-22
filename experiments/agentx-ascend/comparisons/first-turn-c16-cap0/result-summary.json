@@ -1,0 +1,43 @@
+{
+  "submission_valid": true,
+  "was_cancelled": false,
+  "completed_requests": 98,
+  "subagent_requests": 80,
+  "request_errors": 0,
+  "cancelled_at_drain_timeout": 8,
+  "error_summary": [],
+  "configured_duration_seconds": 900.0,
+  "reported_benchmark_duration_seconds": 916.443581696,
+  "output_tokens_per_second": 37.34989290991024,
+  "total_tokens_per_npu_second_including_cached_inputs": 4044.3713826501453,
+  "mean_output_tokens_per_second_per_user": 7.640490732800337,
+  "p90_output_tokens_per_second_per_user": 8.741986380167825,
+  "cache_read_percent": 64.6331139586786,
+  "ttft_ms": {
+    "unit": "ms",
+    "avg": 9363.949195510204,
+    "p1": 754.7854567,
+    "p5": 795.8679179999999,
+    "p10": 913.161937,
+    "p25": 1170.6161124999999,
+    "p50": 4037.3555699999997,
+    "p75": 14328.6033825,
+    "p90": 25000.797428999995,
+    "p95": 40185.99426699999,
+    "p99": 46984.23775370001,
+    "min": 613.85502,
+    "max": 55315.456,
+    "std": 11942.419491751176,
+    "count": 98,
+    "sum": 917667.02116
+  },
+  "metric_duration_coverage": [
+    {
+      "phase_name": "profiling",
+      "expected_duration_seconds": 900.0,
+      "required_ratio": 0.95,
+      "ttft_ratio": 0.9904511644444445,
+      "inter_token_latency_ratio": 1.0
+    }
+  ]
+}

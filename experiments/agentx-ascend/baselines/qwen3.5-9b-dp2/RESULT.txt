@@ -1,0 +1,18 @@
+Official AgentX benchmark completed: submission_valid=true.
+
+Qwen3.5-9B BF16, DP2 TP1, 2 x Ascend 910B2, eager, text-only, native 262144 context.
+Harness commit: 56a0cf70f4c0359454ee4bd15a17770b541a3e3e
+Corpus: semianalysisai/cc-traces-weka-062126, same verified revision as Qwen3-8B run.
+220/393 full traces eligible; concurrency=16, benchmark-duration=900, seed=20260707.
+109 completed requests including 90 subagent requests, 0 errors, 7 drain-timeout cancellations.
+
+Official report: artifacts-c16/profile_export_aiperf.json
+Per-request records: artifacts-c16/profile_export.jsonl
+Summary: result-summary.json
+Reproducibility: run-manifest.json, serve.sh, router.py, benchmark.sh
+Logs: benchmark-c16.log and server.log
+Earlier C4 diagnostic run was interrupted because of sparse traffic and is NOT the final result.
+
+Service remains running: http://127.0.0.1:8000/v1, model Qwen3.5-9B.
+The old Qwen3-8B service was stopped; its scripts and reports remain intact.
+The Qwen3-8B baseline used concurrency=4 and 128K context, so these results are not a controlled performance comparison.

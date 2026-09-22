@@ -1,0 +1,1 @@
+{"policy": "sticky", "replicas": 2, "sessions": {"0": 13, "1": 12}, "requests": {"0": 47, "1": 90}}

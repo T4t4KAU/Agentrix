@@ -73,7 +73,11 @@ CANN 9.0.0 with the matching 910B Ops package, PyTorch/torch_npu 2.10.0,
 and Triton-Ascend 3.2.1. On the Ascend 910B1 instance, Qwen3-0.6B inference,
 ACLGraph decode, shared-prefix caching and eviction, custom Ascend C/Triton
 kernels, and pinned CPU/NPU transfers passed the environment checks.
-ForkAttention migration and multi-card validation remain future work.
+On the two-card Ascend 910B2 instance, Qwen3-8B (128K YaRN) and Qwen3.5-9B
+(native 256K) also passed the official AgentX scenario with TP1/DP2 and
+session-sticky routing. See [AgentX on Ascend](docs/agentx_ascend.md) for the
+reproducible launchers, original results, and routing/scheduling optimization
+work. ForkAttention migration remains future work.
 
 ## Install uv
 

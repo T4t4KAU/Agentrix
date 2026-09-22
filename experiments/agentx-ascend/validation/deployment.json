@@ -1,0 +1,18 @@
+{
+  "model": "Qwen3.5-9B",
+  "url": "http://127.0.0.1:8000/v1",
+  "backend": "http://127.0.0.1:8001",
+  "policy": "sticky",
+  "long_prefill_token_threshold": 1024,
+  "max_num_batched_tokens": 2048,
+  "tp": 1,
+  "dp": 2,
+  "context_length": 262144,
+  "max_num_seqs": 8,
+  "dtype": "bfloat16",
+  "enforce_eager": true,
+  "server_pid": 173371,
+  "router_pid": 173372,
+  "health_check": "passed",
+  "selection": "Best observed configuration in single-run AgentX comparison; repeatability not established"
+}

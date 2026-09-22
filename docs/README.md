@@ -4,6 +4,7 @@
 
 | 主题 | 入口 |
 | --- | --- |
+| 官方 AgentX、Ascend DP 路由与 prefill 调度优化 | [AgentX Ascend](agentx_ascend.md) |
 | NVIDIA 优化结果与 vLLM-Ascend 适配方案 | [优化结果与适配方案](nvidia_memory_results_and_ascend_plan.md) |
 | KV 生命周期、淘汰、offload/restore 与当前限制 | [KV 内存管理](kv_memory_optimization_status.md) |
 | Prefix/session-aware DP 与 GPU 驻留反馈 | [DP 路由](dp_routing.md) |

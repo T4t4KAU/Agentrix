@@ -1,0 +1,13 @@
+Official AgentX benchmark completed.
+
+Harness: https://github.com/SemiAnalysisAI/agentx-harness
+Commit: 56a0cf70f4c0359454ee4bd15a17770b541a3e3e
+Configuration: Qwen3-8B BF16, 2 x Ascend 910B2, DP=2 TP=1, eager, YaRN 131072 context, concurrency=4, duration=900s.
+Corpus: semianalysisai/cc-traces-weka-062126, 82 of 393 complete traces eligible. No prompt truncation or output cap.
+
+See result-summary.json, run-manifest.json and dataset-stats.json.
+Official results: artifacts-final/profile_export_aiperf.json and .csv; per-request records: artifacts-final/profile_export.jsonl.
+Server remains running: API http://127.0.0.1:8000/v1 via sticky DP router; backend http://127.0.0.1:8001.
+Scripts: serve.sh, router.py, benchmark.sh. Separate environments: /data/Agentrix/.venv (server), /data/Agentrix/agentx/.venv (official harness).
+
+Caveats: submission_valid=true is the harness rule check, not official leaderboard certification. This is a functional Ascend/Qwen baseline, not the blog model/hardware performance reproduction. 31 completed profiling requests, 0 errors, 1 request cancelled by the default 30s drain timeout.
