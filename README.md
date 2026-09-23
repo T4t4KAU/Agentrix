@@ -76,9 +76,9 @@ kernels, and pinned CPU/NPU transfers passed the environment checks.
 On the two-card Ascend 910B2 instance, Qwen3-8B (128K YaRN) and Qwen3.5-9B
 (native 256K) also passed the official AgentX scenario with TP1/DP2 and
 session-sticky routing. See [AgentX on Ascend](docs/agentx_ascend.md) for the
-reproducible launchers and key results from routing, scheduling, and hybrid
-cache retention experiments. Full experiment records stay on the server at the
-paths documented there. ForkAttention migration remains future work.
+reproducible launchers and key results from routing, scheduling, hybrid cache
+retention, and decode graph experiments. Full experiment records stay on the
+server at the paths documented there. ForkAttention migration remains future work.
 
 ## Install uv
 

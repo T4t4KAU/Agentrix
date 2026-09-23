@@ -43,7 +43,9 @@ def read_run(path):
     )
 
 
-def compare(reference, candidate, allow_code_change=False):
+def compare(
+    reference, candidate, allow_code_change=False, allow_execution_change=False
+):
     ref_config, ref_manifest, ref = read_run(reference)
     new_config, new_manifest, new = read_run(candidate)
     if ref_config != new_config:
@@ -58,7 +60,6 @@ def compare(reference, candidate, allow_code_change=False):
         "data_parallel_size",
         "max_model_len",
         "dtype",
-        "enforce_eager",
         "gpu_memory_utilization",
         "session_routing",
         "software_versions",
@@ -68,6 +69,39 @@ def compare(reference, candidate, allow_code_change=False):
     ):
         if ref_manifest[key] != new_manifest[key]:
             raise ValueError(f"Uncontrolled difference: {key}")
+    for key in (
+        "kv_cache_memory_bytes",
+        "kv_capacity_tokens_per_rank",
+        "launcher_sha256",
+        "batch_diagnostics",
+    ):
+        if ref_manifest.get(key) != new_manifest.get(key):
+            raise ValueError(f"Uncontrolled difference: {key}")
+    if ref_manifest.get("profiler_dir") or new_manifest.get("profiler_dir"):
+        raise ValueError(
+            "Profiling runs cannot be used as official performance comparisons"
+        )
+    execution_changes = {
+        key: {"reference": ref_manifest.get(key), "candidate": new_manifest.get(key)}
+        for key in (
+            "enforce_eager",
+            "execution_mode",
+            "compilation_config",
+            "npugraph_ex",
+            "cpu_binding",
+        )
+        if ref_manifest.get(key) != new_manifest.get(key)
+    }
+    if execution_changes and not allow_execution_change:
+        raise ValueError(
+            "Execution configuration differs (use --allow-execution-change)"
+        )
+    if (
+        allow_execution_change
+        and ref_manifest["mamba_cache_retention"]
+        != new_manifest["mamba_cache_retention"]
+    ):
+        raise ValueError("Retention policy must match when comparing execution modes")
     changed_files = {
         name: {
             "reference": ref_manifest["plugin_sha256"].get(name),
@@ -94,7 +128,7 @@ def compare(reference, candidate, allow_code_change=False):
                 "Expected completed, valid official runs without request errors"
             )
     ref_summary, new_summary = ref["summary"], new["summary"]
-    return {
+    result = {
         "reference": ref,
         "candidate": new,
         "changed_plugin_files": changed_files,
@@ -120,6 +154,12 @@ def compare(reference, candidate, allow_code_change=False):
             "Preallocated NPU cache-pool size is unchanged; policy changes retained content and reuse.",
         ],
     }
+    if execution_changes:
+        result["changed_execution_settings"] = execution_changes
+        result["notes"][-1] = (
+            "KV cache budgets and reported per-rank capacities match; graph memory is additional."
+        )
+    return result
 
 
 if __name__ == "__main__":
@@ -128,11 +168,21 @@ if __name__ == "__main__":
     parser.add_argument("candidate", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument(
+        "--allow-execution-change",
+        action="store_true",
+        help="Compare execution modes while requiring the same retention and cache capacity",
+    )
+    parser.add_argument(
         "--allow-code-change",
         action="store_true",
         help="Report an explicit code revision comparison",
     )
     args = parser.parse_args()
-    result = compare(args.reference, args.candidate, args.allow_code_change)
+    result = compare(
+        args.reference,
+        args.candidate,
+        args.allow_code_change,
+        args.allow_execution_change,
+    )
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result["relative_change_percent"], indent=2))

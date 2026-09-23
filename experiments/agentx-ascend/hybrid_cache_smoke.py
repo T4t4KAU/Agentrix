@@ -58,7 +58,19 @@ def main():
     parser.add_argument("--model-path", default="/data/models/Qwen3.5-9B")
     parser.add_argument("--expect-sparse", action="store_true")
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--reference-file",
+        help="Compare against an earlier execution mode's cold results",
+    )
+    parser.add_argument(
+        "--concurrent-siblings", type=int, choices=range(1, 9), default=2
+    )
     args = parser.parse_args()
+    reference_results = None
+    if args.reference_file:
+        with open(args.reference_file) as source:
+            reference_results = json.load(source)
+        assert reference_results["passed"]
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, local_files_only=True)
     prefix = tokenizer.encode(
         "<|im_start|>user\n"
@@ -91,6 +103,25 @@ def main():
             name: generate(args, tokens, rank, uuid.uuid4().hex)
             for name, tokens in prompts.items()
         }
+        if reference_results is not None:
+            reference_rank = next(
+                r for r in reference_results["ranks"] if r["rank"] == rank
+            )
+            for name, actual in cold.items():
+                expected = reference_rank["cold"][name]
+                assert actual["tokens"] == expected["tokens"], (
+                    rank,
+                    name,
+                    actual,
+                    expected,
+                )
+                assert actual["finish_reason"] == expected["finish_reason"]
+                assert all(
+                    math.isclose(a, b, rel_tol=0, abs_tol=results["logprob_atol"])
+                    for a, b in zip(
+                        actual["logprobs"], expected["logprobs"], strict=True
+                    )
+                ), (rank, name, actual, expected)
         salt = uuid.uuid4().hex
         warm = {
             name: generate(args, tokens, rank, salt) for name, tokens in prompts.items()
@@ -98,9 +129,12 @@ def main():
         warm["replay"] = generate(args, parent, rank, salt)
         # Concurrent siblings must each get a private running state, preserving
         # the shared checkpoint even when one starts decoding first.
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        with ThreadPoolExecutor(max_workers=args.concurrent_siblings) as executor:
             concurrent = list(
-                executor.map(lambda _: generate(args, sibling, rank, salt), range(2))
+                executor.map(
+                    lambda _: generate(args, sibling, rank, salt),
+                    range(args.concurrent_siblings),
+                )
             )
         warm.update({f"concurrent_{i}": result for i, result in enumerate(concurrent)})
         for name, restored in warm.items():

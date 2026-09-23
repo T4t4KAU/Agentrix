@@ -1,4 +1,4 @@
-# AgentX 在 vLLM-Ascend 上的路由、调度与混合缓存优化
+# AgentX 在 vLLM-Ascend 上的优化与验证
 
 ## 目标和运行边界
 
@@ -7,6 +7,7 @@
 做端到端验证。第一阶段固定 Qwen3.5-9B、两张 Ascend 910B2 64GB、TP1/DP2、
 BF16、eager、原生 262144 上下文、16 个 session trees，只改变路由或 prefill cap。
 后续混合缓存对照固定 sticky + cap1024，只改变本地检查点保留策略。
+图执行对照在选定的缓存策略上固定每卡 36 GiB 缓存预算，比较 eager 与 Decode ACLGraph。
 
 运行环境是 vLLM 0.22.1 + vLLM-Ascend v0.22.1rc1（子模块
 `da9b47a226f2d1b5428f4658af5c4bfe9813dbeb`，包含配置校验和混合缓存保留补丁）。本仓库 `vllm/`
@@ -31,7 +32,8 @@ Ascend 插件当前装为 wheel；修改源码后须部署对应文件或重新�
 | P0 | 长 prefill 分块，减轻队头阻塞 | 0.22.1 原生 scheduler 和 Ascend 自有 scheduler 已消费 `long_prefill_token_threshold`；无需复制整套调度器。新增 Ascend 混合块配置校验 | 保持 sticky、batch token budget=2048，比较 cap=0 与 1024 |
 | P1 | 会话/分支边界的混合缓存保留 | 新增默认关闭的稀疏检查点保留、共享前缀边界补存和未缓存块优先回收；沿用现有 GDN/卷积状态复制 | 缓存管理器测试、两卡冷计算/状态恢复一致性，以及固定 sticky/cap1024 的官方 AgentX 对照 |
 | P2 | 分层缓存与异步恢复 | Ascend 已有 `AscendStoreConnector`、`MooncakeHybridConnector` 和 CPU/NPU offload 路径；存在连接器不代表全部混合布局和状态恢复已验证 | 缓存压力足够时再测 CPU/NPU 搬运、恢复临时内存、抢占和重算，验证 full KV 与线性状态共同恢复 |
-| 后续 | 图执行、GDN/attention 算子与 ForkAttention | 现有基线是 eager；Qwen3.5 的线性层与 full-attention 层需要分别定位瓶颈 | 先 profile，再做正确性和官方 AgentX 对照，单独记录图/算子收益 |
+| 已验证 | Decode ACLGraph | 复用现有 Ascend 图执行与 GDN 参数更新能力，新增显式启动配置；含必要的编译/融合路径 | 同容量 eager/graph 各两次官方 AgentX，另做两卡跨模式正确性与独立剖析 |
+| 后续 | GDN/attention 算子与 ForkAttention | 图模式已减少 host 提交间隙；Qwen3.5 的线性层与 full-attention 层仍需分别分析 | 基于图模式重新定位瓶颈，再做正确性和官方 AgentX 对照，单独记录算子收益 |
 
 文章的 DEP prefill cadence 针对 MoE 跨 rank 同步；当前两个 dense 模型是独立 DP
 副本，优先级较低。DCP/PCP、PP、P/D 拆分也需按模型与通信成本选择，不能从大规模
@@ -408,3 +410,185 @@ python experiments/agentx-ascend/compare_retention.py \
   --allow-code-change \
   --output /data/Agentrix/experiments/agentx-ascend/results/retention-v2/recomputed-comparison.json
 ```
+
+### 2026-09-23 Decode ACLGraph
+
+本轮复用 Ascend 已有的 ACLGraph 和 GDN 图参数更新能力，启动器新增
+`EXECUTION_MODE=decode-graph`；默认仍为 `eager`。图模式配置为
+`mode=3`（VLLM_COMPILE）、`FULL_DECODE_ONLY`、捕获大小 `[1,2,4,8]`，
+关闭可选的 `npugraph_ex`。该配置包含必要的编译及融合路径，收益不能全部归因于图回放本身。
+prefill 和混合批次沿用该模式的非图执行路径。
+
+当前 0.22.1 组合需要 `mode=3` 来初始化 Ascend 图参数；试用 `mode=0` 时，
+GDN 捕获报 `NoneType ... conv1d_events`。该次启动失败记录保留在服务器，未计入性能结果。
+
+两种模式固定 Qwen3.5-9B、TP1/DP2、BF16、256K、C16、sticky、cap1024、batch budget=2048，
+以及 `interval=8192`、`prefer_reuse_boundaries=true`。
+通过 `KV_CACHE_MEMORY_BYTES=38654705664` 固定每卡 36 GiB 的缓存预算，四组每个 rank
+报告的实际容量均为 1,138,625 token；图模式实测每卡额外使用约 0.55 GiB 图内存。
+此预算小于上一轮自动分配的缓存容量，须使用本轮的新 eager 基线比较。
+
+正式测量前，在独立服务周期进行缓存命中后的短 decode 剖析。每卡 8 并发、每请求生成
+32 token 的非剖析诊断耗时由约 4.00 秒降到 1.63 秒。剖析记录中，设备算子执行区间的
+并集占比由约 16% 升到 50%–57%，每卡观测到 32 次 `aclmdlRIExecuteAsync`。
+该占比是所记录 kernel 时间区间的统计，包含剖析开销，不是硬件利用率或官方 benchmark 分数。
+
+两种模式分别通过两卡共 32 请求的状态正确性检查，覆盖冷计算、重放、续问、轮内分支和
+7 个并发兄弟请求。图模式还直接对照 eager 的冷计算结果：生成 token、结束原因一致，
+所比较生成 token 的 logprob 在 0.02 绝对容差内。
+
+正式对照沿用前述官方 harness、数据集和 seed，按 eager → graph → graph → eager
+顺序运行，每组都重启服务，执行完整的 `inferencex-agentx-mvp` 900 秒场景。
+正式窗口没有启用 profiler，也没有混入正确性请求。
+
+| 配置 | 完成 / 错误 / 收尾取消 | 输出 tok/s | 平均 TTFT | P90 TTFT | cache read |
+| --- | --- | ---: | ---: | ---: | ---: |
+| eager-1 | 123 / 0 / 4 | 48.42 | 2.237 s | 4.197 s | 91.87% |
+| graph-1 | 205 / 0 / 5 | 88.26 | 1.957 s | 3.743 s | 92.87% |
+| graph-2 | 208 / 0 / 2 | 89.68 | 1.925 s | 3.645 s | 92.93% |
+| eager-2 | 122 / 0 / 4 | 48.14 | 2.268 s | 3.907 s | 91.79% |
+
+对每种模式的两次官方报告指标取算术平均，输出吞吐从 **48.28 提升至 88.97 tok/s（+84.3%）**，
+平均 TTFT 从 **2.252 降至 1.941 秒（-13.8%）**；两次 P90 TTFT 的均值从 4.052 降至
+3.694 秒（-8.8%，不是合并所有请求后重新计算的 P90）。每用户平均生成速度从
+8.67 提升至 33.88 tok/s；闭环总吞吐还受 prefill、工具等待和请求组合影响，增幅不同。
+
+四组均 `submission_valid=true`、`was_cancelled=false`，请求错误为 0。
+对照脚本核对了官方输入配置、启动脚本与插件 SHA、缓存策略、预算和实际容量。
+两次配对输出吞吐增益分别为 82.3% 和 86.3%；每种模式仍只有两次运行、同一个 seed，
+结果仅支持本次 256K 过滤负载下的观测，不代表 1M 上下文场景或其他负载的稳定增益。
+本轮没有修改 vLLM-Ascend 插件源码，改动位于实验启动、剖析及验证脚本。
+
+四组测量结束后，服务器重新启动选定的图模式服务，再次通过两卡 32 请求的跨模式
+冷计算/缓存恢复检查，前后端健康检查均为 HTTP 200，前端生成请求返回预期结果。
+部署记录指向 `results/decode-graph/selected-decode-graph/`，复测汇总为
+`results/decode-graph/aggregate.json`；当前实例关闭 profiler，启动器的通用默认仍为 eager。
+
+入口支持：
+
+```bash
+# 服务器 /data/Agentrix；正式测量不启用 PROFILE_DIR。
+EXECUTION_MODE=decode-graph KV_CACHE_MEMORY_BYTES=38654705664 \
+  LONG_PREFILL_TOKEN_THRESHOLD=1024 MAMBA_RETENTION_INTERVAL=8192 \
+  MAMBA_PREFER_REUSE_BOUNDARIES=1 MAMBA_RETENTION_DIAGNOSTICS=1 \
+  bash experiments/agentx-ascend/serve.sh
+
+# 用 run_retention.py 启动一轮完整官方场景，结果目录必须尚不存在。
+python experiments/agentx-ascend/run_retention.py \
+  --previous-run /path/to/previous-run --run-dir /path/to/new-run \
+  --interval 8192 --prefer-reuse-boundaries \
+  --execution-mode decode-graph --kv-cache-memory-bytes 38654705664
+
+# 比较本轮同容量、同缓存策略的 eager 与图执行结果。
+python experiments/agentx-ascend/compare_retention.py \
+  experiments/agentx-ascend/results/decode-graph/eager-1 \
+  experiments/agentx-ascend/results/decode-graph/graph-1 \
+  --allow-execution-change \
+  --output /data/Agentrix/experiments/agentx-ascend/results/decode-graph/recomputed-comparison.json
+```
+
+`run_retention.py --serve-only --profile-dir /data/.../traces` 单独启动剖析服务；
+`profile_decode.py` 采集短诊断，`summarize_profile.py` 在服务器汇总解析后的 profiler CSV。
+`hybrid_cache_smoke.py --reference-file ... --concurrent-siblings 7` 检查跨执行模式一致性。
+执行模式对照须给 `compare_retention.py` 显式传入 `--allow-execution-change`；
+它同时要求缓存保留策略、缓存预算、每个 rank 报告的实际容量和启动脚本哈希相同，并拒绝混入剖析运行。
+完整记录位于服务器 `/data/Agentrix/experiments/agentx-ascend/results/decode-graph/`。
+
+### 2026-09-23 图模式基线核查与 CPU 编号映射修复
+
+启动日志暴露了 CPU 绑核失败：`npu-smi info -t topo` 报告物理 NPU4/NPU5，
+`npu-smi info -m` 则将其映射为逻辑设备 0/1。原代码直接用物理拓扑编号查询逻辑设备，
+即使进程允许使用 CPU 0–191，也会误报 cpuset 与 NUMA 亲和冲突。
+`vllm_ascend/cpu_binding.py` 现在将单芯片板卡的拓扑编号转换为 chip logic ID；
+多芯片拓扑沿用原有编号解释。该改动是已有 CPU 亲和机制的缺陷修复，不是新的优化算法。
+
+修复后真实 worker 的主线程及普通子线程分别绑定到 CPU 98–141 和 50–93，
+ACL 线程分别使用 142 和 94，释放线程分别使用 143 和 95，两组互不重叠。
+容器没有 `migratepages`，因此没有进行已有内存页的 NUMA 迁移；本轮绑核对照仅验证
+进程和线程亲和性，不能把它解释为完整的 CPU/内存 NUMA 调优。
+CPU 绑核测试共 75 项通过，包括容器重映射、编号重排与多芯片行为回归；pre-commit 通过。
+三种候选配置分别通过两卡 32 请求的生成、缓存恢复和与 eager 冷计算对照检查。
+
+短诊断固定相同的缓存前缀、每请求输出 32 token，每种并发数重复五次，报告耗时中位数。
+这些结果不是官方 AgentX 分数，也不能代表长 prefill 或完整多轮流量。
+
+| 每卡并发请求数 | 不绑核，npugraph_ex 关闭 | 绑核，npugraph_ex 关闭 | 绑核，npugraph_ex 开启 |
+| --- | ---: | ---: | ---: |
+| 1 | 0.885 s | 0.935 s | 0.863 s |
+| 3 | 1.363 s | 1.461 s | 1.269 s |
+| 5 | 1.454 s | 1.451 s | 1.353 s |
+| 8 | 1.483 s | 1.501 s | 1.258 s |
+
+单独绑核没有在本次短诊断中显示收益；是否采用由端到端测量决定。
+异步调度已经默认启用，不计作新增优化。`npugraph_ex` 是已有的编译期优化能力，
+当前只验证普通 FX 优化，没有开启 static kernel 或 super kernel。
+
+完整官方场景固定同一 launcher 和插件 SHA、每卡 36 GiB、原生 256K、TP1/DP2、C16、
+同一 seed 和缓存保留策略；每组重启服务，计时 900 秒，均开启相同的批次诊断日志。
+
+| 配置 | 完成 / 错误 / 收尾取消 | 输出 tok/s | 平均 TTFT | P90 TTFT | cache read |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 不绑核，npugraph_ex 关闭 | 207 / 0 / 2 | 89.28 | 2.007 s | 4.010 s | 92.80% |
+| 绑核，npugraph_ex 关闭 | 206 / 0 / 3 | 88.87 | 2.005 s | 4.162 s | 92.91% |
+| 绑核，npugraph_ex 开启 | 210 / 0 / 3 | 90.35 | 1.821 s | 3.518 s | 93.00% |
+
+这三组报告均有效、无请求错误。单独绑核后的吞吐变化为 -0.46%，平均 TTFT 为 -0.13%，
+P90 TTFT 为 +3.80%；各配置仅一次测量，不能据此确认稳定收益或退化。
+在绑核配置上开启 `npugraph_ex`，输出吞吐增加 1.66%，平均 TTFT 降低 9.17%，
+P90 TTFT 降低 15.47%。端到端吞吐提升小于短 decode 诊断中的改善；
+这些也是一次测量的结果，不代表其他 seed、负载或硬件上的稳定收益。
+
+随后固定绑核和 `npugraph_ex` 开启，单独比较原生缓存策略与当前的稀疏保留/回收组合。
+两组同样使用每卡 36 GiB，实际容量均为 1,138,625 token；官方报告均有效、未被取消、
+请求错误为 0。原生策略也先在独立服务周期通过两卡 32 请求正确性检查。
+
+| 缓存策略 | 完成 / 错误 / 收尾取消 | 输出 tok/s | 平均 TTFT | P90 TTFT | cache read |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 原生保留与回收 | 183 / 0 / 2 | 78.91 | 4.968 s | 15.694 s | 80.94% |
+| 8192 + prefer_reuse_boundaries | 210 / 0 / 3 | 90.35 | 1.821 s | 3.518 s | 93.00% |
+
+当前策略组合相对原生策略，输出吞吐增加 **14.49%**，平均 TTFT 降低 **63.34%**，
+P90 TTFT 降低 **77.58%**，cache read 增加 12.06 个百分点。
+第二行复用前表第三行，不是另一次重复运行。对照衡量的是稀疏保留、未缓存块优先复用、
+复用边界保护等组合效果，不能单独归因于某一项策略。每用户平均生成速度则从
+32.02 降到 30.55 tok/s；闭环下完成请求组合变化，不能将总吞吐提升解释成所有请求的 decode 都加速。
+各配置仍只有一次测量、一个 seed，需要多次复测才能确认增益的稳定程度。
+
+本轮服务器保留 **decode ACLGraph + npugraph_ex + CPU 绑核 + 8192 稀疏保留/回收组合**，
+继续使用 TP1/DP2、36 GiB/卡、sticky、cap1024 和 batch budget=2048；保留批次诊断，关闭 profiler。
+选择绑核是为了保留已修复的确定性线程分配，不代表本次实验确认了其性能收益。
+最终实例重启后再次通过两卡 32 请求的跨模式正确性检查，前后端健康检查为 HTTP 200，
+实际生成返回预期结果，五个插件文件的源码与运行时哈希一致。
+当前部署记录已更新为 `results/active-service/deployment.json`，服务日志与正确性结果位于
+`results/graph-baseline/selected-service/`。启动器的通用默认仍为 eager，`npugraph_ex` 默认关闭。
+
+实验入口增加 `--npugraph-ex`、`--no-cpu-binding`、`--interval native` 和
+`--batch-diagnostics`。最后一项使用 vLLM 原生批次日志；`summarize_batches.py` 汇总
+prefill、decode 和混合批次。其耗时是引擎观察到的等待/处理区间，受异步重叠影响，
+不能当作 NPU 执行时间，也不能把纯 decode 批次计数直接当作图回放计数。
+汇总时传入 `--benchmark-log RUN_DIR/benchmark.log`，可按官方完成日志中的
+profiling 起止时间剔除预热和收尾；服务日志只有秒级时间戳，窗口边界存在一秒内的精度限制。
+在开启 `npugraph_ex` 的正式窗口中，两卡纯 decode 批次分别占约 96.2% 和 96.9%。
+原生缓存组的 rank 0 混合批次占 15.34%，稀疏策略组则为 2.36%；rank 1 分别为
+2.88% 和 2.68%。这与原生组缓存压力主要集中于一个副本的诊断相符，但不是逐请求配对的因果证明。
+混合批次的主机侧耗时较长，但仅凭批次比例和这类耗时，无法证明延迟 prefill
+能够改善总吞吐与首 token 延迟。本轮没有据此新增调度策略。
+
+缓存对照使用相同插件代码和诊断开关；`--interval native` 使保留与回收走原生分支，
+同时关闭优先回收周期性检查点，并非换用另一套未经修改的安装包。复现入口为：
+
+```bash
+# 在服务器 /data/Agentrix，激活 Ascend 环境后执行；结果目录必须尚不存在。
+python experiments/agentx-ascend/run_retention.py \
+  --previous-run /path/to/previous-run --run-dir /path/to/native-run \
+  --interval native --execution-mode decode-graph --npugraph-ex \
+  --kv-cache-memory-bytes 38654705664 --batch-diagnostics
+
+# 其他参数保持相同，使用 --interval 8192 --prefer-reuse-boundaries 跑另一组。
+python experiments/agentx-ascend/compare_retention.py \
+  /path/to/native-run /path/to/sparse-run \
+  --output /data/Agentrix/experiments/agentx-ascend/results/cache-comparison.json
+```
+
+完整诊断、代码快照、四组正式报告和三个对照汇总位于服务器
+`/data/Agentrix/experiments/agentx-ascend/results/graph-baseline/`。
