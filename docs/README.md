@@ -4,7 +4,7 @@
 
 | 主题 | 入口 |
 | --- | --- |
-| 官方 AgentX、Ascend DP 路由与 prefill 调度优化 | [AgentX Ascend](agentx_ascend.md) |
+| 官方 AgentX、Ascend 路由、调度与混合缓存优化 | [AgentX Ascend](agentx_ascend.md) |
 | NVIDIA 优化结果与 vLLM-Ascend 适配方案 | [优化结果与适配方案](nvidia_memory_results_and_ascend_plan.md) |
 | KV 生命周期、淘汰、offload/restore 与当前限制 | [KV 内存管理](kv_memory_optimization_status.md) |
 | Prefix/session-aware DP 与 GPU 驻留反馈 | [DP 路由](dp_routing.md) |
@@ -28,5 +28,6 @@
 ## 维护规则
 
 - 同一主题只维护一份主文档，不再为每轮调试新增报告。
-- 实验输出与使用文档分开存放，完成分析后按需清理。
+- 本地只保留实验代码、复现方法和主文档中的关键实验数据、验证结论与局限。
+- 完整日志、原始报告、逐请求数据和验证输出只保存在实验服务器；文档注明服务器路径，不再按轮次下载到本地。
 - 删除报告或图表时同步清理文档入口和失效链接。

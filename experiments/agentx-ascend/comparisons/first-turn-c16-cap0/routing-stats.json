@@ -1,1 +1,0 @@
-{"policy": "first-turn-only", "replicas": 2, "sessions": {"0": 12, "1": 12}, "requests": {"0": 12, "1": 12, "native": 100}}

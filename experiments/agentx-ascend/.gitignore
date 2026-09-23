@@ -3,3 +3,11 @@ __pycache__/
 results/
 *.log
 *.pid
+
+# Experiment records live on the server; keep key results in docs/agentx_ascend.md.
+/baselines/
+/comparisons/
+/comparison.json
+/retention/
+/retention-v2/
+/validation/
