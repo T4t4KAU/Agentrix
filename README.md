@@ -78,7 +78,14 @@ On the two-card Ascend 910B2 instance, Qwen3-8B (128K YaRN) and Qwen3.5-9B
 session-sticky routing. See [AgentX on Ascend](docs/agentx_ascend.md) for the
 reproducible launchers and key results from routing, scheduling, hybrid cache
 retention, and decode graph experiments. Full experiment records stay on the
-server at the paths documented there. ForkAttention migration remains future work.
+server at the paths documented there. NPU ForkAttention now has an opt-in
+Qwen3.5 decode integration with physical-page admission, multiple shared groups,
+reusable plans and workspace, and native FIA fallback within ACLGraph. Its
+operator measurements remain separate from official AgentX scores; see the
+validation and workload limits in the same document.
+The FIA-based implementation is the selected development baseline for NPU
+ForkAttention. Further work focuses on shared-prefix admission, split selection,
+planning overhead, and end-to-end validation with the official AgentX workload.
 
 ## Install uv
 

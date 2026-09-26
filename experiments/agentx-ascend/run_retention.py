@@ -95,10 +95,15 @@ def main():
     parser.add_argument("--profile-dir", type=Path)
     parser.add_argument("--npugraph-ex", action="store_true")
     parser.add_argument("--batch-diagnostics", action="store_true")
+    parser.add_argument("--fork-attention", action="store_true")
+    parser.add_argument("--fork-min-shared-tokens", type=int, default=32768)
+    parser.add_argument("--fork-diagnostics", action="store_true")
     parser.add_argument(
         "--cpu-binding", action=argparse.BooleanOptionalAction, default=True
     )
     args = parser.parse_args()
+    if args.fork_min_shared_tokens < 128 or args.fork_min_shared_tokens % 128:
+        parser.error("fork-min-shared-tokens must be a positive multiple of 128")
     if args.interval is None and args.prefer_reuse_boundaries:
         parser.error("prefer-reuse-boundaries requires a non-native interval")
     if args.npugraph_ex and args.execution_mode != "decode-graph":
@@ -116,7 +121,16 @@ def main():
     manifest = json.loads((previous / "run-manifest.json").read_text())
     # Check source/runtime consistency before stopping a working service.
     # Track the affinity fix as well as the hybrid-cache patches.
-    plugin_files = set(manifest["plugin_sha256"]) | {"vllm_ascend/cpu_binding.py"}
+    plugin_files = set(manifest["plugin_sha256"]) | {
+        "vllm_ascend/cpu_binding.py",
+        "vllm_ascend/attention/attention_v1.py",
+        "vllm_ascend/attention/utils.py",
+        "vllm_ascend/attention/fork_batch.py",
+        "vllm_ascend/attention/fork_plan.py",
+        "vllm_ascend/ops/fork_decode.py",
+        "vllm_ascend/ops/triton/fork_attention.py",
+        "vllm_ascend/worker/model_runner_v1.py",
+    }
     for name in sorted(plugin_files):
         source = (root / "vllm-ascend" / name).read_bytes()
         installed = (
@@ -140,6 +154,9 @@ def main():
         ENABLE_NPUGRAPH_EX=str(int(args.npugraph_ex)),
         ENABLE_CPU_BINDING=str(int(args.cpu_binding)),
         BATCH_DIAGNOSTICS=str(int(args.batch_diagnostics)),
+        ENABLE_FORK_ATTENTION=str(int(args.fork_attention)),
+        FORK_MIN_SHARED_TOKENS=str(args.fork_min_shared_tokens),
+        FORK_DIAGNOSTICS=str(int(args.fork_diagnostics)),
     )
     if args.interval is not None:
         env["MAMBA_RETENTION_INTERVAL"] = str(args.interval)
@@ -176,6 +193,11 @@ def main():
         npugraph_ex=args.npugraph_ex,
         cpu_binding=args.cpu_binding,
         batch_diagnostics=args.batch_diagnostics,
+        fork_attention={
+            "enabled": args.fork_attention,
+            "min_shared_tokens": args.fork_min_shared_tokens,
+            "diagnostics": args.fork_diagnostics,
+        },
         launcher_sha256=hashlib.sha256(
             (root / "experiments/agentx-ascend/serve.sh").read_bytes()
         ).hexdigest(),

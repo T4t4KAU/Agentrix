@@ -33,7 +33,8 @@ Ascend 插件当前装为 wheel；修改源码后须部署对应文件或重新�
 | P1 | 会话/分支边界的混合缓存保留 | 新增默认关闭的稀疏检查点保留、共享前缀边界补存和未缓存块优先回收；沿用现有 GDN/卷积状态复制 | 缓存管理器测试、两卡冷计算/状态恢复一致性，以及固定 sticky/cap1024 的官方 AgentX 对照 |
 | P2 | 分层缓存与异步恢复 | Ascend 已有 `AscendStoreConnector`、`MooncakeHybridConnector` 和 CPU/NPU offload 路径；存在连接器不代表全部混合布局和状态恢复已验证 | 缓存压力足够时再测 CPU/NPU 搬运、恢复临时内存、抢占和重算，验证 full KV 与线性状态共同恢复 |
 | 已验证 | Decode ACLGraph | 复用现有 Ascend 图执行与 GDN 参数更新能力，新增显式启动配置；含必要的编译/融合路径 | 同容量 eager/graph 各两次官方 AgentX，另做两卡跨模式正确性与独立剖析 |
-| 后续 | GDN/attention 算子与 ForkAttention | 图模式已减少 host 提交间隙；Qwen3.5 的线性层与 full-attention 层仍需分别分析 | 基于图模式重新定位瓶颈，再做正确性和官方 AgentX 对照，单独记录算子收益 |
+| 实验性接入 | NPU ForkAttention | 已接入 Qwen3.5 decode 的物理页准入、多共享组规划、计划/工作区复用和 ACLGraph 内原生回退；默认关闭 | 两卡算子与模型检查；独立算子收益与官方 AgentX 结果分别记录 |
+| 后续 | GDN 算子与模型级集成 | Qwen3.5 的线性层与 full-attention 层仍需分别分析 | 基于图模式定位剩余瓶颈，再做正确性和官方 AgentX 对照 |
 
 文章的 DEP prefill cadence 针对 MoE 跨 rank 同步；当前两个 dense 模型是独立 DP
 副本，优先级较低。DCP/PCP、PP、P/D 拆分也需按模型与通信成本选择，不能从大规模
@@ -592,3 +593,257 @@ python experiments/agentx-ascend/compare_retention.py \
 
 完整诊断、代码快照、四组正式报告和三个对照汇总位于服务器
 `/data/Agentrix/experiments/agentx-ascend/results/graph-baseline/`。
+
+## NPU ForkAttention 算子原型
+
+2026-09-23 在两张 910B2 上实现并验证了独立的 ForkAttention 算子。
+该阶段模型服务仍使用上一节的 attention 路径；以下均为合成算子负载，**不是新的官方 AgentX 成绩**。
+Qwen3.5-9B 的实际 full-attention 几何为 16 个 query heads、4 个 KV heads、head dimension 256，
+32 层中有 8 层 full attention。GDN 不由该算子处理。
+
+### 实现
+
+- [fork_plan.py](../vllm-ascend/vllm_ascend/attention/fork_plan.py)
+  根据 CPU block table 的物理页身份验证一个候选组的公共前缀，按完整页切分共享段，
+  每个 query 保留非空私有尾部。NumPy 路径批量比较页、校验有效范围，避免逐页 Python 标量循环。
+- [fork_attention.py](../vllm-ascend/vllm_ascend/ops/fork_attention.py)
+  将同组分支作为共享段的多个 query 行，用一次 paged FIA 调用处理所有共享分片和私有尾部。
+  使用现有 Ascend C attention 内核；本轮没有新写 Cube attention 内核。
+  不整理或复制 KV，只打包较小的 Q 和页描述符。
+- [Triton 辅助内核](../vllm-ascend/vllm_ascend/ops/triton/fork_attention.py)
+  分别完成 Q 打包、FP32 稳定 LSE 加权合并，结果写回 BF16/FP16。
+  合并接受最多 33 个部分结果，避免逐段调用合并算子以及整张中间输出的额外 FP32 转换。
+- `ForkAttentionGraph` 使用 ExternalEvent 和 graph-task update 更新 FIA 的长度参数及固定地址页表。
+  已验证尾部增长、跨页、私有页重排和长度回退；超出捕获的组大小、分片数或页表容量时明确拒绝。
+  普通 `NPUGraph` 捕获仍固定原 plan，不能把改变后的长度直接用于旧图。
+
+混合缓存的 1024-token **管理块**会由 runner 拆为 128-token **内核页**。
+本原型只接受后者；直接传入 1024-token 页会在 Python 层被拒绝。
+当前范围是 2～8 个单 token decode 查询、BF16/FP16、普通全注意力、连续 Q/K/V。
+head sizes 64/128/256 的数值测试使用 GQA4；性能矩阵固定模型的 16/4/256 配置。
+
+### 算子性能与对照
+
+每卡扫描 2/3/4/8 分支、8K/32K/64K 共享前缀、128/1024 token 私有尾部、
+1/4/8/16/32 个前缀分片，共 24 个形状、每形状 5 个候选。
+三条路径共用同一份碎片化物理 KV：服务当前使用的因果 paged FIA、
+ForkAttention、以及不合并共享查询的分片对照。
+每个候选采用三条路径的全部 6 种执行顺序，每次计时连续回放 50 次固定 plan 图，报告中位数。
+NPU event 时间包括 Q 打包、attention、结果合并及图回放间隙；不包括 CPU 规划或逐步图任务更新。
+
+下表取尾部 128 token；32K 固定 4 分片，64K 固定 16 分片。
+卡 0 使用后续确认轮，卡 1 使用完整矩阵；并非挑每行最快分片后的结果。
+
+| 分支 / 共享前缀 | 分片 | 卡 0 FIA → Fork（µs） | 卡 1 FIA → Fork（µs） | 卡 1 仅分片（µs） |
+| --- | --- | --- | --- | --- |
+| 2 / 32K | 4 | 278.46 → 113.91 | 277.48 → 116.79 | 187.45 |
+| 4 / 32K | 4 | 286.01 → 115.81 | 289.55 → 126.12 | 261.69 |
+| 8 / 32K | 4 | 553.45 → 124.06 | 561.32 → 131.47 | 458.50 |
+| 2 / 64K | 16 | 827.85 → 240.22 | 832.53 → 247.45 | 388.55 |
+| 4 / 64K | 16 | 855.55 → 272.32 | 837.67 → 264.45 | 559.63 |
+| 8 / 64K | 16 | 1723.64 → 292.68 | 1706.28 → 290.88 | 973.31 |
+
+这些结果支持继续做模型级集成。分片和共享查询分组都有贡献；不能把总加速全部归于减少 HBM 读取。
+单个长段直接执行在小分支数下可能变慢，分片越多也不一定更快；目前没有把候选扫描结果固化为生产准入规则。
+单实例显式缓冲在本轮形状中约 369～373 MiB，以 FIA 保守最大 workspace 为主。
+接入模型时需要按执行流复用工作区，避免每层、每个图重复保留。
+
+独立 profiling 的 4 分支/32K/4 分片用例中，每次 Fork 回放为 Q 打包、FIA、结果合并三项，
+5 次回放及两条对照共核对 35 条设备记录。
+CANN 的 AIC GM→L1 搬运计数由 543232 降至 142848 KB，约减少 74%；
+仅分片对照为 543488 KB。这支持共享分组降低重复搬运，但该计数不是直接测得的 HBM DRAM 流量。
+profiler 报告了 ACL→NPU flow 关联解析错误，因此不使用它推断 host/device 重叠或完整调用关联；
+设备记录按有同步隔开的已知回放顺序分组，并逐项核对 kernel 名称。
+独立、固定 CPU 的重复规划测试中，最终 NumPy 路径的 4 分支/32K 中位耗时约 114 µs；
+这是额外的 CPU 成本，尚需在服务中复用计划，并计入端到端评估。
+
+### 正确性和复现
+
+CPU 规划测试覆盖完整页边界、无共享/共享后缀、页重排、长度回退、无效页及 NumPy 输入。
+两卡各通过 22 项 NPU 测试，覆盖 FP32 dense reference 对照、不同尾长、碎片化页、
+兄弟分支隔离、图回放中 Q/V 数值变化、大 LSE 的 33 段合并，以及不重新捕获图的元数据更新。
+数值验证使用 BF16/FP16 对应容差，不声称逐位相等，也尚未验证完整模型生成 token 一致性。
+
+```bash
+# 在服务器激活 Ascend 环境，并将三个新算子文件部署到实际安装的插件。
+python experiments/agentx-ascend/benchmark_fork_attention.py \
+  --device 0 \
+  --output /data/Agentrix/experiments/agentx-ascend/results/NEW_RUN/matrix.json
+
+# 独立 profiling，不能混入无 profiler 的性能报告。
+python experiments/agentx-ascend/benchmark_fork_attention.py \
+  --branches 4 --prefixes 32768 --tails 128 --splits 4 \
+  --profile-dir /data/Agentrix/experiments/agentx-ascend/results/NEW_PROFILE/trace \
+  --output /data/Agentrix/experiments/agentx-ascend/results/NEW_PROFILE/timing.json
+```
+
+完整代码快照、矩阵、逐轮计时、测试输出和 profiler 数据均在服务器
+`/data/Agentrix/experiments/agentx-ascend/results/fork-attention-v1/`。
+关键记录为 `matrix-rank0.json`、`matrix-rank1.json`、`confirm-rank0.json`，以及
+`npu-tests-dynamic-rank0.txt`、`npu-tests-dynamic-rank1.txt`。
+最终代码另通过 22 项 CPU 规划测试和卡 0 的 22 项 NPU 复测；记录为
+`planner-tests-final-v2.txt`、`npu-tests-final-v2.txt`，代码快照为 `final-code.zip`。
+设备诊断摘要和原始数据分别为 `profile-key-summary.json`、`profile-memory/`。
+后续的在线接入见下节。Agent Hints 尚未接入。
+
+## NPU ForkAttention 在线 decode 接入
+
+当前以 **FIA 版 ForkAttention 作为后续开发与实验基线**：共享前缀规划、Q 打包、CANN FIA
+分段计算及结果合并。优化优先级为量化真实流量的共享机会、调整准入和分片策略、降低规划及
+回退开销，并用官方 AgentX 验证端到端收益。直接计算实验的实现已移除，历史数据及源码快照仅在服务器归档。
+正式服务仍保留原生图路径，ForkAttention 默认关闭；选择 FIA 版作为开发主线不代表已验证在线收益。
+
+2026-09-24 新增默认关闭的 `additional_config.fork_attention`。当前验证目标为
+Qwen3.5-9B、BF16、TP1/PP1、两卡 DP；仅处理普通 causal full attention 的单 token decode。
+GDN、prefill、speculative decode、CP、DBO、滑窗、sinks、量化 KV 不属于这一优化路径。
+不支持的全局并行配置在启用时拒绝；没有可用共享组或不支持的 attention 形状沿用原生路径。
+
+### 接入和资源复用
+
+- `model_runner_v1.py` 只向 metadata builder 提供已经存在的 CPU 内核页表视图。
+  不增加 NPU→CPU 页表回读，也不按会话名推断共享。
+- [fork_batch.py](../vllm-ascend/vllm_ascend/attention/fork_batch.py) 按共同的起始物理页分组，
+  一批可以包含多个不相邻的共享组及独立请求。每个组按完整页切分共享前缀，当前 token 留在尾部。
+  默认共享前缀门槛为 32768 token；不足 64K 使用 4 分片，达到 64K 使用 16 分片。
+  这是基于已测形状的初始规则，不是全形状最优调度器。
+- 每个 metadata builder 只保存一个最近的计划。每步重新比较 CPU 物理页和有效页数；
+  页表未变时只更新尾长，并让同组各层共用结果。页重分配、重排、跨页或长度回退会重新规划。
+- [fork_decode.py](../vllm-ascend/vllm_ascend/ops/fork_decode.py) 在图捕获前分配缓冲区。
+  同一 KV 组的各层、各图尺寸复用一份 FIA 工作区、Q/部分结果和描述符缓冲；不复制 KV。
+  只在页描述符、查询映射或启用状态变化时传输这些小型数据；逐 token 长度通过已有 FIA task update 更新。
+- `AscendAttentionBackendImpl` 捕获固定的 pack→FIA→merge 结构。
+  每次图回放可更新 FIA 的形状、长度、页表和输出地址；没有共享组时 FIA 直接写最终输出，
+  pack/merge 内核执行空分支。ExternalEvent 等待位于 pack 之前，保证元数据更新先于 Q 打包。
+  图补齐行不进入共享组；Fork 分支把补齐行输出置零。
+
+启用后，无共享组的 2～8 token 图仍有两个空内核的开销，因此不能把“自动回退”解释成零开销。
+禁用配置沿用原生图。池不支持并发模型执行，启用时拒绝 DBO；DP 副本各自持有缓冲区。
+这版不会为了创造共享机会重排请求、延迟 decode 或改变 AgentX 输入。
+
+### 接入验证
+
+CPU 规划共 34 项测试通过；原有配置及 attention backend 的 35 项测试通过。
+两张卡分别通过 26 项 NPU 测试，包括原型的 22 项和新增的 BF16/FP16 图内切换、
+两层共用缓冲区、补齐行、多共享组、原生回退，以及 32K/64K 长前缀与原生 FIA 对照。
+
+独立的主机规划诊断中，4 分支/32K 的单次原型重建中位数约 139 µs，批次计划重建约 179 µs，
+复用约 86 µs；8 分支/64K 分别约 212、260、101 µs。
+复用仍包含页表身份检查和新尾长生成，不是零成本；这些诊断不等于服务延迟改善。
+
+最初的并发 HTTP 对照中，50 个请求的 2400 个生成 token 全部一致，
+但逐 token logprob 的 0.03 绝对容差未通过。Fork 对原生参考的最大差异为 0.105709，
+原生服务重跑对同一参考的最大差异为 0.073591；平均绝对差异分别为 0.000382、0.000254。
+最大差异集中在混合批次同一请求的第 3 个输出 token，不能将原生重复运行的波动全部归因于 Fork。
+原始失败结果保留为 `model-fork-complete.json`、`model-native-repeat.json`。
+后续检查改为单个 HTTP 请求提交整个批次，并用不同前缀区分共享组，减少到达时序差异；
+这仍不保证内部调度完全相同。最终检查显式记录使用的 logprob 容差，同时要求所有生成 token 一致。
+整批提交的最终两卡检查通过：50 个请求、2400 个生成 token 一致，最大 logprob 绝对差异
+0.087215，低于本轮显式指定的 0.1。它不满足最初的 0.03 门槛，也不是逐位一致性证明。
+参考及最终结果分别为 `model-native-batched.json`、`model-fork-final.json`；
+复现使用 `fork_decode_smoke.py --batch-request --reference ... --logprob-atol 0.1 --output ...`。
+
+`fork_decode_smoke.py --batch-request` 记录批量接口报告的缓存命中数，不能把它当作逐请求命中数。
+vLLM 0.22.1 的非流式批量 completion 返回最后一个 prompt 的 `num_cached_tokens`，
+因此脚本不再将该数值除以请求数。共享是否实际参与执行以 CPU 物理页规划和后端执行日志核对。
+
+### 官方 AgentX 对照
+
+两组分别重启服务，使用相同的官方 harness、数据集、seed 和 900 秒场景；
+固定 TP1/DP2、原生 256K、36 GiB/卡、sticky、cap1024、batch budget=2048、
+8192 稀疏保留、CPU 绑核、decode ACLGraph 和 `npugraph_ex`。
+启动脚本及 11 个插件文件的 SHA 一致；实际缓存容量均为每卡 1,138,625 token。
+两组唯一的 Fork 配置差异是 `enabled`，共享门槛均记录为 32768，诊断开关一致。
+正确性测试和 profiler 不在正式测量窗口内运行。
+
+| 配置 | 完成 / 请求错误 | 输出 tok/s | 平均 TTFT | P90 TTFT | cache read |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 原生图路径 | 205 / 0 | 88.79 | 1.869 s | 3.555 s | 92.80% |
+| 启用 ForkAttention | 205 / 0 | 88.26 | 2.016 s | 3.716 s | 92.85% |
+
+两组均 `submission_valid=true`、`was_cancelled=false`。
+排空超时分别取消 3、5 个未完成请求；该计数独立于报告中的请求错误数（两组均为 0）。
+启用后吞吐变化为 **-0.59%**，平均 TTFT 为 +7.83%，P90 TTFT 为 +4.54%。
+两个 worker 的最后一条累计执行诊断分别为 14,848、14,080 批次，`selected` 均为 0，
+且全程没有首次共享执行记录。这些计数包含预热、每 256 批次采样一次，
+不能当作精确的正式窗口批次数；它们支持本轮未触发 32K 门槛下的共享路径这一判断。
+
+本轮没有确认 ForkAttention 的 AgentX 端到端收益。较高的 prefix-cache 命中率
+并不保证同卡同批次存在足够长的共享物理前缀；不能把独立算子的加速倍数套用到这里。
+只有一次对照、一个 seed，闭环请求组合和到达时序可能不同，无法据此确认稳定的退化幅度，
+也不能把 TTFT 变化单独归因于两个空内核或 CPU 规划。
+后续需要先量化更短共享前缀及父子分支的同卡并发机会，再评估路由、调度或 Agent Hints；
+本轮没有实现新的 Agent Hints 协议。
+
+服务器最终保留原生图路径，保留此前的混合缓存、绑核、`npugraph_ex` 和 TP1/DP2 配置。
+ForkAttention 默认关闭，可通过下述开关复现。正式报告为 `official-native/`、`official-fork/`，
+对照为 `official-comparison.json`，诊断及验证摘要为 `final-summary.json`，冻结代码为 `benchmark-code.zip`。
+最终服务记录在 `selected-native/`；活动指针为 `results/active-service/deployment.json`。
+
+### 复现入口
+
+```bash
+# 服务器 /data/Agentrix，激活 Ascend 环境后执行。
+ENABLE_FORK_ATTENTION=1 FORK_DIAGNOSTICS=1 FORK_MIN_SHARED_TOKENS=32768 \
+  EXECUTION_MODE=decode-graph ENABLE_NPUGRAPH_EX=1 \
+  KV_CACHE_MEMORY_BYTES=38654705664 LONG_PREFILL_TOKEN_THRESHOLD=1024 \
+  MAMBA_RETENTION_INTERVAL=8192 MAMBA_PREFER_REUSE_BOUNDARIES=1 \
+  bash experiments/agentx-ascend/serve.sh
+
+# 正式对照由现有入口重启服务并运行完整官方场景，仍为 TP1/DP2。
+python experiments/agentx-ascend/run_retention.py \
+  --previous-run /path/to/previous-run --run-dir /path/to/new-run \
+  --interval 8192 --prefer-reuse-boundaries --execution-mode decode-graph \
+  --npugraph-ex --kv-cache-memory-bytes 38654705664 --batch-diagnostics \
+  --fork-attention --fork-diagnostics
+```
+
+对照组移除 `--fork-attention`，其余设置一致。`compare_retention.py --allow-execution-change`
+记录 Fork 配置差异，同时核对官方输入、保留策略、插件 SHA、启动脚本和实际 KV 容量。
+所有原始记录位于服务器 `/data/Agentrix/experiments/agentx-ascend/results/fork-attention-v2/`。
+
+## 已移除的直接计算实验
+
+2026-09-24 的直接 Triton 原型通过数值验证，但性能低于 FIA 版，未接入在线服务。
+现已从本地仓库、服务器源码和已安装插件中删除对应内核、封装、测试及独立 benchmark，
+并清理专用 profiler 选项；后续以 FIA 版为开发与实验基线。
+
+保留关键历史数据：Qwen3.5-9B 的 16 Q heads / 4 KV heads、D=256、BF16、私有尾长 128，
+卡 1 固定请求 16 分片（1K 实际为 8），每个形状轮换四条路径测量 8 轮、每轮 50 次图回放。
+下表为完整算子耗时中位数，单位 µs，不含 CPU 规划和描述符 H2D；卡 0 趋势一致。
+
+| 分支 / 共享前缀 | 原生 FIA | FIA 版 ForkAttention | 已移除的直接原型 |
+| --- | ---: | ---: | ---: |
+| 2 / 1K | 34.95 | 55.91 | 63.79 |
+| 4 / 8K | 100.83 | 78.53 | 234.05 |
+| 8 / 32K | 555.93 | 146.50 | 939.91 |
+
+这些是算子实验，不是官方 AgentX 成绩。剖析显示主要差距在 attention 主体；
+直接原型减少 Q 打包不足以抵消计算成本。原始数据及当时源码快照保存在服务器
+`/data/Agentrix/experiments/agentx-ascend/results/fork-attention-v3/`。
+审核后的源码另归档于
+`/data/Agentrix/experiments/agentx-ascend/results/fork-attention-review-20260924/reviewed-source.zip`。
+历史归档不属于当前可用实现，不再保留已删除脚本的启动命令。
+
+## 代码审核与边界修复（2026-09-24）
+
+审核覆盖 CPU 规划、算子封装、图更新、多组 serving 缓冲及实验入口。FIA 主线保留以下修复：
+
+- 缓存命中的批规划器原先会把小数序列长度静默截断。现在在缓存查询前统一校验整数长度，
+  并先扩为 int64 再计算页数，避免 int32 加法溢出；设备描述符拒绝超出 int32 范围的值。
+- 单组 plan 原先只依赖工厂函数校验，直接构造或 `dataclasses.replace` 可注入负页号、
+  缺失分段或错误 query 映射。现在不可变 plan 在构造时验证页数、分段覆盖、前缀长度与整数类型。
+- FIA 原型及其图回放补齐当前 NPU device 检查；无效图更新在修改缓冲前拒绝。
+- 旧算子 benchmark 提前检查分支、分片及前缀对齐，支持显式测试 128-token 小前缀；
+  模型 smoke 脚本创建输出父目录并检查正数长度。运行 manifest 纳入共享规划模块的 SHA。
+
+审核时 CPU 规划 **56 项**、原有配置及 attention backend **35 项**通过；两张 NPU 分别通过
+**53 项**算子/图测试，其中 **26 项**属于随后移除的直接计算原型，FIA 版保留 **27 项**。
+覆盖共享/私有尾段、长前缀、图切换、跨页更新及非法输入拒绝。
+插件适用的 pre-commit 检查、实验脚本 Ruff 与 shell 语法检查通过。
+本轮未修改计算内核，也没有新的性能或官方 AgentX 结论。
+原始复现、测试日志及服务健康记录保存在服务器
+`/data/Agentrix/experiments/agentx-ascend/results/fork-attention-review-20260924/`。
+
+移除直接原型后，两张 NPU 的 FIA 算子及图切换测试各 **27 项通过**；已删除模块无法再导入，
+活动服务的 12 个插件文件哈希保持一致，前后端健康检查均为 HTTP 200。
+移除及验证记录位于上述服务器目录的 `direct-removal/`，服务配置未调整。

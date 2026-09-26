@@ -23,7 +23,7 @@ args=(serve "$MODEL_PATH" --served-model-name "$MODEL_NAME"
   --enable-prefix-caching --enable-prompt-tokens-details
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-2048}"
   --long-prefill-token-threshold "${LONG_PREFILL_TOKEN_THRESHOLD:-0}")
-for flag in ENABLE_NPUGRAPH_EX ENABLE_CPU_BINDING BATCH_DIAGNOSTICS; do
+for flag in ENABLE_NPUGRAPH_EX ENABLE_CPU_BINDING BATCH_DIAGNOSTICS ENABLE_FORK_ATTENTION FORK_DIAGNOSTICS; do
   if [[ -n ${!flag+x} && ! ${!flag} =~ ^[01]$ ]]; then
     echo "$flag must be 0 or 1." >&2
     exit 2
@@ -41,6 +41,16 @@ if [[ $npugraph_ex == true && ${EXECUTION_MODE:-eager} != decode-graph ]]; then
   exit 2
 fi
 additional_config="\"enable_cpu_binding\":$cpu_binding"
+fork_attention=false
+[[ ${ENABLE_FORK_ATTENTION:-0} != 1 ]] || fork_attention=true
+fork_diagnostics=false
+[[ ${FORK_DIAGNOSTICS:-0} != 1 ]] || fork_diagnostics=true
+fork_min_shared=${FORK_MIN_SHARED_TOKENS:-32768}
+if [[ ! $fork_min_shared =~ ^[1-9][0-9]*$ ]] || (( fork_min_shared % 128 != 0 )); then
+  echo 'FORK_MIN_SHARED_TOKENS must be a positive multiple of 128.' >&2
+  exit 2
+fi
+additional_config+=",\"fork_attention\":{\"enabled\":$fork_attention,\"min_shared_tokens\":$fork_min_shared,\"diagnostics\":$fork_diagnostics}"
 case ${EXECUTION_MODE:-eager} in
   eager) args+=(--enforce-eager) ;;
   decode-graph)

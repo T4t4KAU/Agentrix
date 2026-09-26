@@ -89,6 +89,7 @@ def compare(
             "compilation_config",
             "npugraph_ex",
             "cpu_binding",
+            "fork_attention",
         )
         if ref_manifest.get(key) != new_manifest.get(key)
     }
