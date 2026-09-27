@@ -253,13 +253,15 @@ last stage revisits the first job. The model chooses searches and reads, and the
 oracle checks every stage. Compare sampled occupied KV blocks and task success,
 alongside `peak_tool_context_tokens`; token counts alone are not GPU measurements.
 
-For Qwen3-8B on the server's H100 GPU 1, launch from `/mnt/sda1/hwx/Agentrix`:
+For Qwen3-8B on an H100, launch from the repository root. Set `MODEL_DIR` and
+`RESULTS_DIR` privately to the model and server results directories; the GPU index
+and localhost port below are examples:
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 HF_HUB_OFFLINE=1 VLLM_SERVER_DEV_MODE=1 \
 VLLM_LOG_STATS_INTERVAL=0.1 VLLM_USE_FLASHINFER_SAMPLER=0 \
-vllm/.venv/bin/vllm serve /mnt/sda1/hwx/models/Qwen3-8B \
-  --served-model-name agentrix-paging --host 127.0.0.1 --port 18000 \
+vllm/.venv/bin/vllm serve "${MODEL_DIR}/Qwen3-8B" \
+  --served-model-name agentrix-paging --host 127.0.0.1 --port 8000 \
   --dtype bfloat16 --attention-config '{"backend":"FLASH_ATTN"}' \
   --kernel-config '{"enable_flashinfer_autotune":false}' --enforce-eager \
   --gpu-memory-utilization 0.9 --max-num-seqs 8 \
@@ -273,11 +275,11 @@ separately. For example:
 
 ```bash
 vllm/.venv/bin/python benchmark/scripts/benchmark_tool_result_paging.py \
-  --base-url http://127.0.0.1:18000 --gpu 1 \
+  --base-url http://127.0.0.1:8000 --gpu 1 \
   --mode inline --seed 20260923 --cases 8 --rows 128 --branches 3 \
   --concurrency 3 --kv-cache-bytes 2147483648 \
   --restore-on-validation-error \
-  --server-pid SERVER_PID --output /tmp/tool-paging-inline.json
+  --server-pid SERVER_PID --output "${RESULTS_DIR}/tool-paging-inline.json"
 ```
 
 Use the actual server PID for CPU process-tree RSS sampling. Each arm resets

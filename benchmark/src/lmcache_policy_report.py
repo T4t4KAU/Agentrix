@@ -162,9 +162,9 @@ def render_report(
             "vLLM GPU-cache hits. Actual retrieval is reported separately so cache "
             "misses or allocation failures cannot look like a traffic improvement.",
             "",
-            "## Logical ForkAttention KV Footprint",
+            "## Hypothetical Logical KV Footprint",
             "",
-            "| Baseline branch-local KV | Shared KV | Saved tokens | Saved GiB "
+            "| Fully duplicated branch-local KV | Shared KV | Saved tokens | Saved GiB "
             "| Reduction |",
             "|---:|---:|---:|---:|---:|",
             f"| {int(optimized['baseline_unique_kv'])} "
@@ -173,8 +173,10 @@ def render_report(
             f"| {optimized['kv_gib_saved']:.3f} "
             f"| {optimized['kv_reduction_percent']:.2f}% |",
             "",
-            "> This footprint estimate is workload-derived and independent of the "
-            "LMCache eviction policy; use the reload table for the policy A/B result.",
+            "> This workload-derived estimate assumes duplicated branch-local "
+            "storage. vLLM APC already shares physical prefix pages, including "
+            "with FlashAttention; this is not measured ForkAttention memory "
+            "savings over APC. Use the reload table for the policy A/B result.",
             "",
         ]
     )

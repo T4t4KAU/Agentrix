@@ -2,20 +2,21 @@
 
 ## 当前服务器
 
-`ssh -p 50887 root@connect.bjb2.seetacloud.com`。
+连接参数通过私有配置提供，本文不记录实际地址、端口或账号。
 推理、测试、profiling 仅在此服务器执行；本机负责编辑和传文件。
+路径采用[文档占位符约定](README.md)，运行前通过私有环境设置变量。
 
 | 路径/配置 | 当前用途 |
 | --- | --- |
-| `/root/autodl-tmp/Agentrix` | 部署源码；当前为文件同步目录，没有父仓库 .git |
+| `${REPO_ROOT}` | 部署源码；当前为文件同步目录，没有父仓库 .git |
 | `benchmark/.venv` | 唯一项目 Python 环境，Python 3.12.3 / Torch 2.11.0+cu128 |
 | `vllm/.venv` | 指向 `../benchmark/.venv` 的兼容 symlink，不是第二套环境 |
 | `/usr/local/cuda-12.8` | 当前编译 toolkit，SM120 |
 | `vllm/cmake-build-cu128` | 保留的增量构建目录 |
-| `/root/autodl-tmp/deps/vllm` | CMake 正在引用的依赖源码，不可当临时文件删除 |
-| `/root/autodl-tmp/models` | 用户模型；当前使用 Qwen3-VL-8B-Instruct |
+| `${DEPS_DIR}/vllm` | CMake 正在引用的依赖源码，不可当临时文件删除 |
+| `${MODEL_DIR}` | 用户模型；当前使用 Qwen3-VL-8B-Instruct |
 | `benchmark/results/upstream_vllm_0_25_0` | 独立原始 vLLM baseline，不能被 Agentrix editable install 覆盖 |
-| `/root/autodl-tmp/uv-cache` | 可再下载的安装缓存，不是运行环境 |
+| `${CACHE_DIR}` | 可再下载的安装缓存，不是运行环境 |
 
 服务器有 4 张 RTX 5090（每张约 32 GiB）。当前 matched DP=2 使用 GPUs 0/1，
 不是固定占用全部 GPU。父仓库及子模块版本应由源码提交确定，
@@ -26,12 +27,12 @@
 从服务器仓库根目录设置：
 
 ```bash
-cd /root/autodl-tmp/Agentrix
-export PATH="$PWD/benchmark/.venv/bin:/usr/local/cuda-12.8/bin:/root/.local/bin:$PATH"
+cd "${REPO_ROOT}"
+export PATH="$PWD/benchmark/.venv/bin:/usr/local/cuda-12.8/bin:${HOME}/.local/bin:$PATH"
 export CUDA_HOME=/usr/local/cuda-12.8
 export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6
 export UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple
-export UV_CACHE_DIR=/root/autodl-tmp/uv-cache
+export UV_CACHE_DIR="${CACHE_DIR}"
 export UV_LINK_MODE=copy
 export TORCH_CUDA_ARCH_LIST=12.0
 export VLLM_USE_FLASHINFER_SAMPLER=0
@@ -52,7 +53,7 @@ LMCache 当前缺少可选 `lmcache.cuda_ops`，沿用 Torch fallback；清理�
 
 ## 同步与增量构建
 
-GitHub 下载慢时在本机使用代理 `127.0.0.1:7897`，再将源码传至服务器。
+需要代理时通过本机私有环境配置，再将源码传至服务器。
 主路径需要 vLLM、LMCache、Mooncake；子模块 URL 以根目录 .gitmodules 为准。
 保留服务器 .venv、CMake 输出、依赖、模型和 results，不从本机覆盖这些平台相关产物。
 在没有 .git 的服务器部署目录中，不使用 `git checkout` 或 `git submodule update`。
@@ -60,7 +61,7 @@ GitHub 下载慢时在本机使用代理 `127.0.0.1:7897`，再将源码传至�
 C++/CUDA 变更后，复用已配置的 build tree：
 
 ```bash
-cd /root/autodl-tmp/Agentrix
+cd "${REPO_ROOT}"
 benchmark/.venv/bin/cmake --build vllm/cmake-build-cu128 \
   --target install --parallel 16 --verbose
 ```
@@ -73,7 +74,7 @@ Python-only 变更不需要重编译 vLLM CUDA 扩展。
 ## 检查与实验入口
 
 ```bash
-cd /root/autodl-tmp/Agentrix/benchmark
+cd "${REPO_ROOT}/benchmark"
 LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6 \
   .venv/bin/python -m pytest tests/test_tracelab.py -q
 ```

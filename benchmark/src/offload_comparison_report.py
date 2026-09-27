@@ -121,9 +121,9 @@ def render_report(root: Path) -> str:
     lines.extend(
         [
             "",
-            "## Logical KV Cache Footprint",
+            "## Hypothetical Logical KV Cache Footprint",
             "",
-            "| FlashAttention branch-local KV | ForkAttention shared KV | "
+            "| Fully duplicated branch-local KV | Shared-prefix KV | "
             "Saved tokens | Saved GiB | Reduction |",
             "|---:|---:|---:|---:|---:|",
             f"| {int(baseline['baseline_unique_kv'])} "
@@ -132,8 +132,10 @@ def render_report(root: Path) -> str:
             f"| {baseline['kv_gib_saved']:.3f} "
             f"| {baseline['kv_reduction_percent']:.2f}% |",
             "",
-            "> This is the logical KV footprint required by the common-prefix "
-            "workload. It is independent of the selected offload backend.",
+            "> This workload-derived estimate compares duplicated and shared "
+            "storage. vLLM APC already shares physical prefix pages with "
+            "FlashAttention. This is not measured ForkAttention memory savings "
+            "over an APC baseline or measured HBM read traffic.",
             "",
             "## KV Movement and Storage",
             "",

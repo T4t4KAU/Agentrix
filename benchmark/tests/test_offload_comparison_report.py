@@ -108,5 +108,5 @@ def test_render_report_compares_all_variants(tmp_path: Path) -> None:
     assert "| FlashAttention + native CPU |" in report
     assert "## Pairwise Offload Impact" in report
     assert "| FlashAttention native CPU vs no offload | +16.67% | +16.67% |" in report
-    assert "## Logical KV Cache Footprint" in report
+    assert "## Hypothetical Logical KV Cache Footprint" in report
     assert "| 1000 | 600 | 400 | 0.000 | 40.00% |" in report

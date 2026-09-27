@@ -62,7 +62,7 @@ Prefill, single-sequence decoding, unsupported KV layouts, unsupported model fam
 The following example targets a Tesla T4 with CUDA installed under `/usr/local/cuda`:
 
 ```bash
-export PATH=/usr/local/cuda/bin:$PATH
+export PATH="/usr/local/cuda/bin:$PATH"
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 ```
 
@@ -72,7 +72,7 @@ On CentOS 7, initialize the newer compiler and user-installed CMake first:
 export LC_ALL=C
 export LANG=C
 source /opt/rh/devtoolset-10/enable
-export PATH=/root/.local/bin:/usr/local/cuda/bin:$PATH
+export PATH="${HOME}/.local/bin:/usr/local/cuda/bin:$PATH"
 ```
 
 ### Configure and build

@@ -12,16 +12,17 @@ BF16、eager、原生 262144 上下文、16 个 session trees，只改变路由�
 运行环境是 vLLM 0.22.1 + vLLM-Ascend v0.22.1rc1（子模块
 `da9b47a226f2d1b5428f4658af5c4bfe9813dbeb`，包含配置校验和混合缓存保留补丁）。本仓库 `vllm/`
 是 0.28.0 CUDA 实验分支，不能直接安装到这个 Ascend 环境。
-服务器使用独立 `/data/Agentrix/.venv`，vLLM 源码在 `/data/Agentrix/vllm-0.22.1`。
+服务器使用独立 `${REPO_ROOT}/.venv`，vLLM 源码在 `${REPO_ROOT}/vllm-0.22.1`。
 Ascend 插件当前装为 wheel；修改源码后须部署对应文件或重新构建，不能把源码同步误当成运行时已更新。
 
 ## 实验记录保存规则
 
+本文路径遵循[文档占位符约定](README.md)，复现前通过私有环境设置变量。
 本地只保留代码、复现方法和本文中的关键配置、结果、验证结论及局限。
 后续直接在服务器运行和分析实验，不再将每轮日志、JSON 报告、manifest、诊断快照或测试输出下载到本地。
-新实验的完整产物统一保存在服务器 `/data/Agentrix/experiments/agentx-ascend/results/`。
+新实验的完整产物统一保存在服务器 `${RESULTS_DIR}/`。
 下文的实验记录路径均指服务器；历史归档仍在服务器同项目的 `baselines/`、`comparisons/`、
-`retention/`、`retention-v2/` 和 `validation/` 目录，均相对于 `/data/Agentrix/experiments/agentx-ascend/`。
+`retention/`、`retention-v2/` 和 `validation/` 目录，均相对于 `${EXPERIMENT_DIR}/`。
 2026-09-23 清理本地副本前，已逐文件核对 81 份服务器归档的 SHA-256。
 
 ## 文章中的优化如何落地
@@ -167,7 +168,7 @@ MODEL_NAME=Qwen3.5-9B LONG_PREFILL_TOKEN_THRESHOLD=1024 \
 `compare_retention.py` 默认要求插件哈希相同；跨代码修订比较必须显式加 `--allow-code-change`，
 报告会列出变化的文件。诊断在测量结束时冻结，后续健康检查或模型验证不会改写已有快照。
 本轮相对第一轮的代码差异保存在服务器
-`/data/Agentrix/experiments/agentx-ascend/retention-v2/validation/v1-to-v2.patch`，
+`${EXPERIMENT_DIR}/retention-v2/validation/v1-to-v2.patch`，
 所参考的上游提交及本地实现哈希见同目录的 `implementation-manifest.json`。
 
 ### 对照矩阵
@@ -192,7 +193,7 @@ first-turn-only 与 sticky 使用相同的首轮分配策略，更直接检查�
 `56a0cf70f4c0359454ee4bd15a17770b541a3e3e`。脚本默认读取已准备的离线缓存。
 
 ```bash
-# 在服务器的 /data/Agentrix 下运行；每轮只启动一个模型服务和一个 benchmark。
+# 在服务器的 ${REPO_ROOT} 下运行；每轮只启动一个模型服务和一个 benchmark。
 MODEL_NAME=Qwen3.5-9B LONG_PREFILL_TOKEN_THRESHOLD=1024 \
   bash experiments/agentx-ascend/serve.sh
 
@@ -201,7 +202,7 @@ agentx/.venv/bin/python experiments/agentx-ascend/session_router.py \
   --policy sticky --port 8000 --upstream http://127.0.0.1:8001
 
 # 再一个终端：输出目录必须不存在，防止覆盖前一轮结果。
-ARTIFACT_DIR=/data/Agentrix/experiments/agentx-ascend/results/sticky-cap1024/artifacts \
+ARTIFACT_DIR="${RESULTS_DIR}/sticky-cap1024/artifacts" \
   bash experiments/agentx-ascend/benchmark.sh
 ```
 
@@ -236,7 +237,7 @@ ARTIFACT_DIR=/data/Agentrix/experiments/agentx-ascend/results/sticky-cap1024/art
 ## 已有基线与验证
 
 原始启动脚本、manifest、summary 和 harness JSON 原样保存在服务器
-`/data/Agentrix/experiments/agentx-ascend/baselines/`。这些脚本是历史记录，复跑请用上面的
+`${EXPERIMENT_DIR}/baselines/`。这些脚本是历史记录，复跑请用上面的
 参数化入口；完整逐请求记录和服务器日志仍保留在服务器原运行目录。
 
 | 模型 | 上下文 / 并发 | 完成 / 错误 / 收尾取消 | 输出 tok/s | 平均 TTFT | cache read |
@@ -267,14 +268,14 @@ Qwen3.5 原目录中的 `artifacts-final` 是中断的 C4 诊断；有效报告�
 不能把这些幅度写成稳定性能保证。
 
 机器可读汇总及相同负载校验指纹在服务器
-`/data/Agentrix/experiments/agentx-ascend/comparison.json`；原始官方 JSON、
+`${EXPERIMENT_DIR}/comparison.json`；原始官方 JSON、
 manifest、路由计数和 summary 在同目录的 `comparisons/`。完整日志和逐请求数据在服务器
-`/data/Agentrix/experiments/agentx-ascend/results/`。
+`${RESULTS_DIR}/`。
 
 验证包括 15 项 Ascend 配置回归测试、7 项代理路由测试、真实 Qwen3.5 配置构建
 （512 拒绝，0/1024 接受），以及两卡各两次 8219-token prompt 的生成和缓存复用检查。
 每张卡的重复请求复用了 8192 token。配置验证日志在服务器
-`/data/Agentrix/experiments/agentx-ascend/validation/`，API 检查记录在
+`${EXPERIMENT_DIR}/validation/`，API 检查记录在
 `comparisons/sticky-c16-cap1024/smoke.txt`。
 
 最近一次实验结束时，服务器选用 sticky + cap1024，并启用下节验证的 8192-token 混合缓存保留间隔，
@@ -293,10 +294,10 @@ python -m pytest -q experiments/agentx-ascend/test_session_router.py
 python experiments/agentx-ascend/smoke.py
 
 # 在已安装对应 Ascend 插件补丁的服务器环境中，避免 cwd 导入未构建的源码包。
-source /data/Agentrix/activate-ascend.sh
-cd /data
+source "${REPO_ROOT}/activate-ascend.sh"
+cd "${REPO_ROOT}/.."
 python -m pytest --import-mode=importlib -q \
-  /data/Agentrix/vllm-ascend/tests/ut/patch/platform/test_mamba_prefill_config.py
+  "${REPO_ROOT}/vllm-ascend/tests/ut/patch/platform/test_mamba_prefill_config.py"
 ```
 
 在服务器完整结果目录运行 `summarize.py RUN_DIR`，从官方 JSON、逐请求记录和 `benchmark.log` 生成
@@ -332,23 +333,23 @@ python -m pytest --import-mode=importlib -q \
 完全相同输入重放命中 11264 token。正式 benchmark 后复查也通过。
 
 原始官方报告、manifest、诊断快照和验证记录在服务器
-`/data/Agentrix/experiments/agentx-ascend/retention/`，机器可读对照为该目录的
+`${EXPERIMENT_DIR}/retention/`，机器可读对照为该目录的
 `comparison.json`。完整逐请求数据和
-服务日志保留在服务器 `/data/Agentrix/experiments/agentx-ascend/results/mamba-retention/`。
+服务日志保留在服务器 `${RESULTS_DIR}/mamba-retention/`。
 
 ```bash
-# 在服务器 /data/Agentrix 下重新检查实验条件并计算差异，不需要 NPU。
+# 在服务器 ${REPO_ROOT} 下重新检查实验条件并计算差异，不需要 NPU。
 python experiments/agentx-ascend/compare_retention.py \
   experiments/agentx-ascend/retention/dense-c16-cap1024 \
   experiments/agentx-ascend/retention/sparse8192-c16-cap1024 \
-  --output /data/Agentrix/experiments/agentx-ascend/results/mamba-retention/recomputed-comparison.json
+  --output "${RESULTS_DIR}/mamba-retention/recomputed-comparison.json"
 
 # 缓存生命周期与原配置保护回归测试，使用服务器的 Ascend 环境。
-source /data/Agentrix/activate-ascend.sh
-cd /data
+source "${REPO_ROOT}/activate-ascend.sh"
+cd "${REPO_ROOT}/.."
 python -m pytest --import-mode=importlib -q \
-  /data/Agentrix/vllm-ascend/tests/ut/patch/platform/test_mamba_retention.py \
-  /data/Agentrix/vllm-ascend/tests/ut/patch/platform/test_mamba_prefill_config.py
+  "${REPO_ROOT}/vllm-ascend/tests/ut/patch/platform/test_mamba_retention.py" \
+  "${REPO_ROOT}/vllm-ascend/tests/ut/patch/platform/test_mamba_prefill_config.py"
 ```
 
 ### 2026-09-23 第二轮：复用优先回收与仅保留复用边界
@@ -390,26 +391,26 @@ P90 分别为 9.20、9.46、9.30 tok/s。
 批量分配和事件、淘汰/重置清理、块反复复用、关闭开关后的队列顺序，以及等待重试中共享边界被淘汰的情况。
 选定配置重启后再次通过两卡 22 请求检查，前端健康检查为 HTTP 200，实际生成请求返回预期结果。
 该次部署和校验记录位于服务器
-`/data/Agentrix/experiments/agentx-ascend/retention-v2/validation/`。
+`${EXPERIMENT_DIR}/retention-v2/validation/`。
 
 官方报告、配置、代码哈希及比较结果在服务器
-`/data/Agentrix/experiments/agentx-ascend/retention-v2/`。
-完整日志保留于服务器 `/data/Agentrix/experiments/agentx-ascend/results/retention-v2/`。
+`${EXPERIMENT_DIR}/retention-v2/`。
+完整日志保留于服务器 `${RESULTS_DIR}/retention-v2/`。
 重跑单组实验（会停止指定的上一轮实验服务）：
 
 ```bash
-source /data/Agentrix/activate-ascend.sh
+source "${REPO_ROOT}/activate-ascend.sh"
 python experiments/agentx-ascend/run_retention.py \
   --previous-run /path/to/previous-run \
   --run-dir /path/to/new-run \
   --interval 8192 --prefer-reuse-boundaries
 
-# 在服务器 /data/Agentrix 下跨第一轮代码和本轮代码比较，明确记录代码变化。
+# 在服务器 ${REPO_ROOT} 下跨第一轮代码和本轮代码比较，明确记录代码变化。
 python experiments/agentx-ascend/compare_retention.py \
   experiments/agentx-ascend/retention-v2/reference8192 \
   experiments/agentx-ascend/retention-v2/priority8192 \
   --allow-code-change \
-  --output /data/Agentrix/experiments/agentx-ascend/results/retention-v2/recomputed-comparison.json
+  --output "${RESULTS_DIR}/retention-v2/recomputed-comparison.json"
 ```
 
 ### 2026-09-23 Decode ACLGraph
@@ -468,7 +469,7 @@ GDN 捕获报 `NoneType ... conv1d_events`。该次启动失败记录保留在�
 入口支持：
 
 ```bash
-# 服务器 /data/Agentrix；正式测量不启用 PROFILE_DIR。
+# 服务器 ${REPO_ROOT}；正式测量不启用 PROFILE_DIR。
 EXECUTION_MODE=decode-graph KV_CACHE_MEMORY_BYTES=38654705664 \
   LONG_PREFILL_TOKEN_THRESHOLD=1024 MAMBA_RETENTION_INTERVAL=8192 \
   MAMBA_PREFER_REUSE_BOUNDARIES=1 MAMBA_RETENTION_DIAGNOSTICS=1 \
@@ -485,15 +486,15 @@ python experiments/agentx-ascend/compare_retention.py \
   experiments/agentx-ascend/results/decode-graph/eager-1 \
   experiments/agentx-ascend/results/decode-graph/graph-1 \
   --allow-execution-change \
-  --output /data/Agentrix/experiments/agentx-ascend/results/decode-graph/recomputed-comparison.json
+  --output "${RESULTS_DIR}/decode-graph/recomputed-comparison.json"
 ```
 
-`run_retention.py --serve-only --profile-dir /data/.../traces` 单独启动剖析服务；
+`run_retention.py --serve-only --profile-dir ${RESULTS_DIR}/profile/traces` 单独启动剖析服务；
 `profile_decode.py` 采集短诊断，`summarize_profile.py` 在服务器汇总解析后的 profiler CSV。
 `hybrid_cache_smoke.py --reference-file ... --concurrent-siblings 7` 检查跨执行模式一致性。
 执行模式对照须给 `compare_retention.py` 显式传入 `--allow-execution-change`；
 它同时要求缓存保留策略、缓存预算、每个 rank 报告的实际容量和启动脚本哈希相同，并拒绝混入剖析运行。
-完整记录位于服务器 `/data/Agentrix/experiments/agentx-ascend/results/decode-graph/`。
+完整记录位于服务器 `${RESULTS_DIR}/decode-graph/`。
 
 ### 2026-09-23 图模式基线核查与 CPU 编号映射修复
 
@@ -579,7 +580,7 @@ profiling 起止时间剔除预热和收尾；服务日志只有秒级时间戳�
 同时关闭优先回收周期性检查点，并非换用另一套未经修改的安装包。复现入口为：
 
 ```bash
-# 在服务器 /data/Agentrix，激活 Ascend 环境后执行；结果目录必须尚不存在。
+# 在服务器 ${REPO_ROOT}，激活 Ascend 环境后执行；结果目录必须尚不存在。
 python experiments/agentx-ascend/run_retention.py \
   --previous-run /path/to/previous-run --run-dir /path/to/native-run \
   --interval native --execution-mode decode-graph --npugraph-ex \
@@ -588,11 +589,11 @@ python experiments/agentx-ascend/run_retention.py \
 # 其他参数保持相同，使用 --interval 8192 --prefer-reuse-boundaries 跑另一组。
 python experiments/agentx-ascend/compare_retention.py \
   /path/to/native-run /path/to/sparse-run \
-  --output /data/Agentrix/experiments/agentx-ascend/results/cache-comparison.json
+  --output "${RESULTS_DIR}/cache-comparison.json"
 ```
 
 完整诊断、代码快照、四组正式报告和三个对照汇总位于服务器
-`/data/Agentrix/experiments/agentx-ascend/results/graph-baseline/`。
+`${RESULTS_DIR}/graph-baseline/`。
 
 ## NPU ForkAttention 算子原型
 
@@ -668,17 +669,17 @@ CPU 规划测试覆盖完整页边界、无共享/共享后缀、页重排、长
 # 在服务器激活 Ascend 环境，并将三个新算子文件部署到实际安装的插件。
 python experiments/agentx-ascend/benchmark_fork_attention.py \
   --device 0 \
-  --output /data/Agentrix/experiments/agentx-ascend/results/NEW_RUN/matrix.json
+  --output "${RESULTS_DIR}/NEW_RUN/matrix.json"
 
 # 独立 profiling，不能混入无 profiler 的性能报告。
 python experiments/agentx-ascend/benchmark_fork_attention.py \
   --branches 4 --prefixes 32768 --tails 128 --splits 4 \
-  --profile-dir /data/Agentrix/experiments/agentx-ascend/results/NEW_PROFILE/trace \
-  --output /data/Agentrix/experiments/agentx-ascend/results/NEW_PROFILE/timing.json
+  --profile-dir "${RESULTS_DIR}/NEW_PROFILE/trace" \
+  --output "${RESULTS_DIR}/NEW_PROFILE/timing.json"
 ```
 
 完整代码快照、矩阵、逐轮计时、测试输出和 profiler 数据均在服务器
-`/data/Agentrix/experiments/agentx-ascend/results/fork-attention-v1/`。
+`${RESULTS_DIR}/fork-attention-v1/`。
 关键记录为 `matrix-rank0.json`、`matrix-rank1.json`、`confirm-rank0.json`，以及
 `npu-tests-dynamic-rank0.txt`、`npu-tests-dynamic-rank1.txt`。
 最终代码另通过 22 项 CPU 规划测试和卡 0 的 22 项 NPU 复测；记录为
@@ -782,7 +783,7 @@ ForkAttention 默认关闭，可通过下述开关复现。正式报告为 `offi
 ### 复现入口
 
 ```bash
-# 服务器 /data/Agentrix，激活 Ascend 环境后执行。
+# 服务器 ${REPO_ROOT}，激活 Ascend 环境后执行。
 ENABLE_FORK_ATTENTION=1 FORK_DIAGNOSTICS=1 FORK_MIN_SHARED_TOKENS=32768 \
   EXECUTION_MODE=decode-graph ENABLE_NPUGRAPH_EX=1 \
   KV_CACHE_MEMORY_BYTES=38654705664 LONG_PREFILL_TOKEN_THRESHOLD=1024 \
@@ -799,7 +800,7 @@ python experiments/agentx-ascend/run_retention.py \
 
 对照组移除 `--fork-attention`，其余设置一致。`compare_retention.py --allow-execution-change`
 记录 Fork 配置差异，同时核对官方输入、保留策略、插件 SHA、启动脚本和实际 KV 容量。
-所有原始记录位于服务器 `/data/Agentrix/experiments/agentx-ascend/results/fork-attention-v2/`。
+所有原始记录位于服务器 `${RESULTS_DIR}/fork-attention-v2/`。
 
 ## 已移除的直接计算实验
 
@@ -819,9 +820,9 @@ python experiments/agentx-ascend/run_retention.py \
 
 这些是算子实验，不是官方 AgentX 成绩。剖析显示主要差距在 attention 主体；
 直接原型减少 Q 打包不足以抵消计算成本。原始数据及当时源码快照保存在服务器
-`/data/Agentrix/experiments/agentx-ascend/results/fork-attention-v3/`。
+`${RESULTS_DIR}/fork-attention-v3/`。
 审核后的源码另归档于
-`/data/Agentrix/experiments/agentx-ascend/results/fork-attention-review-20260924/reviewed-source.zip`。
+`${RESULTS_DIR}/fork-attention-review-20260924/reviewed-source.zip`。
 历史归档不属于当前可用实现，不再保留已删除脚本的启动命令。
 
 ## 代码审核与边界修复（2026-09-24）
@@ -842,7 +843,7 @@ python experiments/agentx-ascend/run_retention.py \
 插件适用的 pre-commit 检查、实验脚本 Ruff 与 shell 语法检查通过。
 本轮未修改计算内核，也没有新的性能或官方 AgentX 结论。
 原始复现、测试日志及服务健康记录保存在服务器
-`/data/Agentrix/experiments/agentx-ascend/results/fork-attention-review-20260924/`。
+`${RESULTS_DIR}/fork-attention-review-20260924/`。
 
 移除直接原型后，两张 NPU 的 FIA 算子及图切换测试各 **27 项通过**；已删除模块无法再导入，
 活动服务的 12 个插件文件哈希保持一致，前后端健康检查均为 HTTP 200。

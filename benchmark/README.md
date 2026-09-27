@@ -174,36 +174,29 @@ groups together while balancing group weights across replicas.
 
 Set `DP_DEPLOYMENT=internal` to launch one vLLM frontend with multiple internal
 DP engines. This exercises vLLM's request router instead of the benchmark-side
-router. ForkAttention prefix-aware routing is opt-in:
+router. Current prefix-aware routing is opt-in and works with FlashAttention:
 
 ```bash
-DP_DEPLOYMENT=internal \
-DP_REPLICAS=2 \
-GPU_IDS=0,1 \
-VLLM_FORK_ATTN_DP_PREFIX_ROUTING=1 \
-./scripts/run_vllm_benchmark.sh
+CUDA_VISIBLE_DEVICES=0,1 VLLM_AGENTRIX_DP_ROUTING_POLICY=prefix_aware \
+../vllm/.venv/bin/vllm serve /path/to/Qwen3-8B \
+  --data-parallel-size 2 --data-parallel-size-local 2 --api-server-count 1 \
+  --attention-config '{"backend":"FLASH_ATTN"}' --enable-prefix-caching
 ```
 
-`VLLM_FORK_ATTN_DP_PREFIX_LOAD_SLACK` bounds how far an affinity-selected rank
-may exceed the least-loaded rank in vLLM's `waiting * 4 + running` score. The
-default `32` permits an eight-request shared-prefix cohort to remain together.
-Finished prefixes remain soft routing hints for 30 seconds by default; control
-this with `VLLM_FORK_ATTN_DP_PREFIX_WARM_TTL`.
+The current frontend uses load slack 4, work slack 8,192 token units, decode
+weight 16, and a 300-second TTL for completed-prefix hints. Equal-depth hits
+prefer less remaining work, rather than more historical visits. Generated
+tokens update the remaining-work estimate; preemption restores a conservative
+recomputation budget. These hints do not prove GPU cache residency.
 
-The optimized internal router also consumes physical ForkAttention telemetry
-published through vLLM's existing DP stats channel. It uses the configured
-forest CTA buckets as discrete Graph costs, applies token-weighted load bounds,
-and groups requests arriving in the same short wave by their deepest shared
-logical subtree. The main controls are:
+Use `scripts/benchmark_prefix_aware_dp.py` for controlled revisit, replicated
+prefix, and cold-request comparisons, including per-rank completion counters.
+See [DP routing](../docs/dp_routing.md) for tested commands, results, and limits.
+The historical `VLLM_FORK_ATTN_DP_PREFIX_*`, Graph-bucket, and arrival-wave
+controls described by older recipes are absent from the current frontend.
 
-```text
-VLLM_FORK_ATTN_DP_GRAPH_SLACK_BUCKETS=1
-VLLM_FORK_ATTN_DP_WORK_SLACK_TOKENS=8192
-VLLM_FORK_ATTN_DP_DECODE_TOKEN_WEIGHT=16
-VLLM_FORK_ATTN_DP_ARRIVAL_WAVE_MS=1
-```
-
-Run the complete dataset comparison with two internal DP ranks using:
+The following full-dataset recipe targets those older routing controls and is
+retained for historical reproduction, not validation of the current router:
 
 ```bash
 MODEL_PATH=/path/to/Qwen3-8B \

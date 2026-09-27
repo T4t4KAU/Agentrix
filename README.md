@@ -163,14 +163,21 @@ CMake build directory, and install prefix separate. In particular, reserve
 `vllm/cmake-build-cu130` for the host CUDA 13.0 build and use
 `vllm/cmake-build-cu128` only from the CUDA 12.8 container. Never reconfigure
 one directory with the other toolkit or PyTorch wheel. A container-private
-CUDA 12.8 setup can use `/opt/agentrix-cu128-venv` and
-`/opt/agentrix-cu128-install`; the source checkout may be bind-mounted, but its
+CUDA 12.8 setup can use `${CUDA_VENV_DIR}` and
+`${CUDA_INSTALL_DIR}`; the source checkout may be bind-mounted, but its
 environment and compiled output must not be shared with the host build.
 On SM120 with CUDA 12.8, set `VLLM_USE_FLASHINFER_SAMPLER=0` so vLLM uses its
 native sampler; the current FlashInfer JIT requires CUDA 12.9 or newer for
 SM120. This does not disable the ForkAttention backend.
 
 ## Build and Enable LMCache
+
+The recipes in this section describe an older integration. The current LMCache
+policy registry has no `FORK_AWARE`, and the current CUDA vLLM checkout lacks the
+Agentrix residency/placement hooks and native fanout offload options used below.
+These comparisons cannot establish an active optimization on the current
+checkout. See the [current KV memory audit](docs/kv_memory_optimization_status.md)
+before using these historical recipes.
 
 Install LMCache into the same environment as vLLM so the connector and CUDA
 extension use the same Python, PyTorch, and CUDA ABI:
@@ -195,7 +202,7 @@ write-through behavior.
 chunk_size: 256
 local_cpu: true
 max_local_cpu_size: 8
-local_disk: /mnt/nvme/lmcache
+local_disk: /path/to/cache  # Replace with a private server cache directory.
 max_local_disk_size: 128
 cache_policy: FORK_AWARE
 extra_config:
@@ -254,8 +261,9 @@ The paired report is written to
 policy metric is total KV reload demand reduced relative to default LMCache,
 reported in tokens, GiB, and percent. Actual retrieval, storage, and disk-load
 allocation failures are shown alongside it. The separate logical footprint
-table reports how much branch-local KV ForkAttention avoids independent of the
-LMCache eviction policy.
+table estimates fully duplicated branch-local storage versus shared storage.
+It does not measure physical memory saved over vLLM APC, which also shares
+prefix pages with FlashAttention.
 
 To compare CPU-only offload, tiered LMCache, and vLLM's native connector with
 both attention backends, run:
@@ -278,16 +286,18 @@ The script runs seven configurations with the same workload and capacity:
 ForkAttention without offload, ForkAttention native CPU offload, default
 LMCache LRU CPU offload, fork-aware LMCache CPU offload, fork-aware LMCache
 CPU plus disk, FlashAttention without offload, and FlashAttention native LRU
-CPU offload. The native ForkAttention configuration enables fanout-aware
-admission and hot-prefix protection; the native FlashAttention configuration
-explicitly disables these extensions to preserve the ordinary LRU baseline.
+CPU offload. The script passes historical fanout admission and hot-prefix
+protection options for ForkAttention; the current native connector does not
+implement them. On a runtime that supports these options, changing both the
+attention backend and cache policy would confound their individual effects.
 
 The report is written to
 `benchmark/results/offload_backend_comparison/offload_comparison.md`. It shows
 end-to-end and branch throughput, pairwise offload impact within each backend,
-KV load/store traffic, disk footprint, load failures, and the total logical KV
-footprint reduction from branch-local FlashAttention KV to ForkAttention's
-shared representation. Repeat the command into distinct `OUTPUT_DIR` values
+KV load/store traffic, disk footprint, load failures, and a hypothetical logical
+KV footprint comparison between duplicated and shared storage. This last metric
+is not a measured FlashAttention-versus-ForkAttention memory saving.
+Repeat the command into distinct `OUTPUT_DIR` values
 and use paired medians when collecting performance results.
 
 ## Install the Benchmark Suite

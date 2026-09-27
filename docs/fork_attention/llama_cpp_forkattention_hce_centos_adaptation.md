@@ -18,7 +18,7 @@ Both systems successfully built the CUDA backend for Turing (`sm_75`) and ran Qw
 | Package manager | `dnf` | `yum` | Installation commands differ. |
 | Repository condition | Active HCE repositories | CentOS 7 is EOL; some mirror lists are no longer usable | CentOS SCL repositories had to be redirected to fixed Huawei Cloud URLs. |
 | Default GCC used for the build | GCC 10.3 | System GCC 4.8.5 is too old; SCL GCC 10.2.1 was installed | CentOS builds must enable `devtoolset-10` in every new shell. |
-| CMake | CMake 3.22 from the OS repository | EPEL CMake 3.17.5 is below the project minimum; CMake 3.26.4 was installed with pip | CentOS must put `/root/.local/bin` on `PATH`. |
+| CMake | CMake 3.22 from the OS repository | EPEL CMake 3.17.5 is below the project minimum; CMake 3.26.4 was installed with pip | CentOS must put `${HOME}/.local/bin` on `PATH`. |
 | Ninja | Ninja 1.8 from the OS repository | Ninja 1.10.2 from EPEL | No source-level difference. |
 | Python/pip | Not required for the build toolchain | Python 3.6.8; pip upgraded from 9.0.3 to 21.3.1 | The last pip version compatible with Python 3.6 was used. |
 | glibc | Provided by the HCE image | glibc 2.17 | The CentOS CMake wheel must be compatible with manylinux2014/glibc 2.17. |
@@ -75,7 +75,7 @@ No Software Collections environment or user-installed CMake was required.
 The stock image had CUDA under `/usr/local/cuda-11.4`, but CUDA tools were not necessarily present on the default shell path. The following environment was sufficient:
 
 ```bash
-export PATH=/usr/local/cuda/bin:$PATH
+export PATH="/usr/local/cuda/bin:$PATH"
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 ```
 
@@ -172,12 +172,12 @@ python3 -m pip install --user --upgrade \
   -i https://pypi.tuna.tsinghua.edu.cn/simple \
   'pip==21.3.1'
 
-/root/.local/bin/pip3 install --user \
+${HOME}/.local/bin/pip3 install --user \
   -i https://pypi.tuna.tsinghua.edu.cn/simple \
   'cmake==3.26.4'
 ```
 
-Because this is a user-level installation, `/root/.local/bin` must be added to `PATH` before invoking CMake.
+Because this is a user-level installation, `${HOME}/.local/bin` must be added to `PATH` before invoking CMake.
 
 ### 5.5 Locale and build environment
 
@@ -196,14 +196,16 @@ export LANG=C
 
 source /opt/rh/devtoolset-10/enable
 
-export PATH=/root/.local/bin:/usr/local/cuda/bin:$PATH
+export PATH="${HOME}/.local/bin:/usr/local/cuda/bin:$PATH"
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 ```
 
 ### 5.6 Build
 
+Set `REPO_ROOT` and `MODEL_DIR` privately to the Agentrix checkout and model directory.
+
 ```bash
-cd /root/llama.cpp-fork-attn
+cd "${REPO_ROOT}/llama.cpp"
 
 CC=gcc CXX=g++ cmake -S . -B build-cuda-t4 -G Ninja \
   -DGGML_CUDA=ON \
@@ -235,7 +237,7 @@ build-cuda-t4/bin/test-backend-ops test \
 
 ```bash
 build-cuda-t4/bin/llama-parallel \
-  -m /root/Qwen3-0.6B-UD-IQ1_S.gguf \
+  -m "${MODEL_DIR}/Qwen3-0.6B-UD-IQ1_S.gguf" \
   -ngl 99 \
   -fa on \
   --fork-attn \
