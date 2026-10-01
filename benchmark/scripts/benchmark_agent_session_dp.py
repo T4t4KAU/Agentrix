@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import aiohttp
+from benchmark_prefix_aware_dp import reset_cache
 
 
 @dataclass(slots=True)
@@ -30,6 +31,9 @@ class RequestResult:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
+    parser.add_argument(
+        "--control-url", help="Backend URL for cache reset and engine metrics"
+    )
     parser.add_argument("--model")
     parser.add_argument("--policy-label", default="unknown")
     parser.add_argument("--sessions", type=int, default=12)
@@ -85,11 +89,6 @@ async def discover_model(session: aiohttp.ClientSession, base_url: str) -> str:
     return payload["data"][0]["id"]
 
 
-async def reset_cache(session: aiohttp.ClientSession, base_url: str) -> None:
-    async with session.post(f"{base_url}/reset_prefix_cache") as response:
-        response.raise_for_status()
-
-
 async def read_prompt_sources(
     session: aiohttp.ClientSession, base_url: str
 ) -> dict[str, float]:
@@ -113,8 +112,6 @@ async def run_request(
     prompt: list[int],
     session_id: int,
     phase: str,
-    turn: int,
-    history_tokens: int,
     output_tokens: int,
     launch_delay_s: float = 0.0,
 ) -> RequestResult:
@@ -128,16 +125,14 @@ async def run_request(
         "ignore_eos": True,
         "stream": True,
         "stream_options": {"include_usage": True},
-        "vllm_xargs": {
-            "agentrix_session_id": f"session-{session_id}" if session_id >= 0 else "",
-            "agentrix_turn": turn,
-            "agentrix_history_tokens": history_tokens,
-        },
     }
     started = time.perf_counter()
     first_token_at: float | None = None
     usage: dict[str, Any] | None = None
-    async with session.post(f"{base_url}/v1/completions", json=payload) as response:
+    headers = {"X-Session-ID": f"session-{session_id}"} if session_id >= 0 else {}
+    async with session.post(
+        f"{base_url}/v1/completions", json=payload, headers=headers
+    ) as response:
         if response.status >= 400:
             body = await response.text()
             raise RuntimeError(f"request failed ({response.status}): {body}")
@@ -222,8 +217,6 @@ async def run_batch(
     model: str,
     prompts: list[list[int]],
     phase: str,
-    turn: int,
-    history_tokens: list[int],
 ) -> tuple[list[RequestResult], float]:
     started = time.perf_counter()
     results = await asyncio.gather(
@@ -235,8 +228,6 @@ async def run_batch(
                 prompt,
                 session_id,
                 phase,
-                turn,
-                history_tokens[session_id],
                 args.output_tokens,
                 session_id * args.launch_gap_ms / 1000,
             )
@@ -247,6 +238,7 @@ async def run_batch(
 
 
 async def main_async(args: argparse.Namespace) -> dict[str, Any]:
+    control_url = args.control_url or args.base_url
     timeout = aiohttp.ClientTimeout(total=600)
     connector = aiohttp.TCPConnector(limit=0)
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
@@ -260,9 +252,9 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         )
         trials = []
         for trial_index in range(args.trials):
-            await reset_cache(session, args.base_url)
+            await reset_cache(session, control_url)
             await asyncio.sleep(args.reset_settle_s)
-            metrics_before_prime = await read_prompt_sources(session, args.base_url)
+            metrics_before_prime = await read_prompt_sources(session, control_url)
             prime = await run_request(
                 session,
                 args.base_url,
@@ -270,12 +262,10 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
                 shared,
                 -1,
                 "shared_prefix_prime",
-                0,
-                0,
                 args.output_tokens,
             )
             await asyncio.sleep(args.phase_settle_ms / 1000)
-            metrics_after_prime = await read_prompt_sources(session, args.base_url)
+            metrics_after_prime = await read_prompt_sources(session, control_url)
 
             first_results, first_makespan = await run_batch(
                 session,
@@ -283,21 +273,17 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
                 model,
                 first_turns,
                 "first_turn",
-                0,
-                [0] * args.sessions,
             )
             await asyncio.sleep(args.phase_settle_ms / 1000)
-            metrics_after_first = await read_prompt_sources(session, args.base_url)
+            metrics_after_first = await read_prompt_sources(session, control_url)
             followup_results, followup_makespan = await run_batch(
                 session,
                 args,
                 model,
                 followups,
                 "followup",
-                1,
-                [len(prompt) for prompt in first_turns],
             )
-            metrics_after_followup = await read_prompt_sources(session, args.base_url)
+            metrics_after_followup = await read_prompt_sources(session, control_url)
             first_summary = summarize(first_results, first_makespan)
             followup_summary = summarize(followup_results, followup_makespan)
             prime_server_metrics: dict[str, Any] = {}
@@ -363,6 +349,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "configuration": {
             "base_url": args.base_url,
+            "control_url": control_url,
             "model": model,
             "policy_label": args.policy_label,
             "sessions": args.sessions,

@@ -1,12 +1,12 @@
-from pathlib import Path
+import hashlib
 import json
 import runpy
 import tracemalloc
+from pathlib import Path
 
 import pytest
-
-from coding_agent_tools import RepositoryTools
 from agentrix_application import PagedToolStore
+from coding_agent_tools import RepositoryTools
 
 
 def test_public_test_expands_python_in_build_command(tmp_path: Path) -> None:
@@ -104,6 +104,65 @@ def test_narrow_read_does_not_materialize_an_unselected_large_line(tmp_path):
         tracemalloc.stop()
     assert event["content"] == "File large.log has 3 lines.\n1: wanted"
     assert peak < 1 << 20
+
+
+@pytest.mark.parametrize("paging", [False, True])
+def test_large_selected_line_has_bounded_memory_and_exact_result(tmp_path, paging):
+    source = tmp_path / "large.txt"
+    line = "中😀ab" * (1 << 19)
+    source.write_text(line + "\r\nlast\n", encoding="utf-8")
+    expected = "File large.txt has 2 lines.\n1: " + line
+    expected_hash = hashlib.sha256(expected.encode()).hexdigest()
+    expected_bytes = len(expected.encode())
+    store = PagedToolStore(tmp_path / "snapshots.sqlite") if paging else None
+    if store is not None:
+        store.open_session("root")
+    tools = RepositoryTools(tmp_path, {}, max_output_bytes=511, result_store=store)
+    tracemalloc.start()
+    try:
+        event = tools.read("large.txt", 1, 1)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 3 << 20
+    assert event["content_sha256"] == expected_hash
+    assert event["original_bytes"] == expected_bytes
+    assert event["paged"] is paging
+    assert event["truncated"] is not paging
+    if store is not None:
+        handle = json.loads(event["content"])
+        assert handle["total_chars"] == len(expected)
+        assert handle["preview"] == expected[:256]
+        source.write_text("changed", encoding="utf-8")
+        digest = hashlib.sha256()
+        for offset in range(0, len(expected), 16384):
+            digest.update(
+                store.read("root", handle["result_id"], offset=offset, limit=16384)[
+                    "content"
+                ].encode()
+            )
+        assert digest.hexdigest() == expected_hash == handle["result_id"]
+        store.release_session("root")
+        assert store.stats()["stored_bytes"] == 0
+        store.close()
+    else:
+        assert event["content"] == expected.encode()[:511].decode(errors="replace")
+        assert (
+            event["returned_sha256"]
+            == hashlib.sha256(expected.encode()[:511]).hexdigest()
+        )
+
+
+def test_streamed_read_quota_failure_publishes_no_partial_result(tmp_path):
+    store = PagedToolStore(tmp_path / "snapshots.sqlite", max_bytes=4096)
+    store.open_session("root")
+    (tmp_path / "large.txt").write_text("x" * 8192)
+    tools = RepositoryTools(tmp_path, {}, max_output_bytes=32, result_store=store)
+    with pytest.raises(ValueError, match="budget exceeded"):
+        tools.read("large.txt")
+    assert tools.events == []
+    assert store.stats() == dict(objects=0, stored_bytes=0, sessions=1, references=0)
+    store.close()
 
 
 def test_paging_benchmark_handles_parallel_calls_and_checks_only_proposed_score():

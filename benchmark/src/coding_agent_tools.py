@@ -4,7 +4,10 @@ import hashlib
 import json
 import subprocess
 import sys
+import tempfile
 import time
+from collections.abc import Iterable
+from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -74,6 +77,96 @@ class RepositoryTools:
         elif truncated:
             encoded = encoded[: self.max_output_bytes]
             content = encoded.decode("utf-8", errors="replace")
+        return self._append_event(
+            tool,
+            arguments,
+            content,
+            encoded,
+            content_sha256,
+            original_bytes,
+            truncated,
+            paged,
+            started,
+        )
+
+    def _record_pieces(
+        self,
+        tool: str,
+        arguments: dict[str, Any],
+        pieces: Iterable[str],
+        started: float,
+    ) -> dict[str, Any]:
+        """Record a file result without assembling its full body in memory."""
+        hasher = hashlib.sha256()
+        original_bytes = total_chars = 0
+        prefix = bytearray()
+        preview = ""
+
+        def measured():
+            nonlocal original_bytes, total_chars, preview
+            for piece in pieces:
+                data = piece.encode("utf-8", errors="replace")
+                hasher.update(data)
+                original_bytes += len(data)
+                total_chars += len(piece)
+                prefix.extend(data[: max(0, self.max_output_bytes - len(prefix))])
+                preview += piece[: max(0, 256 - len(preview))]
+                yield piece
+
+        remaining = measured()
+        buffered = []
+        for piece in remaining:
+            buffered.append(piece)
+            if original_bytes > self.max_output_bytes:
+                break
+        else:
+            return self._record(tool, arguments, "".join(buffered), started)
+
+        paged = self.result_store is not None
+        if paged:
+            result_id = self.result_store.put_stream(
+                self.session_id, chain(buffered, remaining)
+            )
+            content = json.dumps(
+                {
+                    "result_id": result_id,
+                    "total_chars": total_chars,
+                    "preview": preview,
+                    "retrieval": "Use search_result with a literal needle, or "
+                    "read_result with offset and limit, to read this exact snapshot.",
+                },
+                ensure_ascii=False,
+            )
+            encoded = content.encode("utf-8")
+        else:
+            for _ in remaining:
+                pass
+            encoded = bytes(prefix)
+            content = encoded.decode("utf-8", errors="replace")
+        return self._append_event(
+            tool,
+            arguments,
+            content,
+            encoded,
+            hasher.hexdigest(),
+            original_bytes,
+            not paged,
+            paged,
+            started,
+        )
+
+    def _append_event(
+        self,
+        tool: str,
+        arguments: dict[str, Any],
+        content: str,
+        encoded: bytes,
+        content_sha256: str,
+        original_bytes: int,
+        truncated: bool,
+        paged: bool,
+        started: float,
+    ) -> dict[str, Any]:
         event = {
             "sequence": len(self.events),
             "tool": tool,
@@ -197,33 +290,43 @@ class RepositoryTools:
         # Retain only the requested range. Still scan to EOF for the exact line
         # count, preserving read_text().splitlines() semantics, including Unicode
         # separators, universal newlines and an unterminated final line.
-        parts = []
         line_number = 1
         at_line_start = True
-        with source.open(encoding="utf-8", errors="replace") as stream:
-            while block := stream.read(64 << 10):
-                for fragment in block.splitlines(keepends=True):
-                    ended = fragment[-1] in "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
-                    if start_line <= line_number <= end_line:
-                        if at_line_start:
-                            parts.append(f"{line_number}: ")
-                        parts.append(fragment[:-1] if ended else fragment)
+        selected_line = False
+        # The header needs the final line count. Spool the selected range from
+        # this single scan, then stream it after the header. Small reads stay in
+        # memory; a long selected line spills to disk instead of growing RAM.
+        with tempfile.SpooledTemporaryFile(
+            max_size=256 << 10, mode="w+t", encoding="utf-8", newline=""
+        ) as body:
+            with source.open(encoding="utf-8", errors="replace") as stream:
+                while block := stream.read(64 << 10):
+                    for fragment in block.splitlines(keepends=True):
+                        ended = fragment[-1] in "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+                        if start_line <= line_number <= end_line:
+                            if at_line_start:
+                                if selected_line:
+                                    body.write("\n")
+                                body.write(f"{line_number}: ")
+                                selected_line = True
+                            body.write(fragment[:-1] if ended else fragment)
                         if ended:
-                            parts.append("\n")
-                    if ended:
-                        line_number += 1
-                    at_line_start = ended
-        total_lines = line_number - 1 + int(not at_line_start)
-        body = "".join(parts)
-        if body.endswith("\n"):
-            body = body[:-1]
-        content = f"File {path} has {total_lines} lines.\n{body}"
-        return self._record(
-            "read",
-            {"path": path, "start_line": start_line, "end_line": end_line},
-            content,
-            started,
-        )
+                            line_number += 1
+                        at_line_start = ended
+            total_lines = line_number - 1 + int(not at_line_start)
+            body.seek(0)
+
+            def pieces():
+                yield f"File {path} has {total_lines} lines.\n"
+                while block := body.read(64 << 10):
+                    yield block
+
+            return self._record_pieces(
+                "read",
+                {"path": path, "start_line": start_line, "end_line": end_line},
+                pieces(),
+                started,
+            )
 
     def apply_patch(self, patch: str) -> dict[str, Any]:
         started = time.perf_counter()

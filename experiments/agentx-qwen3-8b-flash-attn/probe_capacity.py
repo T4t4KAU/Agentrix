@@ -338,7 +338,7 @@ def cleanup_offload_cache(part):
 
 
 def run():
-    root = Path("/mnt/sda1/hwx/Agentrix")
+    root = Path(__file__).resolve().parents[2]
     baseline = root / "experiments/agentx-qwen3-8b-flash-attn"
     run_dir = baseline / ("capacity-probe-" + time.strftime("%Y%m%d-%H%M%S"))
     run_dir.mkdir()
@@ -717,7 +717,9 @@ def run_comparison(
     resume_run=None,
     warmup_requests_per_lane=10,
 ):
-    root = Path("/mnt/sda1/hwx/Agentrix")
+    if mode == "capacity-ab":
+        raise ValueError("Capacity bypass was removed; select an official sweep")
+    root = Path(__file__).resolve().parents[2]
     baseline = root / "experiments/agentx-qwen3-8b-flash-attn"
     source = root / "vllm/vllm/v1/core/sched/scheduler.py"
     upstream = verify_upstream_runtime(upstream_env) if upstream_env else None
@@ -948,7 +950,9 @@ def run_comparison(
                     "RUN=$ROOT/experiments/agentx-qwen3-8b-flash-attn",
                     f"RUN={part}",
                 ).rstrip()
-                additional_config = {"agentrix_capacity_bypass": enabled}
+                if enabled:
+                    raise ValueError("Capacity bypass was removed")
+                additional_config = {}
                 config = json.dumps(additional_config)
                 serve += f" --long-prefill-token-threshold {cap}"
                 if kv_cache_bytes is not None:
@@ -1170,6 +1174,8 @@ if __name__ == "__main__":
         help="Reverse measured arms after smoke checks",
     )
     args = parser.parse_args()
+    if args.ab:
+        parser.error("Capacity bypass was removed; use the official prefill/offload sweeps")
     comparison = (
         args.ab
         or args.prefill_sweep

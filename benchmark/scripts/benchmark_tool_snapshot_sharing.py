@@ -263,20 +263,57 @@ def lifecycle_worker(args, store_type):
 def read_worker(args, tools_type):
     """Measure the real repository read tool, keeping its output unchanged."""
     source = args.read_file.resolve()
-    tools = tools_type(source.parent, {})
-    started = time.perf_counter()
-    first = tools.read(source.name, args.start_line, args.end_line)
-    elapsed = time.perf_counter() - started
-    # Capture RSS before tracing: allocation tracking itself adds memory,
-    # especially in the baseline that creates an object for every file line.
-    peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    tracemalloc.start()
-    try:
-        result = tools.read(source.name, args.start_line, args.end_line)
-        _, peak = tracemalloc.get_traced_memory()
-    finally:
-        tracemalloc.stop()
-    assert first["content_sha256"] == result["content_sha256"]
+    if args.page_reads:
+        sys.path.insert(0, str(ROOT / "application/src"))
+        from agentrix_application import PagedToolStore
+
+    with tempfile.TemporaryDirectory(prefix="agentrix-read-result-") as directory:
+        for iteration in range(2):
+            store = (
+                PagedToolStore(Path(directory) / f"results-{iteration}.sqlite")
+                if args.page_reads
+                else None
+            )
+            if store is not None:
+                store.open_session("root")
+            tools = tools_type(
+                source.parent,
+                {},
+                **({"result_store": store} if args.page_reads else {}),
+            )
+            if iteration:
+                tracemalloc.start()
+            try:
+                started = time.perf_counter()
+                result = tools.read(source.name, args.start_line, args.end_line)
+                if iteration:
+                    _, peak = tracemalloc.get_traced_memory()
+                else:
+                    elapsed = time.perf_counter() - started
+                    peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                    first = result
+            finally:
+                if iteration:
+                    tracemalloc.stop()
+            assert first["content_sha256"] == result["content_sha256"]
+            if store is not None:
+                if result["paged"]:
+                    handle = json.loads(result["content"])
+                    restored = hashlib.sha256()
+                    for offset in range(0, handle["total_chars"], 16384):
+                        restored.update(
+                            store.read(
+                                "root", handle["result_id"], offset=offset, limit=16384
+                            )["content"].encode()
+                        )
+                    assert (
+                        restored.hexdigest()
+                        == result["content_sha256"]
+                        == handle["result_id"]
+                    )
+                store.release_session("root")
+                assert store.stats()["stored_bytes"] == 0
+                store.close()
     return dict(
         mode=args.worker,
         input_file_bytes=source.stat().st_size,
@@ -321,6 +358,8 @@ def read_ablation(args):
                 "--end-line",
                 str(args.end_line),
             ]
+            if args.page_reads:
+                command.append("--page-reads")
             row = json.loads(subprocess.check_output(command, text=True))
             rows.append(row)
             print(
@@ -366,6 +405,7 @@ def read_ablation(args):
         input_file=str(args.read_file.resolve()),
         start_line=args.start_line,
         end_line=args.end_line,
+        page_reads=args.page_reads,
         rows=rows,
         summary=summary,
         exact_output_match=True,
@@ -394,6 +434,11 @@ def main():
     )
     parser.add_argument("--start-line", type=int, default=1)
     parser.add_argument("--end-line", type=int, default=32)
+    parser.add_argument(
+        "--page-reads",
+        action="store_true",
+        help="Enable tool-result paging and verify complete snapshot recovery.",
+    )
     parser.add_argument(
         "--stages",
         type=int,

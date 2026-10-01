@@ -100,9 +100,10 @@ Stream interruption or quota failure rolls back the unpublished revision. Old
 databases are migrated transactionally while retaining their handles and owners.
 
 Existing `put` callers gain page sharing automatically. Producers must use the
-streaming/range-update API to avoid building full result strings in host memory;
-the coding runner still supplies complete strings. Range updates still scan and
-hash the complete revision to preserve its content-addressed handle.
+streaming/range-update API to avoid building full result strings in host memory.
+The coding runner's file-read tool now streams selected content into the store.
+Search and other tool producers still supply complete strings. Range updates
+still scan and hash the complete revision to preserve its content-addressed handle.
 
 To compare storage and host-memory use against an earlier implementation:
 
@@ -159,6 +160,32 @@ checksum chain. Occupancy samples include the overlap between consecutive
 stages, and the benchmark checks that the final session release reclaims all
 data. This is a scripted lifecycle test, not a model-quality evaluation or a
 policy for discarding arbitrary conversation history.
+
+The file-read tool also bounds memory when the selected lines themselves are
+large. It scans the source once, spools the selected text with a 256 KiB memory
+threshold, then streams the line-count header and body through the existing
+snapshot API. Small results retain the normal inline representation. With paging
+disabled, large results retain the same truncated response and full-content hash.
+The temporary file can grow to the selected text size and is closed on success
+or failure; configure the temporary directory on appropriate storage. OS file
+caching is outside the process-buffer limit. This does not bound the accumulated
+tool-event history or every tool producer.
+
+To compare this path with an archived earlier tool implementation, run on the
+experiment server:
+
+```bash
+application/.venv/bin/python benchmark/scripts/benchmark_tool_snapshot_sharing.py \
+  --read-file "${EXPERIMENT_DIR}/long-result.txt" \
+  --baseline-tools "${EXPERIMENT_DIR}/baseline/coding_agent_tools.py" \
+  --start-line 1 --end-line 1 --page-reads --repeats 3 \
+  --output "${RESULTS_DIR}/tool-read-streaming.json"
+```
+
+The benchmark compares exact response hashes, restores each complete paged
+snapshot, checks final reclamation, and measures RSS before allocation tracing.
+The [result inventory](../docs/nvidia_memory_results_and_ascend_plan.md#44-选中大结果的有界缓冲与流式入库2026-09-28)
+reports memory and latency separately.
 
 The coding runner accepts `--tool-result-paging`. Large `read` and `search`
 observations become handles instead of truncated output. The agent can issue
@@ -341,7 +368,7 @@ ENABLE_CACHEBLEND=1 CASES=100 CASE_CONCURRENCY=2 \
 The opt-in run adds the final CacheBlend pair:
 
 | Pair | Off | On | Live matched question |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | FlashAttention | `baseline` | `baseline_compact` | compaction without ForkAttention |
 | ForkAttention | `forkattention` | `forkattention_compact` | compaction/Fork interaction |
 | CacheBlend | `cacheblend` | `cacheblend_compact` | compaction/CacheBlend interaction |
@@ -376,6 +403,12 @@ may attribute a small latency or memory difference solely to compaction; live
 results remain the stronger end-to-end relevance check.
 
 ## Tool-call KV trimming
+
+The application policy below remains available, but the current pinned vLLM
+checkout lacks its `/v1/agentrix/tool-kv/trim` endpoint and engine operation.
+These examples describe the historical integration and do not establish a
+working offload/prefetch path or measured benefit. See
+[current status and limitations](../docs/tool_kv_trimmer.md#current-status-2026-09-28).
 
 `ToolKVTrimmer` is an application-owned, opt-in policy for releasing the GPU
 KV blocks of a vLLM resumable session while a slow tool is running. It waits a

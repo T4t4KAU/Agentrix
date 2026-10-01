@@ -4,6 +4,22 @@ This overview describes the application and backend integration paths.
 Configuration and limitations are covered in
 [KV memory](kv_memory_optimization_status.md) and [DP routing](dp_routing.md).
 
+Current DP deployments use the official `vllm-router==0.1.15` package. The
+private prefix/session router has been removed; older internal-routing
+descriptions and measurements below are historical, not the current policy.
+The [measured result inventory](README.md) is the authority for performance
+claims. The LangGraph flow and compatibility matrix below describe a separate
+historical workload, not the current official AgentX configuration. Repository
+presence does not establish that an integration is connected or beneficial.
+
+The current memory-management design is maintained in
+[the lifecycle and branch plan](kv_memory_optimization_status.md#面向长生命周期与分支的统一方案).
+It separates application object ownership from derived KV residency, reuses
+official sharing and transfer mechanisms, and evaluates capacity and recovery
+latency as well as throughput. The first new implementation bounds host buffers
+for selected large file results; the complete lifecycle-driven KV controller
+and heterogeneous migration remain planned work.
+
 ## Purpose
 
 Agentrix is an inference system for Agent workloads with long shared context,
@@ -12,14 +28,14 @@ not treat every optimization as another attention kernel. The system acts at
 three different representations:
 
 | Layer | Unit optimized | Main mechanism |
-|---|---|---|
+| --- | --- | --- |
 | Application | Prompt sections and tool schemas | Exact, information-preserving compaction |
 | KV memory | Stored or transferred KV chunks | vLLM prefix cache, LMCache CPU/disk tiers, CacheBlend |
 | GPU execution | Attention work over resident KV | ForkAttention, fanout scheduling, CUDA Graphs |
 
 These mechanisms are complementary only when their compatibility constraints
 are satisfied. Prompt compaction removes repeated input representation;
-ForkAttention reduces repeated GPU KV reads and attention work; LMCache changes
+ForkAttention targets repeated GPU KV reads over shared segments; LMCache changes
 where KV is resident; CacheBlend reuses KV for reordered RAG chunks. Their
 speedups must not be multiplied without a measured combined path.
 
@@ -89,8 +105,9 @@ weakening the exact shared parent that ForkAttention needs.
 The `vllm/` submodule contains the primary high-performance inference path.
 The current ForkAttention branch includes the CUDA backend, forest planning,
 fanout-aware scheduling, CUDA Graph dispatch, adaptive tail splitting,
-prefix-aware data-parallel routing, TP coverage, and physical execution
+TP coverage and physical execution
 metrics.
+Cache/session-aware DP routing now runs in the official external router.
 
 ### ForkAttention
 
@@ -117,8 +134,7 @@ across unrelated batches.
 Agentrix aligns work before executing it:
 
 - fanout admission groups sibling branches;
-- prefix-aware DP first constrains rank load, then applies prefix affinity and
-  query aggregation;
+- official external routing selects a replica using its configured cache or session policy;
 - forest plans represent multiple shared roots and private suffixes;
 - sparse plan-capacity buckets allow CUDA Graph replay without capturing every
   possible batch/bucket product;
@@ -131,8 +147,11 @@ singleton CTA entries are exported through Prometheus.
 
 ### Other Runtime Coverage
 
-The vLLM path includes native CPU KV offload controls, hot-prefix protection,
-TP model coverage, and prefix-aware internal DP. The `llama.cpp/` submodule
+The vLLM path includes upstream KV offload connectors, TP model coverage, and
+official external cache/session-aware DP routing. Historical Agentrix native
+fanout offload and hot-prefix protection options are not consumed by the current checkout.
+Agent Hints for tool-wait offload and resume prefetch have not been connected.
+The `llama.cpp/` submodule
 provides narrower ForkAttention implementations for CUDA, MUSA, and Apple
 Metal portability. The LangGraph experiment in this document set uses vLLM;
 llama.cpp is not part of its measured serving path.
@@ -154,20 +173,18 @@ Agentrix therefore reports both fixed allocation and the peak
 
 ### LMCache Tiered Storage
 
-The `LMCache/` submodule extends KV residency beyond the vLLM GPU pool. Its
-Agentrix branch supports:
+The `LMCache/` submodule provides external KV storage infrastructure. Its current
+local cache policy registry exposes LRU, LFU, FIFO, and MRU, not `FORK_AWARE`.
+The historical fork-aware policy and HOT/COOLING/COLD lifecycle were implemented
+on another branch; they are not active features of the pinned combination.
+The current vLLM checkout also lacks the historical Agentrix residency and
+placement hooks required by proactive backup. Remaining coordinator code or
+old configuration files do not establish an operational path.
 
-- local CPU KV storage;
-- optional disk storage;
-- default LRU and `FORK_AWARE` admission/eviction;
-- HOT/COOLING/COLD fanout-prefix lifecycle hysteresis;
-- CPU-to-disk demotion on eviction instead of mandatory write-through;
-- guarded reload and DP handoff integration.
-
-`FORK_AWARE` values a high-fanout shared prefix above low-value private suffix
-chunks while retaining emergency eviction for correctness. CPU and disk
-capacity, transfer traffic, allocation failures, and reload demand must be
-measured independently from logical shared-tree savings.
+CPU and disk capacity, transfer traffic, allocation failures, and reload demand
+must be measured independently from logical shared-tree savings. See
+[the current code audit](kv_memory_optimization_status.md) before running an
+offload recipe.
 
 ### CacheBlend for RAG
 
@@ -198,7 +215,7 @@ and do not load the CacheBlend LMCache configuration or connector.
 ## Compatibility Matrix
 
 | Path | APC | CUDA Graph | ForkAttention | LMCache CPU/disk | CacheBlend |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | Flash baseline | On | On | No | No | No |
 | Flash + compaction | On | On | No | No | No |
 | ForkAttention | On | On | Yes | No in current LangGraph run | No |
@@ -206,9 +223,10 @@ and do not load the CacheBlend LMCache configuration or connector.
 | CacheBlend (opt-in) | Off | Eager | No | 8 GiB local CPU | Yes |
 | CacheBlend + compaction (opt-in) | Off | Eager | No | 8 GiB local CPU | Yes |
 
-The broader repository also supports ForkAttention with ordinary or
-fork-aware CPU/disk offload, but that is a different experiment matrix from
-the CacheBlend RAG path.
+Older benchmark recipes also describe ForkAttention with ordinary or
+fork-aware CPU/disk offload. The fork-aware combination is unavailable in the
+current pinned checkout; this historical matrix is not a compatibility claim
+for the current Qwen3.5/AgentX serving configuration.
 
 ## Observability and Decision Rule
 

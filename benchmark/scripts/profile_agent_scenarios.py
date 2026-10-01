@@ -436,9 +436,6 @@ def run(args):
         VLLM_USE_FLASHINFER_SAMPLER="0",
         VLLM_SERVER_DEV_MODE="1",
         VLLM_PLUGINS="",
-        VLLM_AGENTRIX_DP_ROUTING_POLICY=args.policy,
-        VLLM_FORK_ATTN_DP_PREFIX_MIN_BLOCKS=str(args.prefix_min_blocks),
-        VLLM_FORK_ATTN_DP_WORK_SLACK_TOKENS=str(args.work_slack),
         VLLM_FORK_ATTN_ENABLE_FOREST="1",
         VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH="1",
         VLLM_FORK_ATTN_FANOUT_SCHEDULING_ENABLED="0",
@@ -532,7 +529,7 @@ def run(args):
                     for p in (
                         ROOT / "benchmark/src/tracelab_replay.py",
                         ROOT / "benchmark/scripts/profile_tracelab.py",
-                        ROOT / "vllm/vllm/v1/engine/prefix_router.py",
+                        ROOT / "vllm/vllm/v1/engine/core_client.py",
                         ROOT / "vllm/vllm/v1/attention/backends/fork_attn.py",
                         ROOT / "vllm/vllm/v1/worker/gpu/cudagraph_utils.py",
                     )
@@ -567,13 +564,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--policy",
         default="native",
-        choices=("native", "prefix_aware", "session_aware"),
+        choices=("native",),
     )
     parser.add_argument("--gpus", default="0")
     parser.add_argument("--port", type=int, default=8150)
     parser.add_argument("--gpu-blocks", type=int, default=4608)
-    parser.add_argument("--prefix-min-blocks", type=int, default=4)
-    parser.add_argument("--work-slack", type=int, default=8192)
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--cases", default="")
     parser.add_argument("--eager", action="store_true")

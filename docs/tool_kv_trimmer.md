@@ -1,6 +1,23 @@
 # Tool-call KV Cache Trimmer
 
-## Executive Summary
+## Current status (2026-09-28)
+
+The application policy, client, and TTL predictor remain in
+`application/src/agentrix_application/tool_kv_trimmer.py` and its companion
+predictor module. The current pinned `vllm/` checkout does **not** implement
+`POST /v1/agentrix/tool-kv/trim` or the corresponding engine trim operation.
+The integration and deployment examples below describe the historical design;
+enabling the application flag alone does not provide a working engine path.
+There is no verified current end-to-end memory or latency gain for this policy.
+
+Trimming releases request references; it does not by itself save KV to CPU or
+schedule a prefetch. Ordinary completed HTTP requests already release these
+references. Agent Hints for tool-wait offload must additionally select and save
+reusable full-attention KV and the matching hybrid state, track completed
+transfers, and arrange restoration. That chain is pending, with no measured
+benefit yet. See the [current result inventory](README.md).
+
+## Historical design
 
 `ToolKVTrimmer` is an application-owned policy that releases live GPU KV
 blocks while a resumable vLLM session is idle waiting for a tool. It addresses
@@ -109,7 +126,7 @@ directly without changing the trimmer.
 The implementation is split into two files:
 
 | File | Responsibility |
-|---|---|
+| --- | --- |
 | [`application/src/agentrix_application/tool_kv_trimmer.py`](../application/src/agentrix_application/tool_kv_trimmer.py) | lifecycle, pressure gate, serialization, trim adapter, counters |
 | [`application/src/agentrix_application/tool_ttl_predictor.py`](../application/src/agentrix_application/tool_ttl_predictor.py) | bounded features, online horizon model, persistence |
 
@@ -149,7 +166,7 @@ P(duration > 2,000 ms)  P(duration > 5,000 ms)
 The bounded context is:
 
 | Feature | Meaning |
-|---|---|
+| --- | --- |
 | `tool_family` | coarse application-owned tool class |
 | `argument_bytes` | encoded argument size, not argument content |
 | `kv_tokens` | estimated live tokens for the session |
@@ -188,7 +205,7 @@ versioned JSON object and can be saved and restored atomically with
 There are three operational states:
 
 | State | Trimming | TTL used | Predictor updates |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Disabled | No | None | No |
 | Fixed TTL / predictor shadow | Yes | `grace_ms` | Yes, if a predictor and context are supplied |
 | Active predicted TTL | Yes | predicted, bounded by fixed fallback | Yes |
@@ -237,10 +254,10 @@ tool itself.
 when requests share APC blocks. Releasing one request decrements references;
 the before/after total usage delta is authoritative for physical occupancy.
 
-## Minimal vLLM Integration
+## Historical vLLM Integration (absent from the current checkout)
 
-The policy itself is outside vLLM. The vLLM branch adds only the mechanism
-needed to trim a validated resumable request:
+The policy itself is outside vLLM. The historical integration required the
+following mechanism to trim a validated resumable request:
 
 1. `POST /v1/agentrix/tool-kv/trim` accepts one `request_id`.
 2. The engine resolves an external request ID to its internal request ID.
@@ -275,7 +292,7 @@ The trimmer is compatible with ForkAttention because the two mechanisms act
 at different times and optimize different resources:
 
 | Mechanism | State | Optimization |
-|---|---|---|
+| --- | --- | --- |
 | ForkAttention | sibling queries actively decoding | reuse shared resident KV reads across queries |
 | Tool KV trimmer | session idle waiting for external input | release that session's live GPU KV references |
 
@@ -306,7 +323,7 @@ remain necessary even when offload is available.
 The environment switches are:
 
 | Variable | Default | Meaning |
-|---|---:|---|
+| --- | ---: | --- |
 | `AGENTRIX_TOOL_KV_TRIM_ENABLED` | `0` | master switch |
 | `AGENTRIX_TOOL_KV_TRIM_GRACE_MS` | `500` | fixed fallback TTL |
 | `AGENTRIX_TOOL_KV_TRIM_PRESSURE_THRESHOLD` | `0.70` | minimum total KV usage for trim |
@@ -380,7 +397,7 @@ in “Learned Soft TTL” above. Use `benchmark/scripts/evaluate_tool_ttl_predic
 that controlled evaluation, or `--dataset trace --trace-root <results>` for
 recorded tool events. Run both on the server, with a new `--output` path.
 
-## Deployment Guidance
+## Deployment Guidance (requires restoring the engine integration)
 
 Use the following sequence for a real workload:
 

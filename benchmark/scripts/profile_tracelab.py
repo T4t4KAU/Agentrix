@@ -85,11 +85,7 @@ def main() -> None:
     parser.add_argument(
         "--backend", choices=("FLASH_ATTN", "FORK_ATTN"), default="FLASH_ATTN"
     )
-    parser.add_argument(
-        "--policy", choices=("native", "session_aware"), default="native"
-    )
-    parser.add_argument("--gpu-events", action="store_true")
-    parser.add_argument("--active-placement", action="store_true")
+    parser.add_argument("--policy", choices=("native",), default="native")
     parser.add_argument("--tier-config", type=Path)
     parser.add_argument("--gpu-ids", default="0,1")
     parser.add_argument("--gpu-blocks", type=int, default=2048)
@@ -124,9 +120,6 @@ def main() -> None:
         VLLM_USE_FLASHINFER_SAMPLER="0",
         VLLM_SERVER_DEV_MODE="1",
         VLLM_PLUGINS="",
-        VLLM_AGENTRIX_DP_ROUTING_POLICY=args.policy,
-        VLLM_AGENTRIX_DP_KV_EVENTS=str(int(args.gpu_events)),
-        VLLM_AGENTRIX_KV_PLACEMENT_ACTIVE=str(int(args.active_placement)),
         VLLM_FORK_ATTN_ENABLE_FOREST="1",
         VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH="1",
         VLLM_FORK_ATTN_FANOUT_SCHEDULING_ENABLED="0",

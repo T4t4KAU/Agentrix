@@ -74,6 +74,7 @@ def compare(
         "kv_capacity_tokens_per_rank",
         "launcher_sha256",
         "batch_diagnostics",
+        "router",
     ):
         if ref_manifest.get(key) != new_manifest.get(key):
             raise ValueError(f"Uncontrolled difference: {key}")

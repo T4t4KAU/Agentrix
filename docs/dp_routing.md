@@ -1,125 +1,93 @@
-# DP 路由与 GPU KV 亲和性
+# 官方 DP 路由与历史实验
 
-## 策略与边界
+当前入口统一使用官方 `vllm-router==0.1.15`。已删除自定义 internal DP
+前缀/会话路由器、Ascend 实验代理及其专用性能模拟器。vLLM frontend 恢复官方选路，
+仅保留“所有 DP rank 都 reset 成功才返回成功”的正确性修复。
 
-Agentrix 扩展 vLLM 的 internal DP 路由，不增加第二套调度器。
-`VLLM_AGENTRIX_DP_ROUTING_POLICY` 选择互斥策略：
+## 与官方文章的关系
 
-| 策略 | 行为 |
+[官方文章](https://vllm.ai/blog/2026-09-08-vllm-agentx#load-balance-does-not-guarantee-better-performance)
+已比较 session-aware sticky routing 与负载均衡，缓存亲和性不是本项目原创。
+现在直接使用 [vllm-project/router](https://github.com/vllm-project/router) 的发布组件，
+没有复制或另写一套哈希、前缀索引、过载阈值或会话生命周期算法。
+博客中的实验策略与该发布包不保证逐行相同；当前采用的是官方公开组件。
+
+## 当前策略与接入
+
+| 入口 | 行为 |
 | --- | --- |
-| `native` | 按原有队列负载选择 replica |
-| `prefix_aware` | 在负载和工作量边界内优先选择已有长前缀的 replica |
-| `session_aware` | 首轮保留 native 选择；后续轮优先会话归属，检查前缀与过载条件 |
-| `session_sticky` | 优先维持显式会话归属，不应用普通亲和性的过载改派规则 |
+| 直连 vLLM backend | 官方 internal DP 负载均衡，作为 native 对照 |
+| 官方 `consistent_hash` | 以 `X-Session-ID` 保持多轮会话归属；当前 AgentX 默认策略 |
+| 官方 `cache_aware` | 使用发布包自身的缓存亲和性及负载策略；需要独立对照 |
+| 官方 `round_robin` | 官方 router 内的轮转对照 |
 
-当前版本使用 `VLLM_AGENTRIX_DP_ROUTING_POLICY`，默认 `native`；旧开关
-`VLLM_FORK_ATTN_DP_PREFIX_ROUTING` 已不在当前代码中。
-亲和性策略要求一个 API frontend、固定 DP ranks 和开启 APC，不支持 elastic EP。
-Session-aware 是 prefix-aware 的扩展选择，不是再叠加一次 DP。
-路由与 attention backend 独立，FlashAttention 也能使用。
+官方 router 的 `--intra-node-data-parallel-size` 将同一 backend 的 DP ranks
+作为候选，并设置 `X-data-parallel-rank`。推理请求发到 router；清缓存、采集逐卡
+指标及显式指定 rank 的预热发到 backend。不要用 router 的 metrics 代替 engine metrics。
+没有 session 标识时按官方 fallback 处理，不再维持本项目的旧语义。
+`cache_aware` 不承诺等价于已删除的 token 哈希前缀匹配，也不证明 GPU KV 实际驻留；
+尤其不能将 chat、token-ID completion 和共享前缀分支视为已经验证相同行为。
 
-请求可在 `vllm_xargs` 中提供：
-
-```json
-{
-  "agentrix_session_id": "conversation-42",
-  "agentrix_turn": 2,
-  "agentrix_history_tokens": 3072
-}
-```
-
-后续轮有会话映射时优先该 rank；没有映射则参考最长已知前缀。
-历史覆盖不足时回到 baseline；过载时从负载合格的 rank 中按估算工作量再平衡。
-会话映射受 TTL 和容量约束，缓存 reset 时清理。
-`agentrix_turn` 需要调用方显式提供，当前入口不会从 chat 消息自动推断。
-
-### 两卡负载与执行进度
-
-前缀深度相同时，先比较估算剩余工作、原生负载，再按轮转顺序打破平局。
-历史访问次数不代表额外可复用 token，不能仅因一张卡访问过更多次就持续偏向它。
-冷请求保持原生选择；只有命中达到最小深度的候选才应用亲和性。
-
-工作量初值为未命中的 prompt 长度加 `16 × max_tokens`。
-首个实际生成 token 到达后扣除已完成的 prefill，随后按输出 token 数扣减剩余 decode
-预算。收到抢占通知时，恢复当前上下文的保守重算成本；仅有重新调度事件不会扣除它，
-需要后续模型输出确认恢复。取消和结束只释放剩余预算，缓存清空后仍更新执行进度。
-
-当前 frontend 使用的负载容差为 4，工作量容差为 8,192 token 单位。
-原生负载已有精确的本 frontend 在途请求数下界；有等待队列时，KV 使用率会加重
-排队惩罚。亲和性仍受这些限制，`session_sticky` 的显式会话绑定除外。
-
-工作量是剩余输出预算的启发式估计，不是 GPU 时间预测；首 token 前不能精确跟踪
-chunked prefill 的进度，也不能预知提前停止。评分没有逐请求的可分配 KV 容量，
-请求数均衡不保证瞬时内存压力均衡。
-
-## 缓存提示的边界
-
-当前实现根据已经执行的请求维护有界逻辑前缀提示，默认 TTL 为 300 秒，最多保留
-1,024 个完成请求。生成的最后一个 token 尚未作为输入计算 KV，不提前计入命中。
-Salt、LoRA 和可识别多模态内容隔离命名空间；不支持的请求保持原生路径。
-
-此前文档描述的 `VLLM_AGENTRIX_DP_KV_EVENTS` 和 `kv_routing.py` 不在当前固定的
-CUDA 子模块中，不能按 GPU store/remove 事件索引解释当前实验。
-缓存淘汰可能让逻辑提示过时，目标 engine 会自行验证并重算。
-Router 不 pin GPU block，不同步调用 scheduler，也不跨 GPU 复制 KV。
-清空缓存前会废弃路由提示；DP reset 接口只有所有 replica 都成功时才返回成功，
-避免把单卡清空成功误报为整个 DP 的缓存已清空。
-
-实现入口：
-
-- [前缀与会话选择](../vllm/vllm/v1/engine/prefix_router.py)
-- [Frontend 接入](../vllm/vllm/v1/engine/core_client.py)
-
-## 验证入口
-
-仅在服务器上运行，模型与输出路径显式配置，结果目录每轮独立：
-
-- `vllm/tests/v1/engine/test_prefix_router.py`：无需模型的路由、执行进度与抢占回归。
-- `benchmark/scripts/benchmark_prefix_aware_dp.py`：前缀重访、双卡已复制热点和冷请求对照；
-  保存逐卡完成数、缓存统计、输出 token 哈希、TTFT 和批次耗时。
-- `benchmark/scripts/benchmark_agent_session_dp.py`：多轮会话流量。
-
-先在私有环境中设置 `MODEL_DIR` 和 `RESULTS_DIR`，分别指向模型目录和服务器结果目录。
-两卡服务示例（使用同一模型、配置分别切换 `native` / `prefix_aware`）：
+`VLLM_AGENTRIX_DP_ROUTING_POLICY`、旧 `VLLM_FORK_ATTN_DP_PREFIX_*` 及
+`agentrix_session_id/turn/history_tokens` 路由协议均已停用。引用旧开关的 11 个历史 shell recipes 会立即停止并提示新入口，避免把
+已失效的开关当成优化继续测量；新实验通过下面的官方 HTTP 入口执行。
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 VLLM_SERVER_DEV_MODE=1 \
-VLLM_AGENTRIX_DP_ROUTING_POLICY=prefix_aware \
-vllm/.venv/bin/vllm serve "${MODEL_DIR}/Qwen3-8B" \
-  --host 127.0.0.1 --port 8000 --served-model-name agentrix-dp \
-  --data-parallel-size 2 --data-parallel-size-local 2 --api-server-count 1 \
-  --attention-config '{"backend":"FLASH_ATTN"}' --dtype bfloat16 \
-  --enforce-eager --no-async-scheduling \
-  --max-model-len 8192 --kv-cache-memory-bytes 8589934592 \
-  --max-num-seqs 32 --max-num-batched-tokens 2048 \
-  --enable-prefix-caching --enable-prompt-tokens-details
+# 在实验服务器中安装独立路由环境，不改变推理环境依赖。
+uv venv "${REPO_ROOT}/.router-venv"
+uv pip install --python "${REPO_ROOT}/.router-venv/bin/python" \
+  -r "${REPO_ROOT}/benchmark/requirements-router.txt"
+
+# 先使用已有 serve 配置启动 backend，设 BACKEND_URL 和路由监听参数。
+"${REPO_ROOT}/.router-venv/bin/python" \
+  "${REPO_ROOT}/benchmark/scripts/serve_dp_router.py" \
+  --worker-urls "${BACKEND_URL}" --policy consistent_hash \
+  --intra-node-data-parallel-size 2 \
+  --host "${ROUTER_HOST}" --port "${ROUTER_PORT}" \
+  --prometheus-port "${ROUTER_METRICS_PORT}"
 ```
 
-`VLLM_SERVER_DEV_MODE=1` 用于测试期间清空前缀缓存，服务只监听 localhost。
-`replicated` 测试用 `--warm-rank-counts 8,1` 明确构造访问次数不均的已复制前缀；
-只在预热阶段指定 rank，计时请求由服务自行路由。
+启动器只检查版本和加载官方 Rust router；`--check` 在启动模型前检查依赖。
+Ascend `run_retention.py` 默认采用该入口，并在 manifest 记录官方包、版本和策略；
+比较器拒绝把旧代理与新 router 混成仅缓存策略不同的 A/B。
 
-例如在服务器运行前缀重访测试：
+两卡合成会话对照入口为 `benchmark/scripts/run_agent_session_dp_profile.sh`，
+默认比较 native / consistent_hash / cache_aware，attention 使用官方 FlashAttention。
+请求驱动环境安装 `benchmark[dp]`，提供 aiohttp 与 Prometheus 指标解析依赖。
+设置模型、可用卡及服务器 `OUTPUT_ROOT` 后再运行；该脚本不是官方 AgentX。
+`benchmark_agent_session_dp.py` 和 `benchmark_prefix_aware_dp.py` 均支持
+`--base-url "${ROUTER_URL}" --control-url "${BACKEND_URL}"`。
+原始数据只写到服务器 `${RESULTS_DIR}`，每个冷启动对照重启 router 和 backend；
+只 reset engine 不会同步清除官方 router 自身的估计状态。
+
+## 验证与限制
+
+真实发布包的 Rust 进程配合模拟双 rank backend，已通过五项 CPU 接口测试：
+多轮会话固定 rank、两个 rank 均可被选中、token-ID prompt 与扩展元数据透传、
+SSE 首 chunk 在请求完成前送达；也检查 `cache_aware` 的请求透传与流式路径。
+这证明接口兼容，不证明前缀命中、硬件输出正确性或性能提升。
 
 ```bash
-vllm/.venv/bin/python benchmark/scripts/benchmark_prefix_aware_dp.py \
-  --base-url http://127.0.0.1:8000 --model agentrix-dp \
-  --policy-label prefix_aware --workload revisit --documents 12 \
-  --prefix-tokens 4096 --suffix-tokens 64 --output-tokens 32 \
-  --trials 3 --revisit-order shuffled --seed 20260927 \
-  --output "${RESULTS_DIR}/dp-revisit/result.json"
+uv pip install --python "${REPO_ROOT}/.router-venv/bin/python" aiohttp pytest
+"${REPO_ROOT}/.router-venv/bin/python" -m pytest -q \
+  "${REPO_ROOT}/experiments/agentx-ascend/test_session_router.py"
 ```
 
-每轮先确认 cache reset 成功，计时只覆盖重访/突发批次；预热和指标收集不计入。
-TTFT 从 HTTP 请求发出到第一个实际输出 token ID，空文本特殊 token 也计入，
-不把仅含角色或空 choices 的消息当作首 token。脚本核对每个请求的输入、输出 token 数，
-并确认逐卡完成数之和等于本批请求数。
+原生 DP 十项负载选择、完成计数和全 rank reset 单元检查通过；
+缓存与 checkpoint 的 31 项回归、原生准入的六项调度检查通过；单元环境用固定 token IDs
+代替 gated tokenizer，不加载模型。本轮未完成新 router 的双卡官方 AgentX 性能复测，
+下面的历史收益不能移记为官方 router 的实测收益。
+
+结构化 Agent Hints 父/根路由 API 已在此前撤回；独立的
+[分叉 checkpoint 提示](kv_memory_optimization_status.md#agent-hints提前保留分叉状态2026-09-27)
+也在后续 H100 完整回放未建立收益后撤回。官方路由与缓存机制继续沿用。
 
 ## 两张 H100 实测（2026-09-27）
 
 实验使用两张 H100 PCIe 80 GB，逻辑 GPU 编号为 0/1。
 Qwen3-8B BF16、FlashAttention 3、eager、同步调度、每卡 8 GiB KV 池，
-其他参数使用上述服务命令。比较当前分支 `native`、修改前 `prefix_aware` 和新版
+历史配置为 eager、同步调度、8,192 上下文、每卡 8 GiB KV、32 并发槽、
+2,048 批 token，FlashAttention + APC。比较当时分支 `native`、修改前 `prefix_aware` 和新版
 `prefix_aware`；三组共同使用“两卡 reset 都成功”的修复，只改变路由策略或实现。
 原始工程的安装版本字符串不作为源码提交证明，实际代码以服务器 manifest 的哈希为准。
 
@@ -163,7 +131,7 @@ TTFT P95 中位数下降 6.98%，批次耗时基本不变。重访 TTFT P95 下�
 这次新版批次耗时增加 2.52%，TTFT P95 增加 21.55%；首轮的重访尾延迟改善
 没有稳定复现。**本轮确认的是热点分配与状态处理的改进，没有建立总体性能提升，
 重访延迟存在回退风险。** 两批数据分别保留，不用追加结果替换原始矩阵。
-默认策略继续为 `native`，`prefix_aware` 仍需显式选择。
+当时默认策略为 `native`；本轮已删除自定义 `prefix_aware`，以下数据仅描述历史实现。
 
 720 个正式计时请求均完成预期 token 数，逐卡完成计数与客户端一致、零抢占。
 追加复测还有 144 个计时请求，使用相同检查；两批合计 864 个计时请求，

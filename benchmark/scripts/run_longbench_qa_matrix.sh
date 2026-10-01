@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+
+# Historical recipe: its private frontend controls no longer exist.
+echo "Retired routing recipe. Use run_agent_session_dp_profile.sh; see docs/dp_routing.md." >&2
+exit 2
 set -Eeuo pipefail
 BENCHMARK_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_ROOT="$(cd -- "${BENCHMARK_DIR}/.." && pwd)"

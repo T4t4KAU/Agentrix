@@ -26,6 +26,7 @@ data = [
   "Pillow>=10.0",
 ]
 demo = ["aiohttp>=3.9,<4", "textual>=0.80,<2"]
+dp = ["aiohttp>=3.9,<4", "prometheus-client>=0.20,<1"]
 test = ["pytest>=8.0", "langgraph>=1.2,<2"]
 
 [project.scripts]

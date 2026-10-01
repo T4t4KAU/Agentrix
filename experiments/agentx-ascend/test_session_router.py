@@ -1,126 +1,195 @@
+"""Contract checks against the installed official Rust router, without a GPU."""
+
 import asyncio
+import json
+import socket
+import sys
 import unittest
+from pathlib import Path
 
-from aiohttp import web
-from aiohttp.test_utils import TestClient, TestServer
+from aiohttp import ClientSession, web
+from aiohttp.test_utils import TestServer
 
-from session_router import create_app
+ROOT = Path(__file__).resolve().parents[2]
 
 
-class RouterTest(unittest.IsolatedAsyncioTestCase):
+def free_port():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+class OfficialRouterTests(unittest.IsolatedAsyncioTestCase):
+    policy = "consistent_hash"
+
     async def asyncSetUp(self):
         self.received = []
         self.release_stream = asyncio.Event()
-
-        async def backend(request):
-            self.received.append(
-                (dict(request.headers), await request.read(), request.path_qs)
-            )
-            if request.query.get("stream"):
-                response = web.StreamResponse(
-                    headers={"Content-Type": "text/event-stream"}
-                )
-                await response.prepare(request)
-                await response.write(b'data: {"text":"hello"}\n\n')
-                await self.release_stream.wait()
-                await response.write(b"data: [DONE]\n\n")
-                return response
-            return web.json_response(
-                {"rank": request.headers.get("X-data-parallel-rank")}
-            )
-
         app = web.Application()
-        app.router.add_route("*", "/{path:.*}", backend)
-        self.backend = TestServer(app)
-        await self.backend.start_server()
-        self.clients = []
 
-    async def asyncTearDown(self):
-        self.release_stream.set()
-        for client in self.clients:
-            await client.close()
-        await self.backend.close()
+        async def health(request):
+            return web.Response(text="ok")
 
-    async def proxy(self, policy="sticky"):
-        client = TestClient(
-            TestServer(create_app(str(self.backend.make_url("/")), policy=policy))
+        async def models(request):
+            return web.json_response({"data": []})
+
+        app.router.add_get("/health", health)
+        app.router.add_get("/v1/models", models)
+        app.router.add_get("/metrics", self.metrics)
+        app.router.add_post("/v1/chat/completions", self.backend)
+        app.router.add_post("/v1/completions", self.backend)
+        self.worker = TestServer(app)
+        await self.worker.start_server()
+        self.addAsyncCleanup(self.worker.close)
+        self.url = f"http://127.0.0.1:{free_port()}"
+        metrics_port = free_port()
+        self.process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(ROOT / "benchmark/scripts/serve_dp_router.py"),
+            "--worker-urls",
+            str(self.worker.make_url("/")).rstrip("/"),
+            "--policy",
+            self.policy,
+            "--intra-node-data-parallel-size",
+            "2",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            self.url.rsplit(":", 1)[1],
+            "--prometheus-port",
+            str(metrics_port),
+            "--worker-startup-check-interval",
+            "1",
+            "--worker-startup-timeout-secs",
+            "10",
+            "--disable-retries",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
         )
-        await client.start_server()
-        self.clients.append(client)
-        return client
+        self.log_task = asyncio.create_task(self.process.stdout.read())
+        self.addAsyncCleanup(self.stop_router)
+        self.client = ClientSession()
+        self.addAsyncCleanup(self.client.close)
+        for _ in range(100):
+            if self.process.returncode is not None:
+                self.fail((await self.log_task).decode())
+            try:
+                async with self.client.get(self.url + "/health") as response:
+                    if response.status == 200:
+                        break
+            except OSError:
+                pass
+            await asyncio.sleep(0.1)
+        else:
+            self.fail("Official router did not become ready")
 
-    async def test_session_affinity_and_body_preservation(self):
-        client = await self.proxy()
-        for session, rank in [("parent", "0"), ("child", "1"), ("parent", "0")]:
-            response = await client.post(
-                "/v1/chat/completions",
-                data=b'{"messages":[]}',
-                headers={"X-Session-ID": session},
+    async def stop_router(self):
+        self.release_stream.set()
+        if self.process.returncode is None:
+            self.process.terminate()
+            try:
+                await asyncio.wait_for(self.process.wait(), 5)
+            except TimeoutError:
+                self.process.kill()
+                await self.process.wait()
+        await self.log_task
+
+    async def metrics(self, request):
+        return web.Response(
+            text="\n".join(
+                f'vllm:num_requests_running{{engine="{rank}"}} 0' for rank in range(2)
             )
-            self.assertEqual(await response.json(), {"rank": rank})
-            self.assertEqual(self.received[-1][1], b'{"messages":[]}')
-        stats = await (await client.get("/routing-stats")).json()
-        self.assertEqual(stats["requests"], {"0": 2, "1": 1})
+        )
 
-    async def test_native_clears_caller_rank(self):
-        client = await self.proxy("native")
-        response = await client.post(
-            "/v1/chat/completions",
-            headers={
-                "X-Session-ID": "s",
-                "x-data-parallel-rank": "999",
+    async def backend(self, request):
+        payload = await request.json()
+        rank = request.headers.get("X-data-parallel-rank")
+        self.received.append((dict(request.headers), payload, rank))
+        if payload.get("stream"):
+            response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            await response.prepare(request)
+            await response.write(b'data: {"choices":[{"text":"hello"}]}\n\n')
+            await self.release_stream.wait()
+            await response.write(b"data: [DONE]\n\n")
+            return response
+        return web.json_response({"choices": [], "rank": rank})
+
+    async def post(self, session_id, **extra):
+        payload = {"model": "test", "messages": [{"role": "user", "content": "hi"}]}
+        payload.update(extra)
+        async with self.client.post(
+            self.url + "/v1/chat/completions",
+            json=payload,
+            headers={"X-Session-ID": session_id},
+        ) as response:
+            self.assertEqual(response.status, 200, await response.text())
+            result = await response.json()
+            self.assertIn(result["rank"], ("0", "1"))
+            return result["rank"]
+
+    async def test_growing_sessions_stay_on_their_dp_rank(self):
+        routes = {}
+        for session in range(20):
+            routes[str(session)] = await self.post(str(session))
+        self.assertEqual(set(routes.values()), {"0", "1"})
+        for session, rank in routes.items():
+            self.assertEqual(
+                await self.post(
+                    session,
+                    messages=[
+                        {"role": "user", "content": "hi"},
+                        {"role": "assistant", "content": "tool call"},
+                        {"role": "user", "content": "tool result"},
+                    ],
+                ),
+                rank,
+            )
+
+    async def test_hint_metadata_and_token_prompt_reach_backend(self):
+        payload = {
+            "model": "test",
+            "prompt": [1, 2, 3],
+            "max_tokens": 1,
+            "vllm_xargs": {"example_metadata": 2},
+        }
+        async with self.client.post(
+            self.url + "/v1/completions",
+            json=payload,
+            headers={"X-Session-ID": "tokens"},
+        ) as response:
+            self.assertEqual(response.status, 200, await response.text())
+        _, forwarded, rank = self.received[-1]
+        self.assertEqual(forwarded["prompt"], payload["prompt"])
+        self.assertEqual(forwarded["vllm_xargs"], payload["vllm_xargs"])
+        self.assertIn(rank, ("0", "1"))
+
+    async def test_stream_arrives_before_backend_completion(self):
+        async with self.client.post(
+            self.url + "/v1/chat/completions",
+            json={
+                "model": "test",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
             },
-        )
-        self.assertEqual(await response.json(), {"rank": None})
-
-    async def test_missing_session_uses_native(self):
-        client = await self.proxy()
-        response = await client.post("/v1/chat/completions")
-        self.assertEqual(await response.json(), {"rank": None})
-
-    async def test_first_turn_control_only_pins_new_sessions(self):
-        client = await self.proxy("first-turn-only")
-        for session, rank in [
-            ("parent", "0"),
-            ("child", "1"),
-            ("parent", None),
-            ("child", None),
-            ("new", "0"),
-        ]:
-            response = await client.post(
-                "/v1/chat/completions", headers={"X-Session-ID": session}
+            headers={"X-Session-ID": "stream"},
+        ) as response:
+            self.assertEqual(
+                response.status,
+                200,
+                await response.text() if response.status != 200 else "",
             )
-            self.assertEqual(await response.json(), {"rank": rank})
-        stats = await (await client.get("/routing-stats")).json()
-        self.assertEqual(stats["requests"], {"0": 2, "1": 1, "native": 2})
+            line = await asyncio.wait_for(response.content.readline(), 2)
+            self.assertEqual(
+                json.loads(line.removeprefix(b"data: "))["choices"][0]["text"], "hello"
+            )
+            self.release_stream.set()
+            self.assertIn(b"[DONE]", await response.read())
 
-    async def test_correlation_fallback_and_session_precedence(self):
-        client = await self.proxy()
-        for headers, rank in [
-            ({"X-Correlation-ID": "c"}, "0"),
-            ({"X-Session-ID": "s", "X-Correlation-ID": "c"}, "1"),
-            ({"X-Session-ID": "c"}, "0"),
-        ]:
-            response = await client.post("/v1/chat/completions", headers=headers)
-            self.assertEqual(await response.json(), {"rank": rank})
 
-    async def test_streaming_reaches_client_before_completion(self):
-        client = await self.proxy()
-        response = await client.post(
-            "/v1/chat/completions?stream=1", headers={"X-Session-ID": "s"}
-        )
-        first = await asyncio.wait_for(response.content.readline(), timeout=2)
-        self.assertEqual(first, b'data: {"text":"hello"}\n')
-        self.release_stream.set()
-        self.assertIn(b"[DONE]", await response.read())
-        self.assertEqual(self.received[-1][2], "/v1/chat/completions?stream=1")
-
-    async def test_connection_scoped_headers_are_removed(self):
-        client = await self.proxy()
-        await client.post(
-            "/v1/chat/completions", headers={"Connection": "X-Hop", "X-Hop": "secret"}
-        )
-        self.assertNotIn("X-Hop", self.received[-1][0])
+class OfficialCacheAwareTests(OfficialRouterTests):
+    policy = "cache_aware"
+    # Cache-aware routing has a different contract from session hashing.
+    test_growing_sessions_stay_on_their_dp_rank = None
 
 
 if __name__ == "__main__":

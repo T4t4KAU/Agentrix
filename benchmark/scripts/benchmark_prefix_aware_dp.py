@@ -32,6 +32,9 @@ class RequestResult:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
+    parser.add_argument(
+        "--control-url", help="Backend URL for cache reset and engine metrics"
+    )
     parser.add_argument("--model")
     parser.add_argument("--documents", type=int, default=15)
     parser.add_argument(
@@ -174,7 +177,9 @@ async def run_request(
     first_token_at: float | None = None
     usage: dict[str, Any] | None = None
     generated_tokens: list[int] = []
-    headers = {"X-data-parallel-rank": str(rank)} if rank is not None else {}
+    headers = {"X-Session-ID": f"document-{document}"}
+    if rank is not None:
+        headers["X-data-parallel-rank"] = str(rank)
     async with session.post(
         f"{base_url}/v1/completions", json=payload, headers=headers
     ) as response:
@@ -243,6 +248,7 @@ def summarize(results: list[RequestResult], makespan_s: float) -> dict[str, Any]
 
 
 async def main_async(args: argparse.Namespace) -> dict[str, Any]:
+    control_url = args.control_url or args.base_url
     timeout = aiohttp.ClientTimeout(total=600)
     connector = aiohttp.TCPConnector(limit=0)
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
@@ -263,7 +269,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         ).hexdigest()
         trials = []
         for trial in range(args.trials):
-            reset_attempts = await reset_cache(session, args.base_url)
+            reset_attempts = await reset_cache(session, control_url)
             await asyncio.sleep(1)
 
             warm_results = []
@@ -277,12 +283,12 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
                 warm_plan = [(i, prompt, None) for i, prompt in enumerate(warm_prompts)]
             else:
                 warm_plan = []
-            before_warm = await read_rank_metrics(session, args.base_url)
+            before_warm = await read_rank_metrics(session, control_url)
             for document, prompt, rank in warm_plan:
                 warm_results.append(
                     await run_request(
                         session,
-                        args.base_url,
+                        control_url if rank is not None else args.base_url,
                         model,
                         prompt,
                         document,
@@ -292,14 +298,14 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 await asyncio.sleep(args.settle_ms / 1000)
             warm_rank_metrics = await wait_for_completions(
-                session, args.base_url, before_warm, len(warm_results)
+                session, control_url, before_warm, len(warm_results)
             )
 
             revisit_order = list(range(args.documents))
             if args.revisit_order == "shuffled":
                 random.Random(args.seed + 1_000_000 + trial).shuffle(revisit_order)
 
-            before_batch = await read_rank_metrics(session, args.base_url)
+            before_batch = await read_rank_metrics(session, control_url)
             batch_started = time.perf_counter()
             revisit_results = await asyncio.gather(
                 *[
@@ -317,7 +323,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
             )
             makespan_s = time.perf_counter() - batch_started
             rank_metrics = await wait_for_completions(
-                session, args.base_url, before_batch, len(revisit_results)
+                session, control_url, before_batch, len(revisit_results)
             )
             summary = summarize(revisit_results, makespan_s)
             trials.append(
@@ -364,6 +370,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "configuration": {
             "base_url": args.base_url,
+            "control_url": control_url,
             "model": model,
             "documents": args.documents,
             "workload": args.workload,

@@ -168,35 +168,166 @@ covers FlashAttention with no offload and ordinary native LRU CPU offload. The
 generated `offload_comparison.md` includes pairwise throughput deltas, logical
 KV footprint reduction, KV movement, disk footprint, and load failures.
 
-For DP routing experiments, set `DP_REPLICAS=2` and choose `DP_ROUTING`.
-`round_robin` is the load-balancing baseline; `prefix_forest` keeps branch
-groups together while balancing group weights across replicas.
+### Controlled KV lifecycle probe
 
-Set `DP_DEPLOYMENT=internal` to launch one vLLM frontend with multiple internal
-DP engines. This exercises vLLM's request router instead of the benchmark-side
-router. Current prefix-aware routing is opt-in and works with FlashAttention:
+`scripts/benchmark_agent_kv_tiering.py` compares native APC, official CPU offload,
+and selective backup through `kv_transfer_params.max_offload_tokens`. Use the
+vLLM virtual environment, which provides Transformers and prometheus-client.
+Run only on a dedicated backend: each trial resets its entire prefix cache.
+Enable `VLLM_SERVER_DEV_MODE=1` for the official reset API. Keep results on the
+experiment server.
+
+First start the offload backend with the same model, attention backend and
+scheduler as the APC baseline, an explicit `--kv-cache-memory-bytes` budget,
+and the official connector configuration:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 VLLM_AGENTRIX_DP_ROUTING_POLICY=prefix_aware \
-../vllm/.venv/bin/vllm serve /path/to/Qwen3-8B \
-  --data-parallel-size 2 --data-parallel-size-local 2 --api-server-count 1 \
-  --attention-config '{"backend":"FLASH_ATTN"}' --enable-prefix-caching
+--kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":2147483648,"blocks_per_chunk":1}}'
 ```
 
-The current frontend uses load slack 4, work slack 8,192 token units, decode
-weight 16, and a 300-second TTL for completed-prefix hints. Equal-depth hits
-prefer less remaining work, rather than more historical visits. Generated
-tokens update the remaining-work estimate; preemption restores a conservative
-recomputation budget. These hints do not prove GPU cache residency.
+This fragment reserves a 2 GiB CPU cache; include that cost in comparisons.
+It is for the CUDA runtime, not a version-independent Ascend recipe. Verify
+mixed-state restoration before running pressure or capacity comparisons:
 
-Use `scripts/benchmark_prefix_aware_dp.py` for controlled revisit, replicated
-prefix, and cold-request comparisons, including per-rank completion counters.
-See [DP routing](../docs/dp_routing.md) for tested commands, results, and limits.
-The historical `VLLM_FORK_ATTN_DP_PREFIX_*`, Graph-bucket, and arrival-wave
-controls described by older recipes are absent from the current frontend.
+```bash
+"${REPO_ROOT}/vllm/.venv/bin/python" \
+  "${REPO_ROOT}/benchmark/scripts/benchmark_agent_kv_tiering.py" \
+  --base-url "${BACKEND_URL}" --model "${SERVED_MODEL}" \
+  --tokenizer "${MODEL_DIR}" --mode offload --scenario roundtrip \
+  --sessions 1 --prompt-tokens 8192 --trials 3 \
+  --output "${RESULTS_DIR}/offload-roundtrip.json"
+```
+
+The probe resets device KV while retaining external KV, checks actual transfer
+bytes and prompt-source counters, and requires identical generated token IDs.
+Repeat with unaligned prompt lengths and the runtime's supported finer caching
+configuration to exercise partial recurrent tails; an aligned prompt alone
+does not cover that path. Output equality is a correctness gate for these
+inputs, not a task-quality evaluation.
+
+For the partial-tail cap fix, restart with a finer `--prefix-match-unit` and
+one physical block per offload chunk. Use the actual uniform physical block
+size reported for the mixed model; the following values match the tested
+Qwen3.5 configuration, not arbitrary models:
+
+```bash
+"${REPO_ROOT}/vllm/.venv/bin/python" \
+  "${REPO_ROOT}/benchmark/scripts/check_agent_kv_boundaries.py" \
+  --base-url "${BACKEND_URL}" --model "${SERVED_MODEL}" \
+  --tokenizer "${MODEL_DIR}" --block-tokens 528 --prefix-match-unit 16 \
+  --prompt-tokens 8192 --output "${RESULTS_DIR}/partial-tail-caps.json"
+```
+
+The server must also use `--prefix-match-unit 16`. This probe appends one token
+to the saved prompt so the partial boundary is eligible for restoration. It
+compares against a cold reference, covers six backup caps, and sets a zero
+cap on every resume: existing copies must remain readable without new writes.
+It checks the exact restored/computed boundary and both transfer directions.
+The reusable probe has local validation tests; its hardware run is pending.
+
+For the pressure comparison use `--scenario pressure --sessions 4
+--pressure-requests 8` and separate outputs for `--mode apc`, `--mode offload`,
+and `--mode selective`. Restart when changing the connector or pool budget;
+APC omits the connector. Offload and selective use identical GPU and CPU
+budgets and may share a backend with both caches reset before each trial.
+Use the same seed, prompt length, output length and session plan in all arms.
+Only the selective arm disables new backups for the declared terminal
+requests. Inspect local hits, actual restores and recomputation to establish
+that the chosen workload exceeds device-cache capacity before interpreting
+the comparison. Counters must account for all input tokens and remain stable
+before each phase snapshot; the quiet interval is not a transfer fence.
+Transfer counters can appear only after the first transfer; validity requires
+actual nonzero writes and, for the roundtrip, reads after exercising the path.
+Both probes publish progress using an atomic file replacement, preserving the
+last complete JSON snapshot if a write is interrupted. A progress file with
+`valid: false` is incomplete or failed and must not be included in comparisons.
+
+This is a sequential lifecycle probe, **not official AgentX**. It does not
+measure peak VRAM, host RSS, a capacity limit or tool-wait prefetch. Use server
+telemetry and repeated pool-size comparisons for those separate claims.
+
+For a small-buffer Ascend DMA correctness check, activate the matching CANN and
+Ascend virtual environment, then run:
+
+```bash
+"${ASCEND_VENV_DIR}/bin/python" \
+  "${REPO_ROOT}/benchmark/scripts/check_ascend_kv_transfers.py" \
+  --device 0 --output "${RESULTS_DIR}/ascend-transfers-device0.json"
+```
+
+Repeat on another visible device with a separate output path. This exercises
+installed block-copy helpers, event completion, reused buffers and untouched
+pages with BF16/FP32/uint8 payloads. It neither loads a model nor resets a
+serving engine. It does not establish hybrid KV restoration, scheduler CoW,
+selective backup support or performance; those require matching runtime APIs
+and separate model-level experiments.
+Current verification and hardware availability are recorded in
+[KV memory status](../docs/kv_memory_optimization_status.md#选择性备份边界修复与验证入口).
+
+### Ascend native mixed-cache offload compatibility
+
+The experimental `vllm_ascend.kv_offload.native` adapter backports official
+Ascend native offload to the older canonical-cache handler API. It retains the
+official CPU cache manager. Do not substitute it into a newer runtime that
+already provides the matching native connector.
+
+For the tested older source shape, create an isolated vLLM package overlay:
+
+```bash
+"${ASCEND_VENV_DIR}/bin/python" \
+  "${REPO_ROOT}/benchmark/scripts/prepare_ascend_offload_overlay.py" \
+  --source "${INSTALLED_VLLM_PACKAGE}" --target "${OVERLAY_DIR}/vllm"
+```
+
+The helper refuses an existing target or unexpected patch anchors. It backports
+request offload caps and reset acknowledgements, allows zero-compute async
+restores through scheduling, and rounds Mamba restore hits down to a valid
+state boundary. Installed sources remain untouched. Activate the isolated
+package directory through `PYTHONPATH`, together with the matching Ascend
+adapter, and use this connector configuration:
+
+```json
+{
+  "kv_connector": "AscendOffloadingConnector",
+  "kv_connector_module_path": "vllm_ascend.kv_offload.native.offloading_connector",
+  "kv_role": "kv_both",
+  "kv_connector_extra_config": {
+    "spec_name": "NPUOffloadingSpec",
+    "spec_module_path": "vllm_ascend.kv_offload.native.npu",
+    "cpu_bytes_to_use": 2147483648
+  }
+}
+```
+
+First run `benchmark_agent_kv_tiering.py --scenario roundtrip --mode offload`
+against an isolated development server with reset endpoints enabled. Require
+actual H2D transfers, no local prefix hits, and identical cold/restored output
+tokens before pressure comparisons. Preserve failed runs on the server; do
+not treat a completed transfer as proof of recurrent-state correctness.
+
+### DP routing
+
+DP routing now uses the official `vllm-router==0.1.15` package in a separate
+router environment. `consistent_hash` consumes `X-Session-ID` for multi-turn
+sessions; `cache_aware` and `round_robin` use their official implementations.
+Direct requests to the backend exercise native internal DP load balancing.
+
+Install `requirements-router.txt` in the router environment and `.[dp]` in the
+benchmark environment, then run `scripts/serve_dp_router.py` with
+the official CLI options. `scripts/run_agent_session_dp_profile.sh` compares
+these policies using FlashAttention. Set `OUTPUT_ROOT` to a results directory
+on the experiment server. Session/revisit drivers accept `--base-url` for the
+router and `--control-url` for backend metrics and resets. Restart both services
+for cold comparisons; an engine reset does not clear router estimates.
+
+See [DP routing](../docs/dp_routing.md) for setup and verification limits.
+The private internal DP router and its profiling simulators have been removed.
+Historical `VLLM_AGENTRIX_DP_ROUTING_POLICY` and `VLLM_FORK_ATTN_DP_PREFIX_*`
+controls are no longer supported; old results do not measure the new router.
 
 The following full-dataset recipe targets those older routing controls and is
-retained for historical reproduction, not validation of the current router:
+kept as historical source and now exits with migration guidance. Restore its
+matching historical code only when reproducing old results:
 
 ```bash
 MODEL_PATH=/path/to/Qwen3-8B \

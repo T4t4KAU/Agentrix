@@ -10,19 +10,22 @@ import datetime
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import signal
 import subprocess
 import sys
 import time
 import urllib.request
+from pathlib import Path
 
 from compare_retention import read_run
 
 
 def stop_previous(path):
-    for name, expected in (("router", "session_router.py"), ("server", "vllm")):
+    for name, expected in (
+        ("router", ("session_router.py", "serve_dp_router.py", "vllm::router")),
+        ("server", ("vllm",)),
+    ):
         pid_file = path / f"{name}.pid"
         if not pid_file.exists():
             # A failed server startup may never have reached router startup.
@@ -32,7 +35,7 @@ def stop_previous(path):
         if not proc.exists():
             continue
         command = (proc / "cmdline").read_bytes().decode()
-        if expected not in command:
+        if not any(token in command for token in expected):
             raise RuntimeError(f"PID {pid} does not match the previous {name}")
         os.kill(pid, signal.SIGTERM)
         for _ in range(90):
@@ -83,6 +86,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--previous-run", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--router-python", type=Path)
+    parser.add_argument(
+        "--routing-policy",
+        choices=("consistent_hash", "cache_aware", "round_robin"),
+        default="consistent_hash",
+    )
     parser.add_argument("--interval", type=retention_interval, required=True)
     parser.add_argument("--prefer-reuse-boundaries", action="store_true")
     action = parser.add_mutually_exclusive_group()
@@ -116,9 +125,21 @@ def main():
         )
     root = Path(__file__).resolve().parents[2]
     os.chdir(root)
+    router_python = args.router_python or root / ".router-venv/bin/python"
+    router_command = [
+        str(router_python),
+        str(root / "benchmark/scripts/serve_dp_router.py"),
+    ]
+    # Validate the installed official component before stopping a working service.
+    routing = json.loads(
+        subprocess.check_output([*router_command, "--check"], text=True)
+    )
+    routing.update(policy=args.routing_policy, intra_node_data_parallel_size=2)
     run = args.run_dir.resolve()
     previous = args.previous_run.resolve()
     manifest = json.loads((previous / "run-manifest.json").read_text())
+    if manifest["data_parallel_size"] != 2:
+        parser.error("This launcher requires the recorded two-rank Ascend setup")
     # Check source/runtime consistency before stopping a working service.
     # Track the affinity fix as well as the hybrid-cache patches.
     plugin_files = set(manifest["plugin_sha256"]) | {
@@ -168,6 +189,8 @@ def main():
     manifest.update(
         artifacts=str(run / "artifacts"),
         server_pid=server.pid,
+        session_routing=args.routing_policy,
+        router=routing,
         mamba_cache_retention={
             "interval": args.interval,
             "diagnostics": True,
@@ -216,10 +239,13 @@ def main():
     (run / "run-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     router = start(
         [
-            str(root / "agentx/.venv/bin/python"),
-            "experiments/agentx-ascend/session_router.py",
+            *router_command,
+            "--worker-urls",
+            "http://127.0.0.1:8001",
             "--policy",
-            "sticky",
+            args.routing_policy,
+            "--intra-node-data-parallel-size",
+            "2",
             "--port",
             "8000",
         ],
@@ -254,8 +280,10 @@ def main():
             [sys.executable, "experiments/agentx-ascend/summarize.py", str(run)],
             check=True,
         )
-        with urllib.request.urlopen("http://127.0.0.1:8000/routing-stats") as response:
-            (run / "routing-stats.json").write_bytes(response.read())
+        with urllib.request.urlopen(
+            "http://127.0.0.1:29000/metrics", timeout=10
+        ) as response:
+            (run / "router-metrics.prom").write_bytes(response.read())
         read_run(run)  # Freeze diagnostic snapshots before any later probes.
     print("RUN_COMPLETE", flush=True)
 

@@ -316,43 +316,8 @@ def choose_action(
 
 
 def router_stats(engine: AsyncLLM) -> dict[str, Any]:
-    router = getattr(engine.engine_core, "prefix_router", None)
-    if router is None:
-        return {"active": False}
-    fields = (
-        "route_count",
-        "routing_policy",
-        "prefix_route_count",
-        "affinity_route_count",
-        "first_turn_balance_count",
-        "followup_affinity_count",
-        "followup_rebalance_count",
-        "session_overload_rebalance_count",
-        "session_cache_miss_rebalance_count",
-        "session_id_route_count",
-        "session_prefix_fallback_count",
-        "unknown_turn_route_count",
-        "graph_bound_route_count",
-        "arrival_wave_count",
-        "ordinary_bypass_route_count",
-        "cohort_locked_route_count",
-        "reload_intent_count",
-        "reload_local_count",
-        "reload_rebalanced_count",
-        "reload_committed_count",
-        "reload_failed_count",
-        "reload_saved_tokens",
-    )
-    result = {"active": True}
-    for field in fields:
-        value = getattr(router, field, None)
-        if isinstance(value, (int, float, str, bool)) or value is None:
-            result[field] = value
-    counts = getattr(router, "rank_route_counts", None)
-    if counts is not None:
-        result["rank_route_counts"] = list(counts)
-    result["average_route_us"] = getattr(router, "average_route_us", None)
-    return result
+    # In-process AsyncLLM uses upstream routing; HTTP affinity is external.
+    return {"active": False, "implementation": "upstream_internal"}
 
 
 def kv_summary() -> dict[str, Any]:

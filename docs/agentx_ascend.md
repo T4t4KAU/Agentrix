@@ -1,5 +1,15 @@
 # AgentX 在 vLLM-Ascend 上的优化与验证
 
+当前结论总表见 [优化现状](README.md)：Decode ACLGraph 有重复官方对照支持；
+混合缓存、路由/分块与 `npugraph_ex` 有单次官方改善，重复性仍有限；
+FIA 版 ForkAttention 仅确认特定算子形状收益，官方回放没有端到端收益。
+工具等待卸载与恢复前预取尚未接通，不计入已有成果。
+
+2026-09-28 在服务器重新核对 18 份运行摘要与官方报告，并另核对路由总表。
+来源哈希与关键对照复算保存在服务器
+`${RESULTS_DIR}/documentation-audit-20260928/evidence-index.json`。
+本次没有新跑性能测试。下文按时间保留实验过程，“选定服务”和活动指针均为当时的部署记录。
+
 ## 目标和运行边界
 
 以 [vLLM x AgentX 文章](https://vllm.ai/blog/2026-09-08-vllm-agentx)
@@ -9,8 +19,9 @@ BF16、eager、原生 262144 上下文、16 个 session trees，只改变路由�
 后续混合缓存对照固定 sticky + cap1024，只改变本地检查点保留策略。
 图执行对照在选定的缓存策略上固定每卡 36 GiB 缓存预算，比较 eager 与 Decode ACLGraph。
 
-运行环境是 vLLM 0.22.1 + vLLM-Ascend v0.22.1rc1（子模块
-`da9b47a226f2d1b5428f4658af5c4bfe9813dbeb`，包含配置校验和混合缓存保留补丁）。本仓库 `vllm/`
+运行环境是 vLLM 0.22.1 + vLLM-Ascend v0.22.1rc1 加本项目补丁。
+当前插件子模块固定为 `6ad419a7b6a43cf44d859204ea24458097ef2944`；
+下文早期测量包含旧修订，实际运行源码以各轮 manifest 哈希为准。本仓库 `vllm/`
 是 0.28.0 CUDA 实验分支，不能直接安装到这个 Ascend 环境。
 服务器使用独立 `${REPO_ROOT}/.venv`，vLLM 源码在 `${REPO_ROOT}/vllm-0.22.1`。
 Ascend 插件当前装为 wheel；修改源码后须部署对应文件或重新构建，不能把源码同步误当成运行时已更新。
@@ -197,9 +208,11 @@ first-turn-only 与 sticky 使用相同的首轮分配策略，更直接检查�
 MODEL_NAME=Qwen3.5-9B LONG_PREFILL_TOKEN_THRESHOLD=1024 \
   bash experiments/agentx-ascend/serve.sh
 
-# 另一个终端：可选 native、first-turn-only 或 sticky。
-agentx/.venv/bin/python experiments/agentx-ascend/session_router.py \
-  --policy sticky --port 8000 --upstream http://127.0.0.1:8001
+# 另一个终端：先按 DP 路由文档安装 requirements-router.txt。
+.router-venv/bin/python benchmark/scripts/serve_dp_router.py \
+  --policy consistent_hash --worker-urls "${BACKEND_URL}" \
+  --intra-node-data-parallel-size 2 \
+  --host "${ROUTER_HOST}" --port "${ROUTER_PORT}"
 
 # 再一个终端：输出目录必须不存在，防止覆盖前一轮结果。
 ARTIFACT_DIR="${RESULTS_DIR}/sticky-cap1024/artifacts" \
@@ -209,12 +222,9 @@ ARTIFACT_DIR="${RESULTS_DIR}/sticky-cap1024/artifacts" \
 `DRY_RUN=1` 打印准确命令而不启动服务。`MODEL_NAME=Qwen3-8B` 选择 128K YaRN
 模型配置，默认并发 4；比较模型必须显式统一并发、上下文过滤和其余实验条件。
 
-代理只用于单进程实验：保留本轮所有会话映射，重启后清空；没有多副本共享状态和 TTL。
-无 session ID 的请求交由 native DP。代理不解析或改写 prompt，保留 SSE 流式传输。
-`first-turn-only` 只给每个新 session 的首次请求指定轮转 rank，后续不指定 rank，
-与 sticky 共享首次分配逻辑。它保留已见 session 的记录，直到本轮实验结束。
-`/routing-stats` 可查看映射数和请求分布。不同子代理的 session ID 独立分配，不能
-声称已有父子分支共同路由。多 API frontend 的原生 engine 调度行为保持不变。
+当前改用官方 `vllm-router==0.1.15`，默认 `consistent_hash` 消费 `X-Session-ID`。
+旧 native / first-turn-only / sticky 表格来自已删除的实验代理，仅保留为历史结果。
+官方组件、控制端点及验证边界见 [DP 路由](dp_routing.md)。
 
 ## 固定官方 benchmark 条件
 
@@ -282,13 +292,13 @@ manifest、路由计数和 summary 在同目录的 `comparisons/`。完整日志
 入口 `http://127.0.0.1:8000/v1`，模型名 `Qwen3.5-9B`。当前服务的 PID 和部署记录在
 `results/active-service/`，其中日志链接指向当前实验目录，之前的服务日志已另存。
 启动脚本仍允许用 `LONG_PREFILL_TOKEN_THRESHOLD=0` 复跑原配置；没有修改全局默认调度策略。
-会话路由目前通过本仓库的实验代理实现，尚未接入原生 frontend。
+以上为历史服务状态。当前启动器调用官方 router，尚未把历史性能数字迁移为新组件的收益结论。
 
 验证命令：
 
 ```bash
-# 普通 CPU 环境，需 aiohttp 和 pytest。
-python -m pytest -q experiments/agentx-ascend/test_session_router.py
+# 独立路由环境，需 requirements-router.txt、aiohttp 和 pytest。
+.router-venv/bin/python -m pytest -q experiments/agentx-ascend/test_session_router.py
 
 # 服务启动后：两张卡分别执行跨多个缓存块的长输入及重复请求。
 python experiments/agentx-ascend/smoke.py

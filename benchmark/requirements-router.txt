@@ -1,0 +1,2 @@
+# Run the official Rust router in an environment separate from the model server.
+vllm-router==0.1.15

@@ -11,10 +11,16 @@ LMCache integration, and the end-to-end benchmark suite in one repository:
 
 ## Documentation
 
-Start with the [documentation index](docs/README.md).
+Start with the [measured optimization status and documentation index](docs/README.md).
+It separates official AgentX results, targeted workload gains, negative results,
+and historical integrations that are absent from the current checkout.
 Core references: [server environment](docs/autodl_build_and_benchmark.md),
 [DP routing](docs/dp_routing.md), [KV memory](docs/kv_memory_optimization_status.md),
 [profiling](docs/fork_attention/forkattention_operator_profile.md).
+
+DP deployment now uses the official `vllm-router==0.1.15` package. Custom
+prefix/session routing and the unproven KV admission bypass have been removed;
+previous routing results remain historical.
 
 The generic build and experimental recipes below include older runtime paths.
 For the existing profiling server, use the server guide above; do not recreate
@@ -84,8 +90,10 @@ reusable plans and workspace, and native FIA fallback within ACLGraph. Its
 operator measurements remain separate from official AgentX scores; see the
 validation and workload limits in the same document.
 The FIA-based implementation is the selected development baseline for NPU
-ForkAttention. Further work focuses on shared-prefix admission, split selection,
-planning overhead, and end-to-end validation with the official AgentX workload.
+ForkAttention and remains disabled by default. The measured official AgentX
+run did not select its shared path and showed no end-to-end gain. Tool-wait
+offload and resume prefetch driven by Agent Hints remain unimplemented in the
+measured configuration; the existing connectors are only the transport basis.
 
 ## Install uv
 
