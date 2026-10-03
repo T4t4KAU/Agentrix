@@ -1,5 +1,36 @@
 # Agentrix application optimizations
 
+## Session routing and selective KV backup
+
+For an official `consistent_hash` router and a backend supporting selective
+CPU offload, `session_kv_options` builds standard OpenAI SDK request options:
+
+```python
+from agentrix_application.session_kv import session_kv_options
+
+options = session_kv_options("opaque-session-id", terminal=False)
+response = client.chat.completions.create(
+    model=model_name,
+    messages=messages,
+    **options,
+)
+```
+
+Use the same opaque session identity across turns and retries. `terminal=True`
+adds `kv_transfer_params.max_offload_tokens=0`, skipping this request's new CPU
+backups. Set it only when the application knows before dispatch that the
+request will not be reused; a tool call or the end of an individual branch does
+not establish this. Unknown reuse keeps the backend's default policy.
+The option neither deletes existing copies nor disables restoration, and does
+not force device-memory release. Backend support and an enabled offload
+connector are prerequisites; this adapter does not negotiate capabilities.
+If existing SDK calls use `extra_body` or `extra_headers`, merge explicitly
+without dropping other options. This is an opt-in mapping to official APIs,
+not a new routing or eviction algorithm. Hardware evidence and its limits are
+recorded in [the KV status document](../docs/kv_memory_optimization_status.md).
+
+## Prompt representation
+
 This package removes representation-only prompt redundancy without rewriting
 free-form text. It can omit empty sections, exact duplicates with the same
 stable segment ID, canonical JSON whitespace, and byte-identical tool schemas.

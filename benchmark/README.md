@@ -170,6 +170,50 @@ KV footprint reduction, KV movement, disk footprint, and load failures.
 
 ### Controlled KV lifecycle probe
 
+For the dual-rank version, keep the official router on `consistent_hash`, with
+`--intra-node-data-parallel-size 2`. Use a DP=2, TP=1 backend and explicit device
+and CPU budgets **per rank**. Control operations bypass the router:
+
+```bash
+"${VLLM_PYTHON}" "${REPO_ROOT}/benchmark/scripts/benchmark_dp_kv_lifecycle.py" \
+  --base-url "${ROUTER_URL}" --control-url "${BACKEND_URL}" \
+  --model "${SERVED_MODEL}" --tokenizer "${MODEL_DIR}" \
+  --mode selective --sessions 8 --pressure-requests 16 \
+  --prompt-tokens 8193 --output-tokens 8 --trials 2 --seed 20261001 \
+  --output "${RESULTS_DIR}/selective.json"
+```
+
+Compare `apc`, `offload` and `selective`; the APC server omits the connector.
+The tested Ascend mixed-state boundary is 8193 tokens; verify boundaries for
+other runtimes before reusing this setting. Session IDs remain unchanged across
+arms and phases. Only application-known terminal pressure requests skip backup.
+The probe checks per-rank prompt accounting, both ranks participating, no
+preemption, and exact cold/resumed output token equality. No reset occurs
+between prime, pressure and resume. `--tool-gap-seconds` adds idle time after
+pressure; the pressure phase itself also contributes to inter-turn gaps. This
+sequential experiment measures restoration under cache pressure, not concurrent
+capacity or official AgentX throughput.
+
+`run_dp_kv_lifecycle.py --config "${PRIVATE_CONFIG}" --output "${RESULTS_DIR}"`
+runs the Ascend matrix from a server-private JSON with `env`, `cwd`,
+`router_python`, optional `seeds`/`trials`, and `cases`. Each case supplies
+`label`, complete server `argv`, and `modes` (APC or both offload modes).
+It requires two idle NPUs before each server launch, owns only its child
+processes, reverses offload-mode order for the second seed, and stops its
+services on failure. Start with a fresh output directory. After fixing a
+failure, `--resume` archives failed outputs and logs and preserves valid cells;
+keep the original source snapshot on the server before replacing scripts.
+Do not change completed cells' workload or launch configuration when resuming.
+Use `--extend` to add cases after a completed matrix; prior backend commands
+must remain identical and prior summaries are archived until the expanded
+matrix is validated.
+`sample_npu_experiment.py --pid "${CONTROLLER_PID}" --output
+"${RESULTS_DIR}/npu-samples.jsonl"` records board observations separately;
+sampling can miss transient allocation peaks.
+After completion, run `summarize_dp_kv_lifecycle.py "${RESULTS_DIR}"` in the
+same virtual environment. It rejects missing cells, unequal input plans or
+cross-run output differences before writing `validated-summary.json`.
+
 `scripts/benchmark_agent_kv_tiering.py` compares native APC, official CPU offload,
 and selective backup through `kv_transfer_params.max_offload_tokens`. Use the
 vLLM virtual environment, which provides Transformers and prometheus-client.
@@ -321,6 +365,48 @@ router and `--control-url` for backend metrics and resets. Restart both services
 for cold comparisons; an engine reset does not clear router estimates.
 
 See [DP routing](../docs/dp_routing.md) for setup and verification limits.
+
+For the Ascend shared-document QA comparison, use
+`scripts/run_ascend_router_comparison.py --config "${PRIVATE_CONFIG}"
+--output "${RESULTS_DIR}/runs" --router-python "${ROUTER_PYTHON}"
+--qa-cases "${CASE_FILE}" --trials 1`. Create a fresh output directory first.
+The default compares official policies with question waves. To keep official
+`consistent_hash` fixed and compare FIA ForkAttention off/on, add
+`--qa-fork-attention --qa-fork-min-shared-tokens 4096 --qa-arrival fanout`.
+Both arms use the same diagnostics and shared-prefix threshold; only `enabled`
+changes. The threshold override is experimental; the operator default is 32768.
+Use `--qa-arrival waves` separately to check the original arrival pattern.
+Fanout submits a document's questions together, allowing overlapping decode;
+actual physical sharing must still be confirmed from planner/execution logs.
+The ForkAttention comparison excludes `--qa-prefill-gate`. Keep QA quality,
+output-token differences, memory observations and trigger counts with latency
+results; an enabled flag alone is not evidence of shared execution or a gain.
+
+To scan larger shared prefixes with fixed output length, use the same controller
+with `--fork-scale --scale-trials 3 --trials 1 --fork-min-shared-tokens 16384`
+and omit QA flags. `benchmark_fork_scale.py` tests 16K/32K/64K prefixes with
+2/4/8 branches per rank, two ranks, 128-token private tails and exactly 64
+generated tokens per request. Set the backend context limit to at least 65728.
+This requires a dedicated backend with prefix-cache reset enabled. It probes
+official hash placement, warms shared prefixes and branches, then checks
+per-rank completions, cache hits and preemptions. Synthetic token inputs are a
+controlled scaling probe, not QA or AgentX. Run eager and Decode ACLGraph with
+separate private configs and result directories; compare Fork off/on within
+each mode. Keep output-hash differences alongside fixed-length timing results.
+
+For official AgentX KV-tiering comparisons, use
+`scripts/run_agentx_kv_comparison.py --config "${PRIVATE_CONFIG}" --output "${RESULTS_DIR}/runs"`
+with a fresh server-side output directory. The private JSON supplies `cwd`,
+`python`, `harness`, `harness_commit`, `server_env`, `client_env`, `backend_url`,
+`router_url`, `router` argv, `summarizer` (the existing AgentX `summarize.py`),
+and `cells` containing `label`, `server` argv and `client` argv. Client argv
+uses `{artifacts}` as its output directory. Keep all private configuration and
+artifacts on the server. The controller requires two idle NPUs, verifies the
+clean pinned harness checkout, restarts services for each cell, samples backend
+metrics, validates the official report and cleans up its own child processes.
+Use `sample_npu_experiment.py` alongside it for board-memory observations.
+It does not inject lifecycle hints or modify official traces. Configuration and
+pending results are tracked in the existing [KV status](../docs/kv_memory_optimization_status.md).
 The private internal DP router and its profiling simulators have been removed.
 Historical `VLLM_AGENTRIX_DP_ROUTING_POLICY` and `VLLM_FORK_ATTN_DP_PREFIX_*`
 controls are no longer supported; old results do not measure the new router.

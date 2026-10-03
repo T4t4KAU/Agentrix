@@ -36,6 +36,11 @@ def parse_args() -> argparse.Namespace:
         "--control-url", help="Backend URL for cache reset and engine metrics"
     )
     parser.add_argument("--model")
+    parser.add_argument(
+        "--allow-missing-prompt-details",
+        action="store_true",
+        help="Legacy API omits zero cache-hit details; engine metrics remain required",
+    )
     parser.add_argument("--documents", type=int, default=15)
     parser.add_argument(
         "--workload", choices=("revisit", "replicated", "cold"), default="revisit"
@@ -160,6 +165,7 @@ async def run_request(
     output_tokens: int,
     launch_delay_s: float = 0.0,
     rank: int | None = None,
+    allow_missing_prompt_details: bool = False,
 ) -> RequestResult:
     if launch_delay_s:
         await asyncio.sleep(launch_delay_s)
@@ -203,7 +209,7 @@ async def run_request(
     if first_token_at is None or usage is None:
         raise RuntimeError("stream did not contain a token and final usage")
     details = usage.get("prompt_tokens_details") or {}
-    if "cached_tokens" not in details:
+    if "cached_tokens" not in details and not allow_missing_prompt_details:
         raise RuntimeError("enable prompt-token details on the server")
     if (
         usage["prompt_tokens"] != len(prompt)
@@ -294,6 +300,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
                         document,
                         1,
                         rank=rank,
+                        allow_missing_prompt_details=args.allow_missing_prompt_details,
                     )
                 )
                 await asyncio.sleep(args.settle_ms / 1000)
@@ -317,6 +324,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
                         document,
                         args.output_tokens,
                         launch_position * args.launch_gap_ms / 1000,
+                        allow_missing_prompt_details=args.allow_missing_prompt_details,
                     )
                     for launch_position, document in enumerate(revisit_order)
                 ]

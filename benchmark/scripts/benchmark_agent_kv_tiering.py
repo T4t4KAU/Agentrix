@@ -37,11 +37,13 @@ def save_result(path: Path, result: dict) -> None:
     temporary.replace(path)
 
 
-def metrics(text: str) -> dict[str, float]:
+def metrics(text: str, engine: str | None = None) -> dict[str, float]:
     result: dict[str, float] = {}
     legacy_transfers: dict[str, float] = {}
     for family in text_string_to_metric_families(text):
         for sample in family.samples:
+            if engine is not None and sample.labels.get("engine") != engine:
+                continue
             for key, name in COUNTERS.items():
                 if sample.name == name:
                     result[key] = result.get(key, 0.0) + sample.value
