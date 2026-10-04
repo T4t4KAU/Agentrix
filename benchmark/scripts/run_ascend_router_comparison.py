@@ -37,6 +37,15 @@ def fork_attention_command(command, enabled, min_shared_tokens):
     return command
 
 
+def comparison_schedule(seeds, policies, trials):
+    """Keep each seed's arms adjacent and reverse order across fresh starts."""
+    for trial in range(trials):
+        for index, seed in enumerate(seeds):
+            order = policies[::-1] if (index + trial) % 2 else policies
+            for policy in order:
+                yield seed, policy, trial
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
@@ -44,11 +53,16 @@ def main():
     parser.add_argument("--router-python", required=True, type=Path)
     parser.add_argument("--qa-cases", type=Path)
     parser.add_argument("--trials", type=int, default=3)
+    parser.add_argument("--seeds", type=int, nargs="+", default=[20260927, 20261020])
     parser.add_argument("--qa-max-tokens", type=int, default=256)
     parser.add_argument("--qa-prefill-gate", action="store_true")
     parser.add_argument("--qa-fork-attention", action="store_true")
     parser.add_argument("--fork-scale", action="store_true")
     parser.add_argument("--scale-trials", type=int, default=3)
+    parser.add_argument(
+        "--scale-prefix-tokens", type=int, nargs="+", default=[16384, 32768, 65536]
+    )
+    parser.add_argument("--scale-branches", type=int, nargs="+", default=[2, 4, 8])
     parser.add_argument(
         "--qa-fork-min-shared-tokens",
         "--fork-min-shared-tokens",
@@ -63,6 +77,12 @@ def main():
         parser.error("fork-scale is a separate fixed-length workload; omit QA flags")
     if args.scale_trials < 1:
         parser.error("scale-trials must be positive")
+    if len(set(args.seeds)) != len(args.seeds) or any(seed < 0 for seed in args.seeds):
+        parser.error("seeds must be unique nonnegative integers")
+    if any(n < 1024 or n % 1024 for n in args.scale_prefix_tokens):
+        parser.error("scale-prefix-tokens must be positive multiples of 1024")
+    if any(n < 2 or n > 8 for n in args.scale_branches):
+        parser.error("scale-branches must be between 2 and 8 per rank")
     fork_comparison = args.qa_fork_attention or args.fork_scale
     if args.qa_fork_attention and (not args.qa_cases or args.qa_prefill_gate):
         parser.error("qa-fork-attention requires qa-cases and excludes prefill-gate")
@@ -170,179 +190,170 @@ def main():
             [str(args.router_python), str(scripts / "serve_dp_router.py"), "--check"],
             check=True,
         )
-        schedule = [
-            (20260927, ["consistent_hash", "native", "cache_aware"]),
-            (20261020, ["cache_aware", "native", "consistent_hash"]),
-        ]
+        policies = ["consistent_hash", "native", "cache_aware"]
         if args.qa_prefill_gate:
-            schedule = [
-                (20260927, ["consistent_hash", "consistent_hash_gate"]),
-                (20261020, ["consistent_hash_gate", "consistent_hash"]),
-            ]
+            policies = ["consistent_hash", "consistent_hash_gate"]
         if fork_comparison:
-            schedule = [
-                (20260927, ["consistent_hash_fork", "consistent_hash"]),
-                (20261020, ["consistent_hash", "consistent_hash_fork"]),
-            ]
-        for seed, policies in schedule:
-            for policy in policies:
-                for trial in range(args.trials):
-                    wait_idle()
-                    label = f"{seed}-{policy}-{trial}"
-                    status("server_startup", label=label)
-                    server_command = (
-                        fork_attention_command(
-                            command,
-                            policy == "consistent_hash_fork",
-                            args.qa_fork_min_shared_tokens,
-                        )
-                        if fork_comparison
-                        else command
-                    )
-                    server = start(server_command, label + "-server", config["env"])
-                    ready(server, backend)
-                    for workload in (
-                        ["fork-scale"]
-                        if args.fork_scale
-                        else ["longbench"]
-                        if args.qa_cases
-                        else ["sessions", "revisit", "replicated", "cold"]
-                    ):
-                        cell = label + "-" + workload
-                        router = None
-                        url = backend
-                        if policy != "native":
-                            router = start(
-                                [
-                                    str(args.router_python),
-                                    str(scripts / "serve_dp_router.py"),
-                                    "--worker-urls",
-                                    backend,
-                                    "--policy",
-                                    "consistent_hash"
-                                    if policy
-                                    in {"consistent_hash_gate", "consistent_hash_fork"}
-                                    else policy,
-                                    "--intra-node-data-parallel-size",
-                                    "2",
-                                    "--host",
-                                    "127.0.0.1",
-                                    "--port",
-                                    str(port + 1),
-                                    "--prometheus-port",
-                                    str(port + 2),
-                                ],
-                                cell + "-router",
-                            )
-                            ready(router, router_url)
-                            url = router_url
-                        name = (
-                            "benchmark_agent_session_dp.py"
-                            if workload == "sessions"
-                            else "benchmark_prefix_aware_dp.py"
-                        )
-                        bench = [
-                            command[0],
-                            str(scripts / name),
-                            "--base-url",
-                            url,
-                            "--control-url",
+            policies = ["consistent_hash_fork", "consistent_hash"]
+        schedule = comparison_schedule(args.seeds, policies, args.trials)
+        for seed, policy, trial in schedule:
+            wait_idle()
+            label = f"{seed}-{policy}-{trial}"
+            status("server_startup", label=label)
+            server_command = (
+                fork_attention_command(
+                    command,
+                    policy == "consistent_hash_fork",
+                    args.qa_fork_min_shared_tokens,
+                )
+                if fork_comparison
+                else command
+            )
+            server = start(server_command, label + "-server", config["env"])
+            ready(server, backend)
+            for workload in (
+                ["fork-scale"]
+                if args.fork_scale
+                else ["longbench"]
+                if args.qa_cases
+                else ["sessions", "revisit", "replicated", "cold"]
+            ):
+                cell = label + "-" + workload
+                router = None
+                url = backend
+                if policy != "native":
+                    router = start(
+                        [
+                            str(args.router_python),
+                            str(scripts / "serve_dp_router.py"),
+                            "--worker-urls",
                             backend,
-                            "--model",
-                            model,
-                            "--policy-label",
-                            policy,
-                            "--seed",
-                            str(seed),
-                            "--trials",
-                            "1",
-                            "--output-tokens",
-                            "16",
-                            "--output",
-                            str(output / (cell + ".json")),
-                        ]
-                        if workload != "sessions":
-                            bench += [
-                                "--allow-missing-prompt-details",
-                                "--workload",
-                                workload,
-                                "--documents",
-                                "12",
-                                "--prefix-tokens",
-                                "4096",
-                                "--suffix-tokens",
-                                "64",
-                                "--revisit-order",
-                                "shuffled",
-                            ]
-                        if args.qa_cases:
-                            bench = [
-                                command[0],
-                                str(scripts.parent / "src/longbench_qa_runner.py"),
-                                "--base-url",
-                                url + "/v1",
-                                "--model",
-                                model,
-                                "--cases",
-                                str(args.qa_cases),
-                                "--seed",
-                                str(seed),
-                                "--concurrency",
-                                "4",
-                                "--max-tokens",
-                                str(args.qa_max_tokens),
-                                "--document-routing",
-                                "--output",
-                                str(output / (cell + ".json")),
-                            ]
-                            if args.qa_arrival == "waves" and not args.qa_prefill_gate:
-                                bench.append("--question-waves")
-                            if (
-                                args.qa_prefill_gate
-                                and policy == "consistent_hash_gate"
-                            ):
-                                bench.append("--coalesce-prefill")
-                            with urllib.request.urlopen(
-                                backend + "/metrics", timeout=10
-                            ) as response:
-                                (output / (cell + "-metrics-before.txt")).write_bytes(
-                                    response.read()
-                                )
-                        if args.fork_scale:
-                            bench = [
-                                command[0],
-                                str(scripts / "benchmark_fork_scale.py"),
-                                "--base-url",
-                                url,
-                                "--control-url",
-                                backend,
-                                "--model",
-                                model,
-                                "--seed",
-                                str(seed),
-                                "--trials",
-                                str(args.scale_trials),
-                                "--output",
-                                str(output / (cell + ".json")),
-                            ]
-                        status("benchmark", cell=cell)
-                        client = start(bench, cell, config["env"])
-                        code = client.wait(timeout=7200 if args.fork_scale else 900)
-                        processes.remove(client)
-                        if code:
-                            raise RuntimeError(f"Benchmark failed: {cell}")
-                        if args.qa_cases:
-                            time.sleep(2)
-                            with urllib.request.urlopen(
-                                backend + "/metrics", timeout=10
-                            ) as response:
-                                (output / (cell + "-metrics-after.txt")).write_bytes(
-                                    response.read()
-                                )
-                        completed.append(cell)
-                        if router is not None:
-                            stop(router)
-                    stop(server)
+                            "--policy",
+                            "consistent_hash"
+                            if policy
+                            in {"consistent_hash_gate", "consistent_hash_fork"}
+                            else policy,
+                            "--intra-node-data-parallel-size",
+                            "2",
+                            "--host",
+                            "127.0.0.1",
+                            "--port",
+                            str(port + 1),
+                            "--prometheus-port",
+                            str(port + 2),
+                        ],
+                        cell + "-router",
+                    )
+                    ready(router, router_url)
+                    url = router_url
+                name = (
+                    "benchmark_agent_session_dp.py"
+                    if workload == "sessions"
+                    else "benchmark_prefix_aware_dp.py"
+                )
+                bench = [
+                    command[0],
+                    str(scripts / name),
+                    "--base-url",
+                    url,
+                    "--control-url",
+                    backend,
+                    "--model",
+                    model,
+                    "--policy-label",
+                    policy,
+                    "--seed",
+                    str(seed),
+                    "--trials",
+                    "1",
+                    "--output-tokens",
+                    "16",
+                    "--output",
+                    str(output / (cell + ".json")),
+                ]
+                if workload != "sessions":
+                    bench += [
+                        "--allow-missing-prompt-details",
+                        "--workload",
+                        workload,
+                        "--documents",
+                        "12",
+                        "--prefix-tokens",
+                        "4096",
+                        "--suffix-tokens",
+                        "64",
+                        "--revisit-order",
+                        "shuffled",
+                    ]
+                if args.qa_cases:
+                    bench = [
+                        command[0],
+                        str(scripts.parent / "src/longbench_qa_runner.py"),
+                        "--base-url",
+                        url + "/v1",
+                        "--model",
+                        model,
+                        "--cases",
+                        str(args.qa_cases),
+                        "--seed",
+                        str(seed),
+                        "--concurrency",
+                        "4",
+                        "--max-tokens",
+                        str(args.qa_max_tokens),
+                        "--document-routing",
+                        "--output",
+                        str(output / (cell + ".json")),
+                    ]
+                    if args.qa_arrival == "waves" and not args.qa_prefill_gate:
+                        bench.append("--question-waves")
+                    if args.qa_prefill_gate and policy == "consistent_hash_gate":
+                        bench.append("--coalesce-prefill")
+                    with urllib.request.urlopen(
+                        backend + "/metrics", timeout=10
+                    ) as response:
+                        (output / (cell + "-metrics-before.txt")).write_bytes(
+                            response.read()
+                        )
+                if args.fork_scale:
+                    bench = [
+                        command[0],
+                        str(scripts / "benchmark_fork_scale.py"),
+                        "--base-url",
+                        url,
+                        "--control-url",
+                        backend,
+                        "--model",
+                        model,
+                        "--seed",
+                        str(seed),
+                        "--trials",
+                        str(args.scale_trials),
+                        "--prefix-tokens",
+                        *map(str, args.scale_prefix_tokens),
+                        "--branches",
+                        *map(str, args.scale_branches),
+                        "--output",
+                        str(output / (cell + ".json")),
+                    ]
+                status("benchmark", cell=cell)
+                client = start(bench, cell, config["env"])
+                code = client.wait(timeout=7200 if args.fork_scale else 900)
+                processes.remove(client)
+                if code:
+                    raise RuntimeError(f"Benchmark failed: {cell}")
+                if args.qa_cases:
+                    time.sleep(2)
+                    with urllib.request.urlopen(
+                        backend + "/metrics", timeout=10
+                    ) as response:
+                        (output / (cell + "-metrics-after.txt")).write_bytes(
+                            response.read()
+                        )
+                completed.append(cell)
+                if router is not None:
+                    stop(router)
+            stop(server)
         save("complete.json", {"complete": True, "completed": completed})
         status("complete")
     except BaseException as error:

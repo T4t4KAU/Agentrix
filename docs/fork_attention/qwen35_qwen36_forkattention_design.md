@@ -301,33 +301,25 @@ portion is fitted to approximately 28K tokens rather than 32,768 tokens so
 that image tokens, chat-template framing, branch suffixes, and generated output
 remain within the 32K context limit.
 
-### 9.3 Reproduction
+### 9.3 Historical reproduction
+
+This result used the former private DP routing implementation. Its launcher
+has been removed from the current checkout. Matching recipes and source
+snapshots remain on the experiment server; they must not be paired with the
+current official router and reported as the same experiment.
+
+Dataset preparation remains available:
 
 ```bash
 cd benchmark
 .venv/bin/python -m weblinx_data \
-  --output-dir results/weblinx_subset \
+  --output-dir "${RESULTS_DIR}/weblinx_subset" \
   --split validation --case-count 8 --branch-count 8 --seed 2026
-
-MODEL_PATH="${MODEL_DIR}/Qwen3.6-27B" \
-OUTPUT_TOKENS=256 \
-NUM_GPU_BLOCKS_OVERRIDE=84 \
-VARIANTS="flash_ordinary fork_ordinary fork_prefix_aware" \
-./scripts/run_weblinx_8dp.sh
 ```
 
-The script fixes DP to eight replicas, TP to one, one API frontend, 256
-concurrent branch requests, `max_num_seqs=64`, prefix caching, Forest CUDA
-Graphs, and a 32K model limit. Flash and ordinary Fork use native internal-DP
-placement. Only `fork_prefix_aware` enables the prefix router, the 10 ms arrival
-wave, and fanout scheduling. All arms receive identical roots, suffix budgets,
-shuffle order, output limits, and physical KV capacity.
-
-For the validated Qwen3.6/H20 build, 84 hybrid KV blocks expose 57,344 tokens
-per rank. This deliberately admits one approximately 31K root plus its 32
-branches while preventing two independent roots from residing together. The
-script writes raw request traces, CSV/Markdown summaries, server logs, and
-Prometheus metrics for each variant.
+The archived comparison used DP=8, TP=1, one API frontend, 256 concurrent
+branch requests, `max_num_seqs=64`, and a 32K model limit. For new routing
+experiments, use the [official DP entry points](../dp_routing.md).
 
 ## 10. Current limitations
 

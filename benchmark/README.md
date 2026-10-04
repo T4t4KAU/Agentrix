@@ -5,6 +5,26 @@ and local vLLM end-to-end benchmarks. See
 [`../README.md`](../README.md) for the complete installation, build, and
 reproduction workflow.
 
+## Script entry points
+
+| Purpose | Entry points |
+| --- | --- |
+| Official routing and document QA | `serve_dp_router.py`, `run_agent_session_dp_profile.sh`, `run_ascend_router_comparison.py` |
+| KV backup and capacity | `benchmark_agent_kv_tiering.py`, `benchmark_dp_kv_lifecycle.py`, `benchmark_dp_kv_growth.py` |
+| Official AgentX KV comparison | `run_agentx_kv_comparison.py`, `summarize_agentx_memory.py` |
+| ForkAttention correctness and scale | `benchmark_fork_numerics.py`, `benchmark_fork_scale.py`, their `summarize_*` scripts |
+| Attention operator profiling | `benchmark_flashinfer_cascade.py`, `benchmark_fork_decode.py`, `run_fork_attention_ncu.sh` |
+| Tool data and host memory | `benchmark_tool_result_paging.py`, `benchmark_tool_snapshot_sharing.py`, `benchmark_prompt_tool_result_context.py` |
+| General backend comparison | `run_vllm_benchmark.sh`, `run_sglang_benchmark.sh`, `run_offload_backend_comparison.sh` |
+
+Retired private-router launchers and experiments requiring removed KV
+residency/placement or tool-trim APIs have been removed, along with their
+dedicated plots. Current HTTP clients, dataset builders, validation tools and
+summarizers remain. Coding demos use the Python entry points documented in
+[the demo guide](../docs/coding_agent/coding_agent_live_demo.md).
+Historical source snapshots are retained on the experiment server under
+`${RESULTS_DIR}/script-cleanup-20261004/`; no archived copies are kept here.
+
 ## Common Commands
 
 ```bash
@@ -77,57 +97,21 @@ the Git-ignored `results/` directory. The vLLM script writes one subdirectory
 per backend plus `backend_comparison.csv` and `backend_comparison.md` with the
 end-to-end latency and throughput deltas.
 
-## WebLINX Multimodal 8-DP Benchmark
+## WebLINX dataset preparation
 
-Build a deterministic eight-case subset from the WebLINX validation split:
+The dataset builder remains available independently of the retired private
+8-DP routing recipe:
 
 ```bash
 .venv/bin/python -m weblinx_data \
-  --output-dir results/weblinx_subset \
-  --split validation \
-  --case-count 8 \
-  --branch-count 8 \
-  --seed 2026
+  --output-dir "${RESULTS_DIR}/weblinx_subset" \
+  --split validation --case-count 8 --branch-count 8 --seed 2026
 ```
 
-The builder selects distinct demonstrations with good screenshots and eight
-ranked candidates, downloads only the selected replay files and PNGs, resizes
-the screenshots to 1280x720, and writes a reproducible `manifest.json`. The
-downloaded data remains under the Git-ignored `results/` directory.
-
-Run the Pressure32K/32-shaped workload on eight DP replicas:
-
-```bash
-MODEL_PATH=/path/to/Qwen3.6-27B \
-GPU_IDS=0,1,2,3,4,5,6,7 \
-MANIFEST="$PWD/results/weblinx_subset/manifest.json" \
-NUM_GPU_BLOCKS_OVERRIDE=84 \
-./scripts/run_weblinx_8dp.sh
-```
-
-Each of the eight WebLINX states first issues one natural multimodal bootstrap
-request. Its eight candidates are then expanded into four independent rollout
-strategies each, giving 32 branches per state and 256 globally shuffled branch
-requests. The client sends no DP-rank header: placement is entirely controlled
-by the internal-DP server.
-
-The default matrix contains the three ablations needed to reproduce the text
-Pressure32K/32 design: `flash_ordinary`, `fork_ordinary`, and
-`fork_prefix_aware`. Only the last arm enables prefix-aware DP routing and
-fanout scheduling. All arms use the same 256-token output limit, seeded
-lognormal 256-token suffix distribution, KV capacity, and request order.
-
-`TEXT_PREFIX_TOKENS` defaults to 28,000, leaving room for the image tokens,
-64-token common analysis, candidate/rollout suffix, and 256 generated tokens
-within a 32K context. `MAX_NUM_SEQS` defaults to 64 and Forest CUDA Graphs are
-enabled. Calibrate `NUM_GPU_BLOCKS_OVERRIDE` so one root cohort fits per rank
-but two independent roots do not; `84` produces 57,344 KV tokens per rank for
-the validated Qwen3.6/H20 build. At that deliberately tight boundary, the
-validated optimized run still recorded 27 preemptions because Qwen3.6 uses
-coarse 784-token hybrid cache pages. The result directory contains per-variant
-CSV/JSON summaries, server logs, Prometheus metrics, and `comparison.md`. See
-`docs/fork_attention/qwen35_qwen36_forkattention_design.md` for the validated result and its
-limitations.
+It selects distinct demonstrations, downloads their replay files and images,
+and writes a reproducible manifest. The historical routing comparison requires
+its archived runtime; its old launcher is no longer a current reproduction
+entry point. See [the workload design](../docs/fork_attention/qwen35_qwen36_forkattention_design.md).
 
 ## SGLang Local Benchmark
 
@@ -394,6 +378,66 @@ controlled scaling probe, not QA or AgentX. Run eager and Decode ACLGraph with
 separate private configs and result directories; compare Fork off/on within
 each mode. Keep output-hash differences alongside fixed-length timing results.
 
+For independent service repeats, use `--trials 2` with explicit `--seeds`.
+Each seed's baseline/candidate services now run consecutively; their order
+reverses across seeds and independent repeats. `--scale-trials` controls timed
+batches within a service and must not be counted as independent service runs.
+Use `--scale-prefix-tokens 16384 32768 65536 --scale-branches 4 8` to retain
+short-prefix controls while concentrating on the candidate fanout shapes.
+Keep the runtime fixed and preserve a source manifest; new seeds and restarts
+test reproducibility, without changing the operator or promoting it to default.
+
+After all services complete, run `scripts/summarize_fork_scale.py` with
+`--runs "${RESULTS_DIR}/runs" --seeds 20261003 20261004 --restarts 2
+--output "${RESULTS_DIR}/validated-comparison.json"` on the server. It rejects
+incomplete plans, unequal input/output tokens, changed prompt-source work and
+preemptions. It averages each service's timed batches before combining equally
+weighted seeds/restarts and reports the range of paired changes. Runtime/config
+isolation and formal-window memory observations must also be audited; this is
+not a significance test or a task-quality evaluation.
+When a strict output check fails, `--diagnose-output-differences` retains all
+shapes and reports mismatch counts and within-service output variation. Shapes
+with any mismatched paired output are explicitly ineligible as equal-output
+latency comparisons; the diagnostic mode does not turn them into passing runs.
+
+For full-token diagnostics, run `scripts/benchmark_fork_numerics.py` against
+each isolated service with `--base-url "${ROUTER_URL}" --control-url
+"${BACKEND_URL}" --model "${MODEL_NAME}" --request-mode concurrent` and a
+fresh server-side `--output`. Repeat with `--request-mode batched`: this submits
+one prompt list per rank, preserving the same input plan and cache preparation.
+Defaults cover 16K/32K/64K, 4/8 branches per rank, three repeats and 64 generated
+tokens. Both modes retain full token IDs and top-five logprobs. These instrumented
+timings are diagnostics, not speedup measurements. Compare native repeats,
+independent service restarts, and native/Fork pairs before attributing differences.
+Only compare probabilities through the first differing token, while both
+sequences still have the same generated history.
+
+Build the long-document QA subset with
+`scripts/build_longbench_agentrix_cases.py --data-dir "${DATA_DIR}"
+--datasets narrativeqa --model "${MODEL_DIR}" --cases 8 --min-questions 8
+--max-questions 8 --unique-questions --min-context-tokens 16384
+--max-context-tokens 65536 --output "${CASE_FILE}"`.
+Selection uses original document length and distinct-question count; duplicate
+questions keep their first source row. No answers or generated outputs are used
+to choose cases. Freeze this file before either arm runs. Use
+`src/longbench_qa_runner.py --base-url "${ROUTER_URL}/v1" --model "${MODEL_NAME}"
+--cases "${CASE_FILE}" --concurrency 16 --max-tokens 256 --document-routing
+--prime-first-question --seed "${SEED}" --output "${RESULT_FILE}"` after resetting
+the dedicated backend cache. It scores the first original question per document,
+then the remaining original questions; both phases count toward total time and
+quality. This is a LongBench subset with a controlled arrival pattern, not an
+official AgentX replay or a full LongBench evaluation.
+
+The four-service validation protocol uses native-0, fork-0, fork-1, native-1,
+with both numeric modes and QA in every service. Preserve `validation-plan.json`,
+`progress.json`, frozen `qa-cases.jsonl`/`qa-ready.json`, and labeled reports under
+`runs/` on the server. `scripts/summarize_fork_numerics.py --root "${RESULTS_DIR}"
+--output "${RESULTS_DIR}/validated-results.json"` (with `benchmark/src` on
+`PYTHONPATH`) requires all declared runs to finish. It audits token/digest alignment,
+original QA references, recalculated scores, prompt lengths and quality per seed
+before combining service pairs. Separately verify runtime hashes, the sole Fork
+switch difference, prompt-source counters, execution logs and device ownership.
+
 For official AgentX KV-tiering comparisons, use
 `scripts/run_agentx_kv_comparison.py --config "${PRIVATE_CONFIG}" --output "${RESULTS_DIR}/runs"`
 with a fresh server-side output directory. The private JSON supplies `cwd`,
@@ -410,20 +454,3 @@ pending results are tracked in the existing [KV status](../docs/kv_memory_optimi
 The private internal DP router and its profiling simulators have been removed.
 Historical `VLLM_AGENTRIX_DP_ROUTING_POLICY` and `VLLM_FORK_ATTN_DP_PREFIX_*`
 controls are no longer supported; old results do not measure the new router.
-
-The following full-dataset recipe targets those older routing controls and is
-kept as historical source and now exits with migration guidance. Restore its
-matching historical code only when reproducing old results:
-
-```bash
-MODEL_PATH=/path/to/Qwen3-8B \
-GPU_IDS=0,1 \
-./scripts/run_vllm_dp_full_dataset.sh
-```
-
-This produces separate `flash_dp`, `fork_dp`, and `fork_optimized_dp` results,
-plus an optional pressure-aware offload run. Existing result CSV files are
-treated as checkpoints, so an interrupted full-dataset run can be resumed with
-the same `OUTPUT_ROOT`. The full-dataset optimized variant uses strict Graph
-bucket placement and a 10 ms arrival wave; both ordinary-DP baselines keep the
-optimized router and its telemetry path disabled.

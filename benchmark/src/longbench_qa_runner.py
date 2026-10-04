@@ -100,9 +100,35 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         random.Random(args.seed).shuffle(cases)
     semaphore = asyncio.Semaphore(args.concurrency)
     started = time.perf_counter()
+    phase_seconds = {}
     results = []
     try:
-        if args.question_waves:
+        if args.prime_first_question:
+            for phase, first in (("first", True), ("followup", False)):
+                phase_started = time.perf_counter()
+                batch = await asyncio.gather(
+                    *(
+                        ask(
+                            client,
+                            args.model,
+                            case,
+                            question,
+                            semaphore,
+                            args.max_tokens,
+                            args.document_routing,
+                            prefill_gate,
+                        )
+                        for case in cases
+                        for question in (
+                            case["questions"][:1] if first else case["questions"][1:]
+                        )
+                    )
+                )
+                phase_seconds[phase] = time.perf_counter() - phase_started
+                for row in batch:
+                    row["phase"] = phase
+                results.extend(batch)
+        elif args.question_waves:
             rng = random.Random(args.seed)
             for wave in range(max(len(c["questions"]) for c in cases)):
                 order = [c for c in cases if len(c["questions"]) > wave]
@@ -150,6 +176,8 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "cases_sha256": hashlib.sha256(args.cases.read_bytes()).hexdigest(),
         "seed": args.seed,
         "question_waves": args.question_waves,
+        "prime_first_question": args.prime_first_question,
+        "phase_seconds": phase_seconds,
         "coalesce_prefill": args.coalesce_prefill,
         "mean_end_to_end_ttft_seconds": statistics.fmean(
             r["end_to_end_ttft_seconds"] for r in results
@@ -188,11 +216,20 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--document-routing", action="store_true")
     parser.add_argument("--question-waves", action="store_true")
+    parser.add_argument(
+        "--prime-first-question",
+        action="store_true",
+        help="Evaluate each document's first question, then fan out its remaining original questions",
+    )
     parser.add_argument("--coalesce-prefill", action="store_true")
     parser.add_argument("--seed", type=int, default=20261002)
     args = parser.parse_args()
     if args.concurrency < 1 or args.max_tokens < 1:
         parser.error("concurrency and max-tokens must be positive")
+    if args.prime_first_question and (args.question_waves or args.coalesce_prefill):
+        parser.error(
+            "prime-first-question is a separate arrival pattern; omit waves and prefill coalescing"
+        )
     if args.output.exists():
         parser.error("output already exists")
     result = asyncio.run(run(args))

@@ -72,13 +72,17 @@ async def select_sessions(session, args):
     raise RuntimeError("official session hashes did not cover both ranks")
 
 
-async def run(args):
+async def run(args, *, request_fn=run_request, batch_request_fn=None):
     if args.output.exists():
         raise FileExistsError(args.output)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     result = {
         "valid": False,
-        "scope": "Warm shared prefixes; synthetic fixed-length decode; no QA claim",
+        "scope": getattr(
+            args,
+            "scope",
+            "Warm shared prefixes; synthetic fixed-length decode; no QA claim",
+        ),
         "config": {
             k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
         },
@@ -122,10 +126,25 @@ async def run(args):
                             if prime
                             else groups[group]["branches"]
                         )
+                        if batch_request_fn is not None:
+                            identities.extend(
+                                (rank, branch) for branch in range(len(prompts))
+                            )
+                            calls.append(
+                                batch_request_fn(
+                                    session,
+                                    args.base_url,
+                                    args.model,
+                                    prompts,
+                                    owners[rank],
+                                    output_tokens,
+                                )
+                            )
+                            continue
                         for branch, prompt in enumerate(prompts):
                             identities.append((rank, branch))
                             calls.append(
-                                run_request(
+                                request_fn(
                                     session,
                                     args.base_url,
                                     args.model,
@@ -138,6 +157,8 @@ async def run(args):
                     started = time.perf_counter()
                     rows = await asyncio.gather(*calls)
                     elapsed = time.perf_counter() - started
+                    if batch_request_fn is not None:
+                        rows = [row for batch in rows for row in batch]
                     return [
                         {**asdict(row), "expected_rank": rank, "branch": branch}
                         for row, (rank, branch) in zip(rows, identities)

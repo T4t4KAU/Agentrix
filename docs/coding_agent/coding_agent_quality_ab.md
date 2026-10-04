@@ -28,8 +28,8 @@ per rank and Agentrix receives 2,500. This deliberately tests whether the
 optimized system can retain task quality under a smaller physical KV pool.
 Override both values to the same count for a pure performance control.
 
-The launcher refuses to run when a selected GPU already uses more than 1 GiB,
-preventing unrelated processes from contaminating NVML measurements.
+For new runs, start dedicated services and verify device ownership before
+measuring. The former private-router matrix launcher has been removed.
 
 ## Prepare Sources
 
@@ -45,25 +45,22 @@ by the task manifests and writes a revision marker beside each snapshot.
 
 ## Run
 
-```bash
-MODEL_PATH=/path/to/Qwen3-8B \
-SOURCE_ROOT=/path/to/coding_sources \
-OUTPUT_ROOT=benchmark/results/coding_quality_ab \
-GPU_IDS=0,1,2,3 \
-DP_REPLICAS=4 \
-BASELINE_NUM_GPU_BLOCKS=3852 \
-AGENTRIX_NUM_GPU_BLOCKS=2500 \
-benchmark/scripts/run_coding_agent_quality_matrix.sh
-```
-
-For a capacity-matched control:
+Start a dedicated backend using current supported configuration. The task
+runner accepts its endpoint directly and does not launch a model server:
 
 ```bash
-BASELINE_NUM_GPU_BLOCKS=3852 \
-AGENTRIX_NUM_GPU_BLOCKS=3852 \
-OUTPUT_ROOT=benchmark/results/coding_quality_ab_equal_capacity \
-benchmark/scripts/run_coding_agent_quality_matrix.sh
+PYTHONPATH=benchmark/src:application/src \
+  benchmark/.venv/bin/python -m coding_agent_e2e_runner \
+  --base-url "${BASE_URL}" --model "${SERVED_MODEL}" \
+  --cases "${CASE_FILE}" --task-id "${TASK_ID}" \
+  --task-root "${TASK_ROOT}" --repo "${SOURCE_ROOT}" \
+  --output "${RESULTS_DIR}/run.json"
 ```
+
+For A/B validation, run both arms with identical tasks and generation limits,
+record backend and capacity settings, and aggregate with `coding_quality_report`.
+The historical private-router arms above are not supported by the current
+checkout; use [official routing](../dp_routing.md) for new experiments.
 
 ## Outputs
 

@@ -441,55 +441,16 @@ benchmark/scripts/import_agent_datasets.py \
   --appworld-source /path/to/appworld
 ```
 
-### Main experiment matrix
+### Dataset and DP experiments
 
-`run_main_experiment.sh` runs all four bundled datasets and records streaming
-TTFT/TPOT, P50/P95/P99 request latency, throughput, logical and observed KV
-usage, GPU compute utilization, and NVIDIA memory-controller utilization.
-The single-GPU and TP groups use `MODE` directly:
+Use `benchmark/scripts/run_vllm_dataset_matrix.sh` for the bundled AgentBoard
+and AppWorld attention-backend matrix. Set `MODEL_PATH`, `BACKENDS`, and a
+server-side `OUTPUT_ROOT` explicitly. This is a systems workload; task quality
+requires the corresponding dataset evaluator.
 
-```bash
-cd benchmark
-
-# One GPU: Flash/Fork with no offload, ordinary CPU offload, and optimized offload.
-MODE=single_gpu \
-MODEL_SPECS='qwen3-1.7b|/path/to/Qwen3-1.7B;llama3.2-1b|/path/to/Llama-3.2-1B' \
-./scripts/run_main_experiment.sh
-
-# TP accuracy guardrail: one Flash run and two Fork repeats.
-MODE=tp_accuracy MODEL_SPECS='qwen3-14b|/path/to/Qwen3-14B' \
-./scripts/run_main_experiment.sh
-```
-
-For DP configuration and validation entry points, use the
-[DP guide](docs/dp_routing.md).
-
-Override `PREFIX_LENGTHS`, `BRANCH_COUNTS`, `DATASETS`, `CASE_COUNT`,
-`MAX_DATASET_RECORDS`, `GPU_IDS`, `DP_REPLICAS`, `TP_SIZE`, and
-`VARIANT_SPECS` without editing the scripts. Completed run directories are
-skipped, so an interrupted matrix can resume in place.
-Each mode writes `main_experiment_report.md` and a machine-readable CSV under
-`benchmark/results/main_experiment/<mode>/`. Accuracy means deterministic
-output agreement against FlashAttention; the bundled prompt snapshots do not
-provide a common executable environment-level evaluator.
-
-The runner sets `VLLM_USE_FLASHINFER_SAMPLER=0` by default so sampler JIT does
-not confound attention backend measurements. Set it to `1` explicitly to
-benchmark the FlashInfer sampler; the selected value is recorded in every run
-manifest.
-
-The main matrix uses at most 32 deterministic source records per dataset by
-default. This runs the complete AgentBoard, AppWorld, and AgencyBench snapshots
-and the first 32 SWE-bench Verified records. Set `MAX_DATASET_RECORDS=0` to run
-every available record. The configured cap and full-dataset flag are recorded
-in every run manifest and report.
-
-The ordinary offload baseline is vLLM's native `OffloadingConnector` with LRU
-eviction and all fanout admission, preemption, hotset, and connector planning
-disabled. The optimized variant uses the same CPU capacity and LRU base policy,
-enabling those prefix-aware controls. Ordinary Fork DP likewise disables the
-fanout scheduler; only the prefix-aware DP variant enables it. LMCache and disk
-storage are intentionally outside this matrix.
+For current DP routing, use the official router and the entry points in the
+[DP guide](docs/dp_routing.md). The retired private-router matrix launchers have
+been removed; archived recipes require their matching historical runtime.
 
 On a two-GPU machine, run two single-GPU vLLM replicas and compare DP routing
 policies. `round_robin` is the load-balancing baseline. `prefix_forest` keeps
@@ -517,33 +478,6 @@ GPU_MEMORY_UTILIZATION=0.70 \
 OUTPUT_DIR=results/fork_dp2_prefix_forest \
 ./scripts/run_vllm_benchmark.sh
 ```
-
-### Experimental DP KV Reload Rebalance
-
-The KV-reload Prefix Forest rebalance path is high risk and disabled by
-default. It can move a preempted greedy request to another internal DP rank
-only when LMCache reports a real external reload, the target proves that it
-already has a longer physical GPU prefix, and the router predicts sufficient
-prefix or fanout benefit. Unsupported requests and configurations stay on the
-ordinary prefix-aware DP path.
-
-Run the paired default-LMCache comparison with:
-
-```bash
-cd benchmark
-MODEL_PATH=/path/to/Qwen3-8B \
-GPU_IDS=0,1 \
-OUTPUT_ROOT=results/dp_reload_comparison \
-./scripts/run_vllm_dp_reload_comparison.sh
-```
-
-Both variants start with an empty LMCache server using its default `LRU`
-policy. The baseline leaves `VLLM_FORK_ATTN_DP_RELOAD_REBALANCE=0`; the
-optimized variant sets it to `1`. The experiment additionally requires
-ForkAttention, prefix-aware internal DP, synchronous scheduling, PP=1, the v2
-model runner, `LMCacheMPConnector`, and greedy sampling. The generated report
-includes throughput, preemptions, logical shared-KV reduction, committed
-handoffs, and the GPU-local KV reload avoided by successful handoffs.
 
 Profile ForkAttention with Nsight Systems:
 
