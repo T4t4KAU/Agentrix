@@ -11,10 +11,10 @@ LMCache integration, and the end-to-end benchmark suite in one repository:
 
 ## Documentation
 
-Start with the [measured optimization status and documentation index](docs/README.md).
-It separates official AgentX results, targeted workload gains, negative results,
-and historical integrations that are absent from the current checkout.
-Core references: [server environment](docs/autodl_build_and_benchmark.md),
+Start with the [technical report and documentation index](docs/README.md).
+The [cross-platform report](docs/agentrix_cross_platform_optimizations.md)
+explains the design, measured benefits, resource costs, and applicable workloads.
+Core references: [Ascend architecture and execution](docs/agentx_ascend.md),
 [DP routing](docs/dp_routing.md), [KV memory](docs/kv_memory_optimization_status.md),
 [profiling](docs/fork_attention/forkattention_operator_profile.md).
 
@@ -23,8 +23,8 @@ prefix/session routing and the unproven KV admission bypass have been removed;
 previous routing results remain historical.
 
 The generic build and experimental recipes below include older runtime paths.
-For the existing profiling server, use the server guide above; do not recreate
-its environment or enable the paused offload path by following an old recipe.
+Check the relevant backend guide and pinned versions before enabling an
+experimental integration.
 
 ## System Requirements
 

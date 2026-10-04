@@ -74,9 +74,9 @@ Nsys 包含模型、调度、API、CUDA Graph；Ncu 用于详细算子 counter�
 Cached tokens 不能直接换算为 branch 共享收益；抢占恢复可能复用自身缓存。
 路由、placement 和 attention 同时开启的对照，不能归因于单个 kernel。
 
-## FlashInfer Cascade 与 CUDA ForkAttention（2026-09-27）
+## FlashInfer Cascade 与 CUDA ForkAttention
 
-新增入口 `benchmark/scripts/benchmark_flashinfer_cascade.py` 直接调用 FlashInfer 官方
+实验入口 `benchmark/scripts/benchmark_flashinfer_cascade.py` 直接调用 FlashInfer 官方
 `MultiLevelCascadeAttentionWrapper`。旧 profiling 脚本的 `CASCADE_ATTN` 调用的是
 vLLM FlashAttention 后端的 Cascade，不能用它代替 FlashInfer 的结果。
 

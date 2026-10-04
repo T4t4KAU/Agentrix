@@ -289,8 +289,8 @@ pages with BF16/FP32/uint8 payloads. It neither loads a model nor resets a
 serving engine. It does not establish hybrid KV restoration, scheduler CoW,
 selective backup support or performance; those require matching runtime APIs
 and separate model-level experiments.
-Current verification and hardware availability are recorded in
-[KV memory status](../docs/kv_memory_optimization_status.md#选择性备份边界修复与验证入口).
+The lifecycle strategy and measured scope are described in
+[KV memory management](../docs/kv_memory_optimization_status.md#agent-hints-与选择性备份).
 
 ### Ascend native mixed-cache offload compatibility
 

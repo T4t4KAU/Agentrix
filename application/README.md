@@ -87,6 +87,13 @@ export AGENTRIX_PROMPT_COMPACTION_MIN_AGE_TURNS=4
 export AGENTRIX_PROMPT_COMPACTION_RECOVERABLE_TOOLS=read,read_file
 ```
 
+Rewriting old messages changes the token prefix and can invalidate APC or a
+shared ForkAttention parent. Compact the shared parent once before branching;
+keep it stable while the cohort is active, and compact private suffixes
+independently. Exact restoration requires retaining the historical backing
+store; persist it if restoration must survive an application restart. Exact
+text recovery does not establish equivalent task quality after paging.
+
 ## Paged tool snapshots and branch lifetimes
 
 `PagedToolStore` stores immutable tool results in SQLite, split into 4,096-character
@@ -215,7 +222,7 @@ application/.venv/bin/python benchmark/scripts/benchmark_tool_snapshot_sharing.p
 
 The benchmark compares exact response hashes, restores each complete paged
 snapshot, checks final reclamation, and measures RSS before allocation tracing.
-The [result inventory](../docs/nvidia_memory_results_and_ascend_plan.md#44-选中大结果的有界缓冲与流式入库2026-09-28)
+The [streaming results](../docs/agentrix_cross_platform_optimizations.md#大结果流式入库)
 reports memory and latency separately.
 
 The coding runner accepts `--tool-result-paging`. Large `read` and `search`
@@ -439,7 +446,7 @@ The application policy below remains available, but the current pinned vLLM
 checkout lacks its `/v1/agentrix/tool-kv/trim` endpoint and engine operation.
 These examples describe the historical integration and do not establish a
 working offload/prefetch path or measured benefit. See
-[current status and limitations](../docs/tool_kv_trimmer.md#current-status-2026-09-28).
+[current status and limitations](../docs/kv_memory_optimization_status.md#agent-hints-与选择性备份).
 
 `ToolKVTrimmer` is an application-owned, opt-in policy for releasing the GPU
 KV blocks of a vLLM resumable session while a slow tool is running. It waits a
