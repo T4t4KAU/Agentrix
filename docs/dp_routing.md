@@ -132,6 +132,29 @@ EOS、输出上限 256；两个种子只改变到达顺序。任务评分未下�
 因此 ForkAttention 继续显式启用；NPU 架构、分段计算和 profiling 见
 [Ascend 专题](agentx_ascend.md)。
 
+## 历史 CUDA 共享文档对照
+
+旧版 CUDA 实现曾在四张 H20 上，以 Qwen3-32B BF16 对比 FlashAttention +
+原生 DP 与 ForkAttention + 私有 prefix-aware DP。LongBench v1 的
+`multifieldqa_en`、`qasper` 子集包含 32 篇文档、68 个带参考答案的问题，
+每篇文档对应两个或三个问题，长度 4,842～14,851 token。两侧均启用前缀
+缓存，采用贪心解码、关闭 thinking、并发 64、输出上限 64 token。
+
+| 指标 | FlashAttention + 原生 DP | ForkAttention + 私有 prefix-aware DP |
+| --- | ---: | ---: |
+| 每个 rank 的 GPU KV blocks | 3,852 | 2,600 |
+| 整批耗时 | 76.79 s | 54.92 s |
+| 平均 TTFT | 44.01 s | 29.52 s |
+| 平均请求延迟 | 60.23 s | 39.16 s |
+| 单进程 GPU 显存峰值 | 84,926 MiB | 81,822 MiB |
+| Exact Match | 5.88% | 5.88% |
+| Token F1 | 40.53% | 40.42% |
+
+这是同时改变注意力、路由和缓存容量的配置对照：整批耗时加速 1.40 倍，
+单进程显存峰值减少 3,104 MiB，不能将收益单独归因于某一组件。归一化
+预测一致率为 91.18%，不代表严格输出等价。这组历史数据不属于当前官方
+router 对照，也不与 Ascend 的不同模型、数据子集及配置合并。
+
 ## 官方策略之上的探索边界
 
 应用侧 `PrefixPrefillGate` 尝试让同前缀的后续请求等待首个请求返回首 token

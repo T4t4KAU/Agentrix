@@ -7,6 +7,7 @@ LMCache integration, and the end-to-end benchmark suite in one repository:
 - `vllm-ascend/` is pinned to `v0.22.1rc1` for Ascend development with vLLM 0.22.1.
 - `LMCache/` is a Git submodule pinned to the tiered KV storage implementation.
 - `llama.cpp/` is a Git submodule pinned to the CUDA/MUSA ForkAttention implementation.
+- `sglang/` is a Git submodule pinned to the ForkAttention-enabled implementation.
 - `benchmark/` contains simulation, API, and local vLLM benchmarks.
 
 ## Documentation
@@ -562,3 +563,9 @@ docker run --rm \
 For another GPU architecture, override `TORCH_CUDA_ARCH_LIST` at build time.
 The default value `12.0` targets NVIDIA Blackwell consumer GPUs. Keep
 `CUDA_IMAGE` and `TORCH_BACKEND` on the same CUDA release family.
+
+## License
+
+Agentrix's original code and documentation are licensed under the
+[Apache License 2.0](LICENSE). Git submodules are separate upstream works and
+remain subject to the license files distributed in their respective repositories.
