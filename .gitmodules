@@ -20,5 +20,5 @@
 	branch = main
 [submodule "vllm-ascend"]
 	path = vllm-ascend
-	url = https://github.com/vllm-project/vllm-ascend.git
-	branch = releases/v0.22.1rc
+	url = https://github.com/T4t4KAU/vllm-ascend.git
+	branch = agentrix-agentx-prefill-guard
