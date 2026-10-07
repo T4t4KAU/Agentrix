@@ -9,7 +9,7 @@
 | 文档 | 内容 |
 | --- | --- |
 | [跨平台优化总文](agentrix_cross_platform_optimizations.md) | 整体方案、自主实现与框架能力、工具数据管理、分平台关键结果 |
-| [Ascend 推理优化](agentx_ascend.md) | NPU 架构、ForkAttention 算子适配、profiling、混合缓存与图执行 |
+| [Ascend 推理优化](agentx_ascend.md) | 与 NVIDIA 的架构差异及迁移挑战、ForkAttention 算子适配、profiling、混合缓存与图执行 |
 | [KV 内存管理](kv_memory_optimization_status.md) | 生命周期、选择性备份、增长上下文与分支、设备容量和恢复代价 |
 | [DP 路由](dp_routing.md) | 官方 consistent_hash、文档 QA、路由与 ForkAttention 的配合 |
 

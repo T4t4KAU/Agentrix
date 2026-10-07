@@ -29,6 +29,56 @@ without dropping other options. This is an opt-in mapping to official APIs,
 not a new routing or eviction algorithm. Hardware evidence and its limits are
 recorded in [the KV status document](../docs/kv_memory_optimization_status.md).
 
+### LangGraph lifecycle hints
+
+`LangGraphKVHints` derives an opaque `X-Session-ID` from LangGraph's
+`configurable.thread_id` and an application/tenant namespace. Sibling `Send`
+tasks, retries and checkpoint resumes keep the same identity. This uses the
+official router's affinity; it does not introduce another router.
+
+Bind the adapter to the compiled graph. Backup reduction additionally requires
+an explicit `disposable=True` contract: later invocations will not reuse full
+private transcripts. Checkpointed graphs, including inherited checkpointers,
+keep the backend's default backup policy. `END` alone does not establish that
+contract, since a thread may be resumed or revisited.
+
+```python
+from agentrix_application.langgraph_kv import LangGraphKVHints
+
+# Inside a node, use the config supplied by LangGraph.
+hints = LangGraphKVHints(graph, namespace="research-app", disposable=True)
+options = hints.options(
+    config,
+    reuse="shared_prefix",
+    request_tokens=rendered_request_token_ids,
+    shared_tokens=rendered_shared_root_token_ids,
+)
+```
+
+`reuse="unknown"` retains default backup. `reuse="shared_prefix"` caps new
+backup at the exact common token prefix, retaining the shared root while
+excluding a branch's disposable private suffix. `reuse="none"` skips new
+backup for a known final request. These are application dataflow contracts,
+not predictions inferred from node names, a finished tool call, or graph edges.
+Provide token IDs rendered with the serving model's actual chat template,
+tools and options; the adapter does not estimate a boundary from characters.
+The cap is an upper bound: backend block alignment and recurrent-state
+availability determine which prefixes can actually be stored.
+In mixed attention/recurrent models, the cap does not create a new recurrent
+checkpoint. Keep the parent on normal backup and retain a recoverable boundary;
+the cap also does not pin that boundary against the backend's normal eviction.
+
+The existing RAG graph supplies these contracts from its state projection:
+planner and tool-selection requests remain reusable, branch reflections pass
+only their answers to the join, and the final reducer ends a disposable case.
+`agentrix-langgraph live --agent-hints lifecycle` enables this mapping;
+`--agent-hints affinity` is the control with identical session routing and
+default backup. The default is `off`. Reflection boundaries use vLLM's
+`/tokenize` endpoint; recorded request latency includes that extra work.
+This requires a backend with the official selective-offload interface and an
+enabled CPU connector. It does not move tool-waiting KV, prefetch data, delete
+checkpoints or release allocated device memory.
+
 ## Prompt representation
 
 This package removes representation-only prompt redundancy without rewriting

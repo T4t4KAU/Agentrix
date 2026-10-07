@@ -15,21 +15,22 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Annotated, Any, TypedDict
 
-from openai import AsyncOpenAI
-
 from agentrix_application import (
     CompactedPrompt,
     PromptSection,
     compact_prompt_delta,
 )
+from agentrix_application.langgraph_kv import KVReuse, LangGraphKVHints
 from data import load_records, record_to_prompt
 from hotpot import (
     HotpotExample,
-    evaluate_predictions as evaluate_hotpot_predictions,
     load_hotpot,
     stratified_sample,
 )
-
+from hotpot import (
+    evaluate_predictions as evaluate_hotpot_predictions,
+)
+from openai import AsyncOpenAI
 
 CACHEBLEND_SEPARATOR = "§CACHEBLEND§"
 CACHEBLEND_PROTOCOL = "Agentrix stable RAG context protocol v1"
@@ -470,6 +471,7 @@ class AgentRuntime:
         rag_format: str = "plain",
         prompt_compaction: bool = False,
         workload: str = "legacy",
+        agent_hints: str = "off",
     ) -> None:
         self.client = client
         self.model = model
@@ -479,6 +481,9 @@ class AgentRuntime:
         self.rag_format = rag_format
         self.prompt_compaction = prompt_compaction
         self.workload = workload
+        if agent_hints not in ("off", "affinity", "lifecycle"):
+            raise ValueError("unknown agent hints mode")
+        self.agent_hints = agent_hints
 
     async def complete(
         self,
@@ -490,6 +495,10 @@ class AgentRuntime:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: dict[str, Any] | str | None = None,
         branch_id: int | None = None,
+        graph_config: dict[str, Any] | None = None,
+        kv_policy: LangGraphKVHints | None = None,
+        kv_reuse: KVReuse = "unknown",
+        shared_messages: list[dict[str, Any]] | None = None,
     ) -> Any:
         request: dict[str, Any] = {
             "model": self.model,
@@ -503,8 +512,66 @@ class AgentRuntime:
             request["tool_choice"] = tool_choice
         started_ms = (time.perf_counter() - self.recorder.started) * 1000
         started = time.perf_counter()
+        request_tokens = None
         async with self.semaphore:
+            hint_started = time.perf_counter()
+            if self.agent_hints != "off":
+                if graph_config is None or kv_policy is None:
+                    raise ValueError(
+                        "agent hints require a bound graph and node config"
+                    )
+                reuse = kv_reuse if self.agent_hints == "lifecycle" else "unknown"
+                request_tokens = shared_tokens = None
+                if reuse == "shared_prefix" and kv_policy.can_limit_backup(
+                    graph_config
+                ):
+                    if shared_messages is None:
+                        raise ValueError(
+                            "shared-prefix backup requires shared messages"
+                        )
+
+                    # Use the serving tokenizer and chat template, including
+                    # tools. Character counts and standalone token estimates
+                    # cannot safely identify the shared boundary.
+                    async def tokenize(items, *, generation):
+                        body = {
+                            "model": self.model,
+                            "messages": items,
+                            "add_generation_prompt": generation,
+                        }
+                        if tools is not None:
+                            body["tools"] = tools
+                        path = (
+                            self.client.base_url.path.removesuffix("v1/") + "tokenize"
+                        )
+                        url = self.client.base_url.copy_with(path=path)
+                        result = await self.client.post(
+                            str(url), cast_to=dict, body=body
+                        )
+                        return result["tokens"]
+
+                    request_tokens, shared_tokens = await asyncio.gather(
+                        tokenize(messages, generation=True),
+                        tokenize(shared_messages, generation=False),
+                    )
+                request.update(
+                    kv_policy.options(
+                        graph_config,
+                        reuse=reuse,
+                        request_tokens=request_tokens,
+                        shared_tokens=shared_tokens,
+                    )
+                )
+            hint_ms = (time.perf_counter() - hint_started) * 1000
             response = await self.client.chat.completions.create(**request)
+        if (
+            request_tokens is not None
+            and response.usage is not None
+            and response.usage.prompt_tokens != len(request_tokens)
+        ):
+            raise RuntimeError(
+                "tokenize and chat completion used different prompt lengths"
+            )
         latency_ms = (time.perf_counter() - started) * 1000
         message = response.choices[0].message
         response_data = message.model_dump(exclude_none=True)
@@ -517,6 +584,7 @@ class AgentRuntime:
                 "branch_id": branch_id,
                 "started_ms": started_ms,
                 "latency_ms": latency_ms,
+                "kv_hint_ms": hint_ms,
                 "request": request,
                 "response": response_data,
                 "usage": usage,
@@ -753,6 +821,7 @@ def build_graph(
     branch_max: int = 8,
     tool_delay_profile: str = "legacy",
     seed: int = 2026,
+    checkpointer: Any = None,
 ):
     from langgraph.graph import END, START, StateGraph
     from langgraph.types import Send
@@ -845,7 +914,7 @@ def build_graph(
         )
         return {"bootstrap_evidence": evidence, "bootstrap_results": results}
 
-    async def planner(state: OverallState) -> dict[str, Any]:
+    async def planner(state: OverallState, config) -> dict[str, Any]:
         rag_format = getattr(runtime, "rag_format", "plain")
         message = await runtime.complete(
             case_id=state["case_id"],
@@ -854,6 +923,8 @@ def build_graph(
                 state["bootstrap_evidence"], state["task"], rag_format
             ),
             max_tokens=token_limits["planner"],
+            graph_config=config,
+            kv_policy=kv_policy,
         )
         shared_analysis = message.content or "Investigate the task."
         if workload != "hotpot":
@@ -913,7 +984,7 @@ def build_graph(
             for branch_id in range(branches)
         ]
 
-    async def branch_agent(state: BranchState) -> dict[str, Any]:
+    async def branch_agent(state: BranchState, config) -> dict[str, Any]:
         required_tool = state["required_tool"]
         rag_format = getattr(runtime, "rag_format", "plain")
         shared_messages: list[dict[str, Any]] = [
@@ -950,6 +1021,8 @@ def build_graph(
             tools=available_tools,
             tool_choice={"type": "function", "function": {"name": required_tool}},
             branch_id=state["branch_id"],
+            graph_config=config,
+            kv_policy=kv_policy,
         )
         call = _tool_call(selected, required_tool, fallback_query)
         if workload == "hotpot":
@@ -1007,6 +1080,12 @@ def build_graph(
             messages=reflection_messages,
             max_tokens=token_limits["reflect"],
             branch_id=state["branch_id"],
+            graph_config=config,
+            kv_policy=kv_policy,
+            # The join consumes branch answers, not their private transcripts.
+            # Siblings can still consume the common root, so keep its backup.
+            kv_reuse="shared_prefix",
+            shared_messages=shared_messages,
         )
         if workload == "hotpot":
             return {
@@ -1029,7 +1108,7 @@ def build_graph(
             ]
         }
 
-    async def reducer(state: OverallState) -> dict[str, Any]:
+    async def reducer(state: OverallState, config) -> dict[str, Any]:
         if workload == "hotpot":
             evidence = json.dumps(
                 sorted(state["branch_outputs"], key=lambda item: item["branch_id"]),
@@ -1074,6 +1153,9 @@ def build_graph(
                 {"role": "user", "content": evidence},
             ],
             max_tokens=token_limits["reduce"],
+            graph_config=config,
+            kv_policy=kv_policy,
+            kv_reuse="none",
         )
         if workload == "hotpot":
             return {"answer": _hotpot_final_output(message.content)}
@@ -1089,7 +1171,11 @@ def build_graph(
     graph.add_conditional_edges("planner", fanout, ["branch_agent"])
     graph.add_edge("branch_agent", "reducer")
     graph.add_edge("reducer", END)
-    return graph.compile()
+    compiled = graph.compile(checkpointer=checkpointer)
+    # These benchmark cases are one-shot workflows. The policy independently
+    # suppresses backup limits when a checkpointer enables later resumption.
+    kv_policy = LangGraphKVHints(compiled, namespace="agentrix-rag-v1", disposable=True)
+    return compiled
 
 
 async def run_live(args: argparse.Namespace) -> dict[str, Any]:
@@ -1238,6 +1324,7 @@ async def run_live(args: argparse.Namespace) -> dict[str, Any]:
         rag_format=args.rag_format,
         prompt_compaction=args.prompt_compaction,
         workload=workload,
+        agent_hints=getattr(args, "agent_hints", "off"),
     )
     limits = {
         "planner": args.planner_tokens,
@@ -1275,7 +1362,8 @@ async def run_live(args: argparse.Namespace) -> dict[str, Any]:
                     "branches": spec["branches"],
                     "branch_roles": spec["branch_roles"],
                     "branch_outputs": [],
-                }
+                },
+                config={"configurable": {"thread_id": spec["case_id"]}},
             )
 
     started = time.perf_counter()
@@ -1295,6 +1383,7 @@ async def run_live(args: argparse.Namespace) -> dict[str, Any]:
         "branch_roles": [spec["branch_roles"] for spec in selected_tasks],
         "rag_format": args.rag_format,
         "prompt_compaction": args.prompt_compaction,
+        "agent_hints": getattr(args, "agent_hints", "off"),
         "rag_root": str(args.rag_root) if workload != "hotpot" else None,
         "rag_manifest": (
             str(args.rag_manifest)
@@ -1395,6 +1484,18 @@ async def replay_trace(args: argparse.Namespace) -> dict[str, Any]:
                 await asyncio.sleep(delay)
         request = dict(event["request"])
         request["model"] = args.model
+        if getattr(args, "kv_backup", "captured") == "default":
+            extra_body = dict(request.get("extra_body") or {})
+            transfer = dict(extra_body.get("kv_transfer_params") or {})
+            transfer.pop("max_offload_tokens", None)
+            if transfer:
+                extra_body["kv_transfer_params"] = transfer
+            else:
+                extra_body.pop("kv_transfer_params", None)
+            if extra_body:
+                request["extra_body"] = extra_body
+            else:
+                request.pop("extra_body", None)
         if getattr(args, "fixed_output_tokens", False):
             output_length_source = getattr(args, "fixed_output_length_source", "max")
             target_tokens = request.get("max_tokens")
@@ -1556,6 +1657,7 @@ async def replay_trace(args: argparse.Namespace) -> dict[str, Any]:
                 getattr(args, "fixed_output_tokens", False)
             ),
             "wall_ms": wall_ms,
+            "kv_backup": getattr(args, "kv_backup", "captured"),
         },
         "events": sorted(replayed, key=lambda item: item["started_ms"]),
     }
@@ -1623,6 +1725,10 @@ def _parser() -> argparse.ArgumentParser:
                 ),
             )
             item.add_argument("--branches", type=int, default=4)
+            item.add_argument(
+                "--agent-hints", choices=["off", "affinity", "lifecycle"], default="off",
+                help="Use thread affinity and optionally graph-owned selective KV backup.",
+            )
             item.add_argument("--rag-root", type=Path, default=Path("..") / "docs")
             item.add_argument("--rag-manifest", type=Path)
             item.add_argument(
@@ -1637,6 +1743,10 @@ def _parser() -> argparse.ArgumentParser:
             item.add_argument("--reduce-tokens", type=int, default=128)
         else:
             item.add_argument("--trace", type=Path, required=True)
+            item.add_argument(
+                "--kv-backup", choices=["captured", "default"], default="captured",
+                help="Keep captured backup caps, or remove only the caps for a matched control.",
+            )
             item.add_argument(
                 "--case-concurrency",
                 type=int,

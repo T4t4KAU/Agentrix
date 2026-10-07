@@ -25,6 +25,55 @@ summarizers remain. Coding demos use the Python entry points documented in
 Historical source snapshots are retained on the experiment server under
 `${RESULTS_DIR}/script-cleanup-20261004/`; no archived copies are kept here.
 
+## LangGraph KV lifecycle comparison
+
+The existing `agentrix-langgraph live` entry point supports `--agent-hints
+affinity` and `--agent-hints lifecycle`. Both derive the official session
+header from `thread_id`. Lifecycle mode additionally uses the graph's known
+dataflow: keep planner/tool-selection backup, cap branch-reflection backup to
+the shared token prefix, and skip new backup for the disposable final reducer.
+Explicit or inherited checkpointing preserves the default backup policy.
+See the [application adapter](../application/README.md#langgraph-lifecycle-hints).
+
+Use the same model, frozen corpus/tasks, concurrency and GPU/CPU budgets in both
+arms. On a **dedicated** backend with the official offload connector, reset GPU
+and external caches before each arm and alternate execution order. For example:
+
+```bash
+agentrix-langgraph live \
+  --base-url "${BASE_URL}/v1" --model "${MODEL_NAME}" \
+  --task-file "${TASK_FILE}" --rag-root "${CORPUS_DIR}" \
+  --cases 4 --case-concurrency 1 --concurrency 4 --branches 4 \
+  --bootstrap-chunks 12 --bootstrap-max-chars 16000 \
+  --planner-tokens 64 --tool-tokens 128 --reflect-tokens 64 --reduce-tokens 96 \
+  --agent-hints lifecycle --output "${RESULTS_DIR}/lifecycle.json"
+```
+
+Repeat with `--agent-hints affinity` for the control. Compare deltas of
+`vllm:kv_offload_store_bytes_total`, external-hit/recompute token counters and
+preemptions after server metrics settle. Record graph wall time and the trace's
+`kv_hint_ms`, which includes server tokenization work. Check identical request
+content and model outputs, ignoring only generated tool-call IDs when comparing
+responses. If live outputs diverge, use a frozen request trace for attribution;
+do not describe it as an exact live-output comparison. Tokenization overhead
+belongs in the candidate's latency. Fewer CPU writes do not establish lower
+allocated VRAM, lower reserved CPU memory or a throughput gain.
+
+For a fixed-input control, capture a lifecycle run and replay the **same trace**
+with `--kv-backup default` and `--kv-backup captured`:
+
+```bash
+agentrix-langgraph replay \
+  --base-url "${BASE_URL}/v1" --model "${MODEL_NAME}" \
+  --trace "${RESULTS_DIR}/lifecycle.json" --timing sequential --concurrency 1 \
+  --kv-backup captured --output "${RESULTS_DIR}/replay-captured.json"
+```
+
+The default arm removes only `max_offload_tokens`, preserving prompt content,
+session headers and other transfer options. Reset the dedicated backend between
+arms. Replay uses already captured caps, so its timing excludes online hint
+construction and tokenization; report that cost from live runs separately.
+
 ## Common Commands
 
 ```bash

@@ -5,9 +5,9 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
 import langgraph_runner
+import pytest
+from hotpot import load_hotpot
 from langgraph_runner import (
     CACHEBLEND_SEPARATOR,
     HotpotRAG,
@@ -18,7 +18,6 @@ from langgraph_runner import (
     format_rag_results,
     summarize_rag_reuse,
 )
-from hotpot import load_hotpot
 
 
 class FakeRuntime:
@@ -66,6 +65,142 @@ class FakeRuntime:
     ):
         self.tools.append((case_id, branch_id, name, arguments, known_results))
         return "[]"
+
+
+@pytest.mark.parametrize("durable", [False, True])
+def test_native_graph_hints_keep_siblings_affine_and_protect_checkpoints(durable):
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    runtime = FakeRuntime()
+    graph = build_graph(
+        runtime,
+        branches=3,
+        token_limits={"planner": 8, "tool_select": 8, "reflect": 8, "reduce": 8},
+        checkpointer=InMemorySaver() if durable else None,
+    )
+    asyncio.run(
+        graph.ainvoke(
+            {"case_id": "c", "task": "research", "branch_outputs": []},
+            config={"configurable": {"thread_id": "thread-1"}},
+        )
+    )
+    identities = set()
+    for call in runtime.calls:
+        config = call["graph_config"]
+        assert config["metadata"]["langgraph_node"] in (
+            "planner",
+            "branch_agent",
+            "reducer",
+        )
+        options = call["kv_policy"].options(
+            config,
+            reuse=call.get("kv_reuse", "unknown"),
+            request_tokens=[1, 2, 9],
+            shared_tokens=[1, 2, 3],
+        )
+        identities.add(options["extra_headers"]["X-Session-ID"])
+        if durable or call["stage"] in ("planner", "tool_select"):
+            assert "extra_body" not in options
+        else:
+            assert options["extra_body"]["kv_transfer_params"][
+                "max_offload_tokens"
+            ] == (2 if call["stage"] == "branch_reflect" else 0)
+    assert len(identities) == 1
+
+
+def test_inherited_langgraph_checkpointer_disables_partial_backup():
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import END, START, StateGraph
+
+    runtime = FakeRuntime()
+    child = build_graph(
+        runtime, 1, {"planner": 8, "tool_select": 8, "reflect": 8, "reduce": 8}
+    )
+    parent = StateGraph(langgraph_runner.OverallState)
+    parent.add_node("child", child)
+    parent.add_edge(START, "child")
+    parent.add_edge("child", END)
+    asyncio.run(
+        parent.compile(checkpointer=InMemorySaver()).ainvoke(
+            {"case_id": "c", "task": "research", "branch_outputs": []},
+            config={"configurable": {"thread_id": "thread-1"}},
+        )
+    )
+    assert all(
+        not call["kv_policy"].can_limit_backup(call["graph_config"])
+        for call in runtime.calls
+    )
+
+
+@pytest.mark.parametrize("mode", ["off", "affinity", "lifecycle"])
+def test_runtime_tokenizes_exact_chat_only_for_partial_backup(mode):
+    import httpx
+    from agentrix_application.langgraph_kv import LangGraphKVHints
+
+    posts, requests = [], []
+
+    async def tokenize(url, *, cast_to, body):
+        posts.append((url, body))
+        return {
+            "tokens": [1, 2, 3] if not body["add_generation_prompt"] else [1, 2, 9, 10]
+        }
+
+    async def complete(**kwargs):
+        requests.append(kwargs)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(model_dump=lambda **_: {"content": "ok"})
+                )
+            ],
+            usage=None,
+        )
+
+    client = SimpleNamespace(
+        base_url=httpx.URL("http://backend/v1/"),
+        post=tokenize,
+        chat=SimpleNamespace(completions=SimpleNamespace(create=complete)),
+    )
+    runtime = langgraph_runner.AgentRuntime(
+        client=client,
+        model="m",
+        rag=None,
+        recorder=langgraph_runner.TraceRecorder("m"),
+        concurrency=1,
+        agent_hints=mode,
+    )
+    messages = [
+        {"role": "user", "content": "shared"},
+        {"role": "user", "content": "private"},
+    ]
+    asyncio.run(
+        runtime.complete(
+            case_id="c",
+            stage="reflect",
+            messages=messages,
+            max_tokens=4,
+            tools=langgraph_runner.TOOLS,
+            graph_config={"configurable": {"thread_id": "t"}},
+            kv_policy=LangGraphKVHints(
+                SimpleNamespace(checkpointer=None), namespace="n", disposable=True
+            ),
+            kv_reuse="shared_prefix",
+            shared_messages=messages[:1],
+        )
+    )
+    assert requests[0]["messages"] == messages
+    assert requests[0]["tools"] == langgraph_runner.TOOLS
+    if mode == "lifecycle":
+        assert len(posts) == 2
+        assert all(url == "http://backend/tokenize" for url, _ in posts)
+        assert all(body["tools"] == langgraph_runner.TOOLS for _, body in posts)
+        assert (
+            requests[0]["extra_body"]["kv_transfer_params"]["max_offload_tokens"] == 2
+        )
+    else:
+        assert not posts
+        assert "extra_body" not in requests[0]
+    assert ("extra_headers" in requests[0]) == (mode != "off")
 
 
 def test_local_rag_uses_real_files_and_is_deterministic(tmp_path: Path) -> None:
@@ -401,8 +536,9 @@ def test_hotpot_supporting_facts_accept_pairs_and_json_objects() -> None:
     ) == [["Alpha", 1], ["Beta", 2]]
 
 
+@pytest.mark.parametrize("kv_backup", ["captured", "default"])
 def test_dependency_replay_preserves_requests_and_stage_order(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kv_backup: str
 ) -> None:
     requests = []
 
@@ -432,6 +568,14 @@ def test_dependency_replay_preserves_requests_and_stage_order(
                     "messages": [{"role": "user", "content": f"{case_id}:{stage}"}],
                     "temperature": 0,
                     "max_tokens": 7,
+                    "extra_headers": {"X-Session-ID": "stable-thread"},
+                    "extra_body": {
+                        "chat_template_kwargs": {"enable_thinking": False},
+                        "kv_transfer_params": {
+                            "max_offload_tokens": 16,
+                            "other": "keep",
+                        },
+                    },
                     "tool_choice": {
                         "type": "function",
                         "function": {"name": "paragraph_search"},
@@ -457,6 +601,7 @@ def test_dependency_replay_preserves_requests_and_stage_order(
         timing="dependency",
         fixed_output_tokens=True,
         fixed_output_length_source="captured",
+        kv_backup=kv_backup,
     )
 
     payload = asyncio.run(langgraph_runner.replay_trace(args))
@@ -481,6 +626,16 @@ def test_dependency_replay_preserves_requests_and_stage_order(
     assert payload["metadata"]["fixed_output_length_source"] == "captured"
     assert payload["metadata"]["forced_tool_choice_normalized"] is True
     assert payload["metadata"]["requests"] == 8
+    assert payload["metadata"]["kv_backup"] == kv_backup
+    for request in requests:
+        assert request["extra_headers"] == {"X-Session-ID": "stable-thread"}
+        assert request["extra_body"]["chat_template_kwargs"] == {
+            "enable_thinking": False
+        }
+        transfer = request["extra_body"]["kv_transfer_params"]
+        assert transfer["other"] == "keep"
+        assert ("max_offload_tokens" in transfer) == (kv_backup == "captured")
+    assert json.loads(trace.read_text()) == source
 
 
 def test_agent_replay_preserves_branch_dependencies_and_allows_disorder(

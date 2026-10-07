@@ -10,6 +10,11 @@ ForkAttention 与图执行改善设备计算和提交效率。各层的结果来
 不叠加成统一加速比。框架层方案见 [跨平台优化](agentrix_cross_platform_optimizations.md)，
 当前成果总表见 [技术汇报导航](README.md)。
 
+Ascend 算子适配的核心挑战，是把共享前缀的计算复用映射到 **AIC/AIV 分离、
+分用途片上存储和显式搬运流水**上。相同的 attention 数学公式，在 NVIDIA
+与 Ascend 上具有不同的任务粒度、数据交接和资源约束。下文先对照两种架构，
+再说明这些差异如何决定 ForkAttention 的分段、打包、归约和图执行设计。
+
 ## 实验平台与评价方法
 
 Ascend 实验采用双 Ascend 910B2 64 GB、Qwen3.5-9B BF16、TP=1/DP=2，
@@ -128,6 +133,137 @@ speculative decoding 或 context parallelism 组合。这与后文 CPU 分层缓
 识别共享物理 KV，把多个分支对相同前缀的注意力计算组织成 FIA 任务。两张 DP 卡
 各自执行，不在卡间共享 KV，也不因启用算子而改变请求顺序。
 
+### 与 NVIDIA H100 的差异与迁移挑战
+
+架构对照限定为 **NVIDIA H100 的 Hopper 架构**与 **Ascend 910B2 的 A2 架构**。
+同时区分硬件能力与实际代码：仓库 CUDA ForkAttention 使用 `cp.async`、
+`ldmatrix`、`mma.sync` 和 warp 归约，采用 SM80 及后续架构可用的实现方式；
+H100 支持 TMA，不代表该内核已经使用 TMA 或 Hopper 专用的矩阵流水。
+具体可见 [CUDA 指令封装](../vllm/csrc/libtorch_stable/attention/fork/cuda_arch.h)
+与 [CUDA 分段内核](../vllm/csrc/libtorch_stable/attention/fork/fork_fwd_kernel.h)。
+
+| 对照维度 | NVIDIA H100 / CUDA | Ascend 910B2 / 当前实现 | 对 ForkAttention 的直接挑战 |
+| --- | --- | --- | --- |
+| 计算与协作范围 | SM 内包含 Tensor Core 和通用计算单元；线程块可组织矩阵计算与 softmax | AIC 执行 Cube，AIV 执行 Vector，两类核独立控制 | 要重新设计矩阵与向量阶段的数据交接，CUDA 线程块内部的融合方式不能逐条翻译 |
+| 局部数据驻留 | 当前 CUDA 内核组合使用 shared memory 与线程寄存器 fragment | 矩阵侧使用 L1/L0，向量侧使用 UB，容量不能任意互借 | 必须分别约束矩阵 tile、FP32 归约临时量和搬运缓冲的生命周期 |
+| 并行粒度 | block/warp 调度，驻留受寄存器、shared memory 等限制 | Triton-Ascend program 映射到有限的计算核，细碎任务存在额外执行开销 | 需要重新选择分片数、每任务数据量和 head 分组，照搬 CUDA 网格可能得不偿失 |
+| 搬运与同步 | 当前代码使用异步复制、等待和线程块同步；Hopper 另有 TMA 能力 | MTE、Cube、Vector 分别推进，涉及核内队列与跨核数据交接 | 双缓冲必须协调消费者进度、缓冲复用和同步，增加缓冲数也增加片上占用 |
+| 分页与布局 | 当前代码显式控制页地址、线程取数和 shared-memory swizzle | paged FIA 接收页表，内部矩阵布局由 CANN 处理，辅助核另行组织连续访问 | 既要适配不连续物理页，又要避免额外大张量整理、补齐和归约布局转换 |
+
+硬件与编程模型依据见 [H100 SM 架构](https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/)、
+[CUDA SIMT 编程](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/writing-cuda-kernels.html)、
+[Hopper 调优指南](https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html)、
+[Ascend A2 架构规格](https://asc.gitcode.com/guide/programming_guide/advanced_programming/hardware_implementation/architecture_spec/npu_arch_2201.html)
+和 [Triton-Ascend 开发指南](https://github.com/triton-lang/triton-ascend/blob/main/docs/en/programming_guide/index.md)。
+表中的迁移挑战是结合这些架构约束和本仓库代码作出的设计分析，不是两种硬件
+的性能排名。链接用于说明架构与开发原则，当前运行时的支持范围仍以本仓库
+实现为准；具体解决方式如下。
+
+#### 挑战一：重新确定矩阵计算与 softmax 的融合边界
+
+仓库 CUDA 分段内核在同一 CTA，即线程块内，串起 `QK → softmax → PV`。
+Q/K/V 分块放入 shared memory，矩阵累加形成寄存器 fragment；softmax
+使用这些分数更新局部最大值、分母和输出累加器，随后继续下一块。因而一次
+分段计算可以在局部完成多轮矩阵与非矩阵计算，不必把完整 attention 分数
+矩阵写回全局存储。跨分段仍可能需要部分结果和最终归并，不能理解为整个
+ForkAttention 没有全局中间数据。
+
+A2 的 Cube 与 Vector 分属 AIC/AIV，局部存储也分属不同计算路径。若直接
+重写上述循环，就要为矩阵结果交给 Vector、归一化结果返回矩阵阶段安排数据
+通路与同步；CUDA 中可由同一线程块继续使用的寄存器 fragment，在这里没有
+对应的直接替换方式。这是**计算阶段之间的数据所有权与交接边界发生变化**。
+该代架构的跨核通路见后文 [A2 计算架构](#ascend-910b-的计算架构)。
+
+当前实现把分段内部的融合交给 FIA，将自主控制范围放在共享 query 分组、
+分片和最终 LSE 合并。这样可以复用官方对 Cube/Vector 流水的实现，但代价是
+FIA 与 merge 之间需要显式部分输出和工作区。A2 可以通过融合算子重叠不同
+阶段；分离架构不意味着完全串行，也不能据此断定每段数据都会穿透 L2 访问
+HBM。本文不把上述概念依赖当成某个 FIA 分支的实际微架构执行轨迹。
+
+#### 挑战二：把片上容量预算从一个 tile 拆到多种存储
+
+GPU 侧也有严格的局部资源约束：较大的寄存器 fragment 或 shared-memory
+tile 会影响线程块驻留。H100 每 SM 有 64K 个 32 位寄存器，shared memory
+上限为 228 KiB；它们具有不同的分配和访问规则。A2 则需要分别考虑 AIC 的
+L1/L0 与 AIV 的 UB。**不能把 H100 的 shared memory 与 A2 的 UB 单独比较
+大小，就判定一个 attention tile 能否迁移。** 各阶段使用的数据、归约临时量
+和并行驻留方式都不同。[Hopper 局部资源约束](https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html#occupancy)
+
+本项目的新合并内核正体现了这个取舍：一次处理两个 head，最多 17 段补齐到
+32，FP32 `values` 的逻辑大小为 `32 × 2 × 256 × 4 = 64 KiB`；扩大到
+四个 head 就变为 128 KiB，此外还有输入、乘积及归约临时量。AIV 的 UB
+预算约束会影响编译布局及可采用的缓冲方式，不能只按“任务越少越快”扩大
+head 组。双 head 已接入代码，其性能增量尚无 NPU 实测结论。
+
+这一挑战还限制了共享范围：APC 可以让许多分支引用同一份全局 KV，但单核
+片上存储容不下完整长前缀。算子必须把共享变成**同一小块 KV 服务更多有效
+query**，同时控制中间结果占用；全局页共享不会自动形成计算阶段的片上复用。
+
+#### 挑战三：在共享复用、矩阵有效工作量和任务开销之间选粒度
+
+单 token decode 的每个分支只有一行 query。按分支分别计算，共享 KV 容易
+被重复读取；把所有共享工作集中到很少的任务，又可能缺少并行度。CUDA
+和 Ascend 都存在这个问题，但网格到硬件的映射、每任务局部资源和调度成本
+不同，最优分片数不能从一个平台直接沿用。
+
+Triton-Ascend 官方指南专门指出，直接搬用 GPU 上的大量细粒度任务可能带来
+明显的启动与初始化成本，并给出按物理核数分配、核内循环处理块的设计方式。
+当前实现采用更局部的调整：Q 整行打包、合并时相邻 head 分组；尚未实现按
+设备核数固定网格的持久化循环。[Triton-Ascend 多核任务划分](https://github.com/triton-lang/triton-ascend/blob/main/docs/en/programming_guide/index.md#common-multi-core-task-parallelism)
+
+在 FIA 主体中，多分支 query 提供更宽的查询集合，前缀分片增加独立段；两者
+共同改变算子形状。分片过细则增加部分输出、LSE 和 merge 工作。因此当前
+32K 前缀采用四分片、64K 采用十六分片，是已测形状的取舍；既不能按 Cube
+峰值算力推断收益，也不能把一段共享 KV 的全部计算固定压到一个任务中。
+
+辅助核已有一项独立证据：把 Q 的复制宽度由 1024 改为 4096，逻辑 program
+由 544 减到 136，profiling 中 Q 打包耗时 **41.306 → 11.285 µs**；同组 FIA
+搬运计数没有下降。它说明优化任务粒度本身具有价值，没有证明 NPU 比 GPU
+具有固定倍数的任务开销。完整测量范围见 [在线 Q 打包](#在线-q-打包按-npu-执行开销调整任务粒度)。
+
+#### 挑战四：同时满足分页访问和矩阵、向量两套布局需求
+
+物理 KV 页不连续，短尾部和分支长度也不齐。仓库 CUDA 代码通过页地址解析、
+CuTe 线程布局、shared-memory swizzle 和 `ldmatrix` 为矩阵指令组织数据；
+这些布局与 CUDA 的取数和 fragment 分布相关，不能把 swizzle 参数原样套到
+Ascend 的 L1/L0 或 UB。[CUDA tile 与搬运布局](../vllm/csrc/libtorch_stable/attention/fork/kernel_traits.h)
+
+Ascend 路径将混合缓存管理块映射为 128-token 内核页，继续向 FIA 提交物理
+页表；只复制较小的 Q 和描述符，避免为规整布局复制整个共享 KV。FIA 内部
+处理矩阵输入格式，输出的 `[partial, head, dim]` 又成为归约核的新约束。
+因此 merge 保持 `dim` 连续，复用相邻 head 的索引；把分段轴换到末尾并不会
+使间接读取的物理地址自动连续。
+
+挑战是同时控制**访问的连续性、格式转换、补齐和局部工作集**。GPU 同样受
+合并访存及 bank 冲突影响，但其线程到数据的映射规则不能代替 NPU 的搬运
+和布局规则。当前方案把这种差异收敛在 FIA 接口与辅助内核两侧，而不改变
+引擎中 KV 页的共享身份。
+
+#### 挑战五：建立正确的异步流水，并保留收益的可解释性
+
+两种平台都需要显式同步。CUDA 源码中的 `cp.async` 等待和线程块屏障，
+与 H100 可选的 TMA/barrier 协作，均有各自的完成条件；A2 需要协调 MTE、
+Cube、Vector 队列及跨核交接。移植时必须重新明确：哪一方生产缓冲、哪一方
+消费、何时可以覆盖。更多流水级只有在独立工作足够且缓冲容得下时才有价值。
+[CUDA 异步屏障语义](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/async-barriers.html)
+
+在当前方案中，FIA 内部同步由 CANN 承担，外部则固定为 `pack → FIA → merge`。
+服务层另有一类依赖：页映射与启用状态必须先于 pack 被设备读取，因此
+ACLGraph 的等待点放在 pack 之前。这是当前运行时接入需要解决的问题，
+不应与 AIC/AIV 的硬件同步混为一谈，也不能把 CUDA Graph 视为无需管理
+动态数据、只有 ACLGraph 才有依赖问题。
+
+这些差异还决定性能证据的解释范围：Ascend 的 AIC GM→L1 搬运计数、NVIDIA
+的 DRAM/L2 计数，以及各自的活动区间和占用指标，测量位置不同。本文用同一
+平台的完整路径对照说明收益，不把它们互换为带宽或利用率。CUDA 算子比较
+来自 RTX 5070，H100 上已有的是另外的内存管理实验；它们都不能充当这里
+H100 与 A2 的同负载性能排名。
+
+以上挑战共同决定当前实现的边界：共享关系与稳定 softmax 合并可以跨平台
+复用，而任务划分、局部驻留、布局和同步必须按后端重新设计。当前 NPU 增量
+集中在**共享任务组织与 Vector 辅助算子**，FIA 内部 Cube tile 和流水仍由
+官方实现承担。下文给出 A2 数据通路与具体算子设计。
+
 ### Ascend 910B 的计算架构
 
 本节以实验使用的 **Ascend 910B2、Atlas A2 架构**为对象。Host CPU 运行调度器、
@@ -242,7 +378,7 @@ head dimension 256。32 层中只有 8 层 full attention 进入这条路径；G
 | 判断共享、选择分片 | CPU `ForkBatchPlanner` | 使用 runner 已有 CPU 页表，避免为规划回读设备数据 |
 | 组织 Q | Triton-Ascend `pack_fork_batch` | 复制较小的查询，为同一 KV 分段提供多个分支的 query 行 |
 | QK、softmax、PV | 原生 paged FIA | 复用官方 attention 的计算、搬运与内部切分能力 |
-| 合并分段输出 | Triton-Ascend `merge_fork_batch` | 按每个 query/head 做 FP32 稳定归约，一次写回最终结果 |
+| 合并分段输出 | Triton-Ascend `merge_fork_batch` | 按 query 与相邻 head 组并行，每个 head 独立做 FP32 稳定归约 |
 | 重复 decode 提交 | 官方 ACLGraph 与 graph-task update | 保持图结构和缓冲地址固定，更新本轮长度及页映射 |
 
 这里没有自行控制 FIA 内部的 Cube tile 或 MTE 流水。优化目标是让同一共享段
@@ -328,8 +464,9 @@ O   = sum_j(w_j * O_j) / sum_j(w_j)
 ```
 
 该公式在数学上恢复完整 KV 集合上的 softmax 加权输出，仍需通过浮点容差和
-模型输出检查。`merge_fork_batch` 按 query/head 并行，局部将部分结果转为 FP32，
-完成加权归约后写回原输出精度，避免额外生成整张 FP32 中间张量。
+模型输出检查。`merge_fork_batch` 按 query 与 head 组并行，局部将部分结果转为
+FP32，各 head 独立完成加权归约后写回原输出精度，避免额外生成整张 FP32
+全局中间张量。在线路径每组处理两个相邻 head，具体布局与取舍见后文。
 无效分段通过映射中的 `-1` 屏蔽，图捕获的补齐行输出为零。
 
 在线规划最多 16 个共享分片，故每个 query 最多合并 **17 段**。
@@ -457,6 +594,176 @@ NPU event 时间包括 Q 打包、attention、结果合并及图回放间隙；�
 
 独立 profiling 的三路径耗时、搬运计数和架构解释见
 [Profiling：共享分组减少了哪些工作](#profiling共享分组减少了哪些工作)。
+
+### 在线 Q 打包：按 NPU 执行开销调整任务粒度
+
+在线图为最多 136 个打包 query 行预留容量。每行包含 `16 × 256 = 4096`
+个元素，原先以 1024 个元素为一块，产生 `136 × 4 = 544` 个 Triton program。
+即使某些行无效，也需要执行计数判断。将块宽调整为 4096，一次复制完整 query
+行，固定网格缩小为 136 个 program。这里减少的是同一 kernel 内的逻辑任务，
+kernel 启动次数保持不变。该选择针对当前 NPU 和 attention 形状，依据实测确定。
+
+Q 打包由 Vector 路径执行；FIA 的矩阵计算、KV 分片和 FP32 LSE 合并均保持
+不变。每行 BF16/FP16 数据为 8 KiB，调整只改变复制粒度，不增加设备张量或
+FIA workspace，也不改变 KV 的共享与存储方式。
+
+在双 910B2 上，各使用两个种子，比较原有在线 ForkAttention 与整行打包版本。
+两组均使用 136 行打包容量，输出补齐到 8 行，保持相同分页 KV、分片数和图配置。
+每个配置按正反循环顺序计时八轮，每轮回放 100 次 ACLGraph，先取轮次中位数，
+再将两卡、两个种子的结果等权合并。下表为 BF16、私有尾部 128 token；时间
+包括 Q 打包、FIA、合并及图回放间隙，不包括 CPU 规划、逐步任务更新和模型其他层。
+
+| 并行分支 / 共享前缀 | 原打包完整路径（µs） | 整行打包完整路径（µs） | 耗时降低 |
+| --- | ---: | ---: | ---: |
+| 4 / 32K | 166.56 | 136.48 | 18.06% |
+| 8 / 32K | 168.96 | 139.71 | 17.31% |
+| 4 / 64K | 297.85 | 271.60 | 8.81% |
+| 8 / 64K | 311.26 | 284.08 | 8.73% |
+
+将私有尾部扩大到 1024 token 后，这四个配置的完整路径耗时仍降低
+**8.21%～18.00%**。这两种尾长的每组配对均更快，FIA workspace 均为
+**386,662,400 字节**；已有的工作区成本仍然存在。
+
+单独 profiling 的四分支、32K 前缀、128-token 尾部配置中，五次回放的
+Q 打包 kernel 均值为 **41.306 → 11.285 µs**，降低 **72.68%**。
+FIA 的 AIC GM→L1 计数两组均为 **142,848 KB/回放**，说明这次增量的收益
+主要来自辅助算子的执行组织，没有增加一项 KV 搬运削减收益。
+该 profiling 与关闭 profiler 的上表分别计量。
+
+整行打包已用于在线 `ForkDecodeBuffers`。这组实验的合并阶段使用原有逐 head
+归约，不包含后述双 head 合并增量。上述比例属于完整 attention 算子路径，
+不能直接视为模型请求或 Agent 工作流的加速比例；后文的模型结果属于另一次
+原生 FIA 与 ForkAttention 的对照。
+
+### LSE 合并：面向 Vector 与 UB 的相邻 head 分组
+
+共享 query 分组减少 FIA 的重复搬运后，Q 打包和分段归约在整条路径中的占比
+变得更值得关注。合并阶段不再执行 QK 或 PV 矩阵乘，主要工作是间接寻址、
+指数、乘加和求和，优化对象是 Vector 侧的数据组织与任务粒度。
+
+在线实现将一个 program 的责任范围从一个 `query/head` 扩大为一个
+`query/相邻双 head`。这属于 ForkAttention 辅助算子的实现优化：保持 FIA
+接口与分段算法，调整归约内核的执行组织。双 head 版本已接入代码，尚无该
+增量的 NPU 编译、运行与性能结论；本文已有性能表均不包含它。
+
+#### 从分段归一化推导合并公式
+
+对固定 query `q` 和 head `h`，设第 `j` 段可见 token 集为 `S_j`，FIA 内部
+缩放后的 attention 分数为 `s_t`。各段互不重叠，合起来覆盖该请求的完整
+可见 KV。FIA 返回：
+
+```text
+Z_j = sum_{t in S_j} exp(s_t)
+L_j = log(Z_j)
+O_j = sum_{t in S_j} exp(s_t) * V_t / Z_j
+
+O = sum_j Z_j * O_j / sum_j Z_j
+  = sum_j exp(L_j - m) * O_j / sum_j exp(L_j - m)
+m = max_j L_j
+```
+
+`O_j` 已经过段内 softmax，合并权重必须由 `L_j` 决定；按段长加权或对各段
+输出取平均都会改变结果。缩放因子已经在 FIA 中使用，合并时不再重复缩放。
+LSE 是自然对数，因此使用 `exp`；换用 `exp2` 时必须同时做底数转换。
+
+相邻 head 只共用分段索引和执行任务。每个 head 的 `m`、权重及分母分别计算，
+归约只沿分段轴进行，没有跨 head 求和。对分支也是如此：共享的是可见 KV
+页，每个 query 的 attention 分布和输出仍独立。计算使用 FP32，在最终写回
+时转成 BF16/FP16；数学等价不意味着不同浮点归约顺序的结果逐位相同。
+
+#### 沿 FIA 的物理布局读取，避免额外转置
+
+FIA 的部分输出连续存储为 `[T, H, D]`，LSE 为 `[T, H, 1]`。
+`MergeMap[q, j]` 给出某个原始 query 的第 `j` 段落在哪个部分输出行。
+两者的元素地址为：
+
+```text
+r = MergeMap[q, j]
+partial_offset = (r * H + h) * D + d
+lse_offset     = r * H + h
+```
+
+不同分段的 `r` 可以不连续，因此分段轴本身是间接访问；同一行中相邻 head
+的 `D` 个元素则紧邻。当前内核采用逻辑 tile `[PAD_PARTS, 2, D]`，维持
+`D` 为连续维度，沿第 0 轴归约。以 `D=256`、BF16/FP16 为例，一个 head
+为 512 字节，两个相邻 head 构成 1 KiB 连续范围。一次载入映射后，广播给
+两个 head 使用，无需生成新的转置张量或重新排布 FIA 输出。
+
+将逻辑 tile 改成 `[2, D, PAD_PARTS]` 可以把归约轴放到最后，但原始物理
+布局并没有随之变化，分段读取仍是间接且跨步的。编译器可能需要不同的局部
+布局转换。该方案保留在独立 benchmark 中用于比较，在线采用维度连续的布局。
+是否形成更宽搬运、是否出现额外转置或 UB 溢出，最终取决于 Triton-Ascend
+的编译结果，不能仅根据 Python 层的维度排列推断。
+
+#### 任务数与局部工作集的平衡
+
+设图的输出行数为 `B_g`，每个 program 处理 `G` 个 head，逻辑网格为：
+
+```text
+grid = (B_g, ceil(H / G))
+FP32 value tile = PAD_PARTS * G * D * 4 bytes
+```
+
+在线最多 17 段，归约宽度补齐到 32。下表按 `B_g=8, H=16, D=256`
+计算，只描述代码的逻辑形状，不是设备测量：
+
+| 每任务 head 数 G | program 数 | 单任务 FP32 values 的逻辑大小 | 取舍 |
+| --- | ---: | ---: | --- |
+| 1 | 128 | 32 KiB | 任务较细，映射与地址计算按 head 重复 |
+| 2，在线采用 | 64 | 64 KiB | 共用索引，保留更多片上临时量余地 |
+| 4，实验候选 | 32 | 128 KiB | 任务更少，但更容易受局部存储与归约成本限制 |
+
+A2 的每个 AIV 有 192 KiB UB，Vector 输入与中间量使用该局部存储，具体
+可用空间还受编译器预留影响，见 [官方架构规格](https://asc.gitcode.com/guide/programming_guide/advanced_programming/hardware_implementation/architecture_spec/npu_arch_2201.html)。
+表中仅计算 FP32 `values`，还没有计入低精度输入、乘积、LSE、权重、归约
+临时量及输出；编译器也可能复用或拆分它们。因此，64 KiB 不能解释为实际
+UB 峰值，128 KiB 小于物理容量也不足以证明四 head 方案能高效运行。
+
+选择双 head 是在任务粒度与局部工作集之间作出的实现取舍，并非已测最优点。
+任务减少还可能降低小批次下可调度的并行度。Triton program 数也不等于实际
+启用的 AIV 数；编译器如何映射任务、每核承担多少工作，仍属于后端执行细节。
+该选择固定在图捕获之前，不进行逐 token 的主机选型、重新编译或自动调参。
+
+#### 静态图里的动态数据与输出边界
+
+ACLGraph 固定归约网格、张量地址和编译参数，设备上的 `Count` 与
+`MergeMap` 决定当前回放的有效工作。每个 program 读取本 query 的映射，
+对越过 17 段容量的补齐位置置 `-1`；负索引及越过 head 数的尾组位置都不
+执行有效数据读取。部分输出缓冲无需每步清零，无效内容不会参与结果。
+
+图内有两种不同的空状态：
+
+| 状态 | 合并行为 | 目的 |
+| --- | --- | --- |
+| `Count > 0`，某 query 的映射全部为 `-1` | 将该输出行写为零 | 图补齐行不产生 NaN，也不保留上步结果 |
+| `Count == 0` | 不读分段数据、不写输出 | FIA 已按原生路径写出结果，merge 不得覆盖 |
+
+补齐位置的 LSE 按负无穷处理；最大值和分母设置下界，使全无效行的权重为零、
+输出为零。该处理定义了补齐行语义，不用于掩盖有效 FIA 输出中的 NaN。
+每个 program 独占其 query/head 组的最终输出，不需要原子加法或额外的跨核
+归约。图中既有等待点仍位于 pack 前，保护本轮描述符更新；内核读取设备
+计数，无需 `.item()` 引起的主机同步。运行时可以沿用同一张图进行
+Fork→原生→Fork 切换。
+
+#### 明确收益对象和资源成本
+
+双 head 合并减少的是逻辑 program 数以及重复的映射、地址生成工作。
+各 head 的部分输出和 LSE 仍需各读一次，KV 页、FIA workspace、显式部分
+结果缓冲、算子启动次数都没有因此减少。以每个 query 有 `J` 个有效段计，
+合并读取部分输出的逻辑有效载荷为 `B × J × H × D × 2` 字节；八个分支、
+32K 前缀对应五段时为 320 KiB，64K 前缀对应十七段时为 1088 KiB。
+这些是按形状计算的值，不是 HBM 流量计数，也不会因 head 分组而减半。
+
+改进目标是降低合并阶段的设备耗时，在 FIA 之外进一步压缩辅助算子成本。
+它不提供新的 KV 容量收益，也不将 FIA 改写成 Cube/Vector 融合的新 attention
+内核。现有端到端结构仍为 `pack → FIA → merge`；取消中间结果的全局交接
+需要进一步改变 FIA 的输出接口或内部流水，超出本次实现范围。
+
+从硬件适配角度看，连续维度、向量归约与 UB 工作集是这里直接控制的对象，
+不能把 GPU 的线程块或 warp 配置机械换成 NPU 的任务粒度。分组归约的数学
+方法可以跨平台使用，但 Ascend 的最佳粒度不能由 CUDA 上的结果代替。
+该增量目前提供实现设计，不将任务数变化换算为新增吞吐、模型延迟或内存收益。
+
 ## NPU ForkAttention 在线 decode 接入
 
 在线路径复用 CPU 物理页计划、设备缓冲和 FIA 工作区，减少逐 token 重建与
